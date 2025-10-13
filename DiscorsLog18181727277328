@@ -1,0 +1,137 @@
+import discord
+from discord.ext import commands
+from discord import app_commands
+import requests
+import io
+
+intents = discord.Intents.default()
+bot = commands.Bot(command_prefix="!", intents=intents)
+
+
+# ---------------------- Roblox API Helpers ----------------------
+def get_user_info(username: str):
+    """Return Roblox user info by username."""
+    r = requests.post("https://users.roblox.com/v1/usernames/users",
+                      json={"usernames": [username]}, timeout=15)
+    data = r.json().get("data", [])
+    if not data:
+        return None
+    uid = data[0]["id"]
+
+    info = requests.get(f"https://users.roblox.com/v1/users/{uid}", timeout=15).json()
+    friends = requests.get(f"https://friends.roblox.com/v1/users/{uid}/friends/count", timeout=15).json().get("count", 0)
+    groups = requests.get(f"https://groups.roblox.com/v2/users/{uid}/groups/roles", timeout=15).json().get("data", [])
+    badges = requests.get(f"https://badges.roblox.com/v1/users/{uid}/badges?limit=5", timeout=15).json().get("data", [])
+
+    return {
+        "id": uid,
+        "info": info,
+        "friends": friends,
+        "groups": groups,
+        "badges": badges
+    }
+
+
+# ---------------------- Dropdown Menu ----------------------
+class ProfileSelect(discord.ui.Select):
+    def __init__(self, profile_data):
+        options = [
+            discord.SelectOption(label="Profile Overview", emoji="👤"),
+            discord.SelectOption(label="Friends", emoji="👥"),
+            discord.SelectOption(label="Groups", emoji="🏛️"),
+            discord.SelectOption(label="Badges", emoji="🎖️"),
+        ]
+        super().__init__(placeholder="Choose what to view...", options=options)
+        self.profile_data = profile_data
+
+    async def callback(self, interaction: discord.Interaction):
+        data = self.profile_data
+        user = data["info"]
+
+        if self.values[0] == "Profile Overview":
+            embed = discord.Embed(
+                title=f"{user['displayName']} (@{user['name']})",
+                color=discord.Color.blurple(),
+                description=f"**User ID:** {user['id']}\n"
+                            f"**Created:** {user['created'][:10]}\n"
+                            f"**Description:**\n{user['description'] or '*No description*'}",
+            )
+            embed.set_thumbnail(url=f"https://www.roblox.com/headshot-thumbnail/image?userId={user['id']}&width=180&height=180&format=png")
+            embed.set_footer(text="Roblox Profile Overview")
+
+        elif self.values[0] == "Friends":
+            embed = discord.Embed(
+                title=f"{user['displayName']}'s Friends",
+                description=f"👥 **{data['friends']} total friends**",
+                color=discord.Color.green()
+            )
+            embed.set_footer(text="Roblox Friends")
+
+        elif self.values[0] == "Groups":
+            groups = data["groups"][:5]
+            if groups:
+                desc = "\n".join([f"🏛️ [{g['group']['name']}](https://www.roblox.com/groups/{g['group']['id']}) — {g['role']['name']}" for g in groups])
+            else:
+                desc = "*No groups found.*"
+            embed = discord.Embed(
+                title=f"{user['displayName']}'s Groups",
+                description=desc,
+                color=discord.Color.orange()
+            )
+            embed.set_footer(text="Roblox Groups")
+
+        elif self.values[0] == "Badges":
+            badges = data["badges"][:5]
+            if badges:
+                desc = "\n".join([f"🎖️ [{b['name']}](https://www.roblox.com/badges/{b['id']})" for b in badges])
+            else:
+                desc = "*No badges found.*"
+            embed = discord.Embed(
+                title=f"{user['displayName']}'s Badges",
+                description=desc,
+                color=discord.Color.gold()
+            )
+            embed.set_footer(text="Recent Badges")
+
+        await interaction.response.edit_message(embed=embed, view=self.view)
+
+
+class ProfileView(discord.ui.View):
+    def __init__(self, profile_data):
+        super().__init__(timeout=300)
+        self.add_item(ProfileSelect(profile_data))
+
+
+# ---------------------- Slash Command ----------------------
+@bot.tree.command(name="roblox_profile", description="View a Roblox user's profile with dropdown options.")
+@app_commands.describe(username="Roblox username to check")
+async def roblox_profile(interaction: discord.Interaction, username: str):
+    await interaction.response.defer(thinking=True)
+
+    profile_data = get_user_info(username)
+    if not profile_data:
+        await interaction.followup.send("❌ Could not find that Roblox user.")
+        return
+
+    user = profile_data["info"]
+    embed = discord.Embed(
+        title=f"{user['displayName']} (@{user['name']})",
+        color=discord.Color.blurple(),
+        description=f"**User ID:** {user['id']}\n"
+                    f"**Created:** {user['created'][:10]}\n"
+                    f"**Description:**\n{user['description'] or '*No description*'}",
+    )
+    embed.set_thumbnail(url=f"https://www.roblox.com/headshot-thumbnail/image?userId={user['id']}&width=180&height=180&format=png")
+    embed.set_footer(text="Roblox Profile Overview")
+
+    await interaction.followup.send(embed=embed, view=ProfileView(profile_data))
+
+
+# ---------------------- Startup ----------------------
+@bot.event
+async def on_ready():
+    await bot.tree.sync()
+    print(f"✅ Logged in as {bot.user}")
+
+
+bot.run("MTQyNjk4Nzg2Njk2MTA4ODU2Mg.G0NaSc.oe1HUGTnfMPIiR0rTB1ubY3kzG2yJJsnFjh-8A")
