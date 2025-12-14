@@ -106,7 +106,8 @@ Return ONLY valid JSON (no markdown, no extra text) in exactly this schema:
   "description": "string",          // explain which rule(s) apply and why
   "is_bannable": true/false,
   "unsure": true/false,
-  "suggestion": "string"            // empty if not unsure; otherwise tell them to contact a mod / open a ticket
+  "suggestion": "string",           // empty if not unsure; otherwise tell them to contact a mod / open a ticket
+  "rule": "string"                  // REQUIRED: the exact rule bullet text that was broken (or multiple, separated by '; ')
 }
 
 Keep description concise and informative.
@@ -152,9 +153,9 @@ def call_openai(system_prompt: str, user_prompt: str) -> str:
             body = e.read().decode("utf-8", errors="replace")
         except Exception:
             body = ""
-        return f'{{"ban_title":"Error","ban_length":"None","description":"OpenAI HTTP error {e.code}: {body[:400]}","is_bannable":false,"unsure":true,"suggestion":"Try again or contact a moderator."}}'
+        return f'{{"ban_title":"Error","ban_length":"None","description":"OpenAI HTTP error {e.code}: {body[:400]}","is_bannable":false,"unsure":true,"suggestion":"Try again or contact a moderator.","rule":""}}'
     except Exception as e:
-        return f'{{"ban_title":"Error","ban_length":"None","description":"OpenAI request failed: {e}","is_bannable":false,"unsure":true,"suggestion":"Try again or contact a moderator."}}'
+        return f'{{"ban_title":"Error","ban_length":"None","description":"OpenAI request failed: {e}","is_bannable":false,"unsure":true,"suggestion":"Try again or contact a moderator.","rule":""}}'
 
 async def call_openai_async(system_prompt: str, user_prompt: str) -> str:
     return await asyncio.to_thread(call_openai, system_prompt, user_prompt)
@@ -180,7 +181,6 @@ def safe_parse_model_json(text: str) -> dict:
     text = (text or "").strip()
     try:
         obj = json.loads(text)
-        # Minimal schema defaults
         return {
             "ban_title": str(obj.get("ban_title", "Unknown")),
             "ban_length": str(obj.get("ban_length", "Unknown")),
@@ -188,6 +188,7 @@ def safe_parse_model_json(text: str) -> dict:
             "is_bannable": bool(obj.get("is_bannable", False)),
             "unsure": bool(obj.get("unsure", False)),
             "suggestion": str(obj.get("suggestion", "")).strip(),
+            "rule": str(obj.get("rule", "")).strip(),
         }
     except Exception:
         return {
@@ -197,9 +198,10 @@ def safe_parse_model_json(text: str) -> dict:
             "is_bannable": False,
             "unsure": True,
             "suggestion": "I couldn’t confidently parse this. Please contact a moderator / open a report ticket.",
+            "rule": "",
         }
 
-def build_embed(result: dict, user_prompt: str) -> discord.Embed:
+def build_embed(result: dict) -> discord.Embed:
     title = f"{result['ban_title']} — {result['ban_length']}"
     desc = result["description"] or "No description provided."
 
@@ -208,11 +210,16 @@ def build_embed(result: dict, user_prompt: str) -> discord.Embed:
         description=desc[:4096],
     )
 
-    # Add the user's report as a field (trim to fit)
-    report_text = user_prompt.strip()
-    if len(report_text) > 900:
-        report_text = report_text[:900] + "…"
-    embed.add_field(name="Report", value=report_text or "(empty)", inline=False)
+    # Replace "Report" with "Rule" and show exact rule(s) broken
+    rule_text = (result.get("rule") or "").strip()
+    if not rule_text:
+        # Fallback: if model didn't provide, show a helpful placeholder
+        rule_text = "No exact rule provided."
+
+    if len(rule_text) > 900:
+        rule_text = rule_text[:900] + "…"
+
+    embed.add_field(name="Rule", value=rule_text, inline=False)
 
     # Footer used as “small text”
     if result.get("unsure") and result.get("suggestion"):
@@ -255,7 +262,7 @@ async def ask(interaction: discord.Interaction, message: str):
 
     raw = await call_openai_async(SYSTEM_PROMPT, user_prompt)
     result = safe_parse_model_json(raw)
-    embed = build_embed(result, user_prompt)
+    embed = build_embed(result)
 
     await interaction.followup.send(embed=embed)
 
