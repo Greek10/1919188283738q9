@@ -2,6 +2,7 @@
 # - Hardcoded pre-prompt (characteristics) in code
 # - /ask sends user message to ChatGPT with that system prompt
 # - Bot formats response into a clean Discord Embed
+# - NEW: /add (upload template) + /templates (browse templates with buttons)
 #
 # Requirements:
 #   pip install -U discord.py
@@ -16,6 +17,7 @@ import json
 import asyncio
 import urllib.request
 import urllib.error
+from typing import Optional, List, Dict
 
 import discord
 from discord import app_commands
@@ -32,6 +34,37 @@ COOLDOWN_S = 6
 _last_used = {}
 
 SHOW_DEBUG_PREVIEW = False
+
+# -------------------- TEMPLATE STORAGE --------------------
+TEMPLATES_FILE = "templates.json"
+_templates_lock = asyncio.Lock()
+
+def _now_unix() -> int:
+    return int(time.time())
+
+async def load_templates() -> List[Dict]:
+    async with _templates_lock:
+        try:
+            if not os.path.exists(TEMPLATES_FILE):
+                return []
+            with open(TEMPLATES_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, list):
+                return data
+            return []
+        except Exception:
+            return []
+
+async def save_templates(items: List[Dict]) -> None:
+    async with _templates_lock:
+        with open(TEMPLATES_FILE, "w", encoding="utf-8") as f:
+            json.dump(items, f, ensure_ascii=False, indent=2)
+
+def clamp_text(s: str, n: int) -> str:
+    s = (s or "").strip()
+    if len(s) <= n:
+        return s
+    return s[: n - 1] + "…"
 
 # ✅ SYSTEM PROMPT (formatted + forces JSON output)
 SYSTEM_PROMPT = r"""
@@ -215,22 +248,86 @@ def build_embed(result: dict) -> discord.Embed:
         description=desc[:4096],
     )
 
-    # Replace "Report" with "Rule" and show exact rule(s) broken
     rule_text = (result.get("rule") or "").strip()
     if not rule_text:
-        # Fallback: if model didn't provide, show a helpful placeholder
         rule_text = "No exact rule provided."
-
     if len(rule_text) > 900:
         rule_text = rule_text[:900] + "…"
 
     embed.add_field(name="Rule", value=rule_text, inline=False)
 
-    # Footer used as “small text”
     if result.get("unsure") and result.get("suggestion"):
         embed.set_footer(text=result["suggestion"][:2048])
 
     return embed
+
+# -------------------- TEMPLATE BROWSER UI --------------------
+def make_template_embed(tpl: Dict, idx: int, total: int) -> discord.Embed:
+    title = tpl.get("title", "Untitled")
+    author = tpl.get("author", "Unknown")
+    img_url = tpl.get("image_url", "")
+    added_by = tpl.get("added_by_name", "Unknown")
+    created_at = tpl.get("created_at", 0)
+
+    e = discord.Embed(
+        title=f"🧩 Template {idx+1}/{total}: {title}",
+        description=f"**Author:** {author}\n**Added by:** {added_by}\n**Added:** <t:{int(created_at)}:R>",
+    )
+
+    if img_url:
+        e.set_image(url=img_url)
+
+    # Show raw URL as a fallback
+    if img_url:
+        e.add_field(name="Image URL", value=clamp_text(img_url, 900), inline=False)
+
+    e.set_footer(text="Use the buttons to browse templates.")
+    return e
+
+class TemplatePager(discord.ui.View):
+    def __init__(self, templates: List[Dict], owner_id: int, timeout: float = 120.0):
+        super().__init__(timeout=timeout)
+        self.templates = templates
+        self.owner_id = owner_id
+        self.page = 0
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.owner_id:
+            await interaction.response.send_message("Only the command user can control this menu.", ephemeral=True)
+            return False
+        return True
+
+    def current_embed(self) -> discord.Embed:
+        total = len(self.templates)
+        return make_template_embed(self.templates[self.page], self.page, total)
+
+    def update_buttons(self):
+        total = len(self.templates)
+        self.prev_button.disabled = (self.page <= 0)
+        self.next_button.disabled = (self.page >= total - 1)
+
+    @discord.ui.button(label="⬅ Prev", style=discord.ButtonStyle.secondary)
+    async def prev_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.page = max(0, self.page - 1)
+        self.update_buttons()
+        await interaction.response.edit_message(embed=self.current_embed(), view=self)
+
+    @discord.ui.button(label="Next ➡", style=discord.ButtonStyle.secondary)
+    async def next_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.page = min(len(self.templates) - 1, self.page + 1)
+        self.update_buttons()
+        await interaction.response.edit_message(embed=self.current_embed(), view=self)
+
+    @discord.ui.button(label="Close", style=discord.ButtonStyle.danger)
+    async def close_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        for child in self.children:
+            child.disabled = True
+        await interaction.response.edit_message(view=self)
+
+    async def on_timeout(self):
+        for child in self.children:
+            child.disabled = True
+        # We can’t always edit on timeout without the message reference; that’s okay.
 
 @bot.event
 async def on_ready():
@@ -241,6 +338,7 @@ async def on_ready():
         print("⚠️ Slash sync error:", e)
     print(f"✅ Logged in as {bot.user} (id={bot.user.id})")
 
+# -------------------- COMMANDS --------------------
 @bot.tree.command(
     name="ask",
     description="Check if something is bannable under the game rules (not official)."
@@ -275,6 +373,62 @@ async def ask(interaction: discord.Interaction, message: str):
 async def ping(interaction: discord.Interaction):
     await interaction.response.send_message("🏓 Pong!")
 
+# ---- NEW: /add (upload template) ----
+@bot.tree.command(name="add", description="Add a new template (image + title + author).")
+@app_commands.describe(
+    image="Upload the template image",
+    title="Template title",
+    author="Template author"
+)
+async def add_template(
+    interaction: discord.Interaction,
+    image: discord.Attachment,
+    title: str,
+    author: str
+):
+    # basic checks
+    if image.content_type and not image.content_type.startswith("image/"):
+        await interaction.response.send_message("That file doesn’t look like an image.", ephemeral=True)
+        return
+
+    title = clamp_text(title, 80)
+    author = clamp_text(author, 80)
+
+    await interaction.response.defer(thinking=True)
+
+    # Save the template metadata (we store the CDN URL; no rehosting)
+    templates = await load_templates()
+    templates.append({
+        "id": f"{_now_unix()}-{interaction.user.id}",
+        "title": title or "Untitled",
+        "author": author or "Unknown",
+        "image_url": image.url,
+        "added_by_id": interaction.user.id,
+        "added_by_name": str(interaction.user),
+        "created_at": _now_unix(),
+    })
+    await save_templates(templates)
+
+    e = discord.Embed(
+        title="✅ Template Added",
+        description=f"**Title:** {title}\n**Author:** {author}",
+    )
+    e.set_image(url=image.url)
+    await interaction.followup.send(embed=e)
+
+# ---- NEW: /templates (browse templates) ----
+@bot.tree.command(name="templates", description="Browse saved templates.")
+async def templates(interaction: discord.Interaction):
+    tpls = await load_templates()
+    if not tpls:
+        await interaction.response.send_message("No templates have been added yet. Use `/add` first.", ephemeral=True)
+        return
+
+    view = TemplatePager(tpls, owner_id=interaction.user.id, timeout=180.0)
+    view.update_buttons()
+    await interaction.response.send_message(embed=view.current_embed(), view=view)
+
+# -------------------- START --------------------
 if __name__ == "__main__":
     if not DISCORD_TOKEN:
         raise RuntimeError("Missing DISCORD_TOKEN env var.")
