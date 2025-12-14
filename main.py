@@ -1,14 +1,14 @@
 # Discord Slash Bot (Pydroid-friendly)
 # - Hardcoded pre-prompt (characteristics) in code
-# - /ask sends user message to ChatGPT with that system prompt
-# - Bot formats response into a clean Discord Embed
+# - /ask checks if something is bannable under your rules
+# - Output: clean Discord markdown (NO embeds, NO "Report" field)
 #
 # Requirements:
 #   pip install -U discord.py
 #
-# Env vars you MUST set:
-#   DISCORD_TOKEN   = your Discord bot token
-#   OPENAI_API_KEY  = your OpenAI API key
+# Env vars:
+#   DISCORD_TOKEN
+#   OPENAI_API_KEY
 
 import os
 import time
@@ -26,26 +26,27 @@ DISCORD_TOKEN = os.getenv("DISCORD_TOKEN", "").strip()
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
 
 MODEL = "gpt-4.1-mini"
-MAX_OUTPUT_TOKENS = 450
+MAX_OUTPUT_TOKENS = 650
 
 COOLDOWN_S = 6
 _last_used = {}
 
 SHOW_DEBUG_PREVIEW = False
 
-# ✅ SYSTEM PROMPT (formatted + forces JSON output)
+# ✅ SYSTEM PROMPT (forces exact rule matching + multi-reason ban-length)
 SYSTEM_PROMPT = r"""
 You are a moderation helper for a Roblox r/place-clone game.
-You must follow Roblox TOS and the rules below.
+You must follow Roblox TOS and the in-game rules below.
 
-# In-game Rules (summary)
+# In-game Rules
+
 Permanent Ban:
 - Leaking personally identifiable information ("doxxing")
 - Deploying bot accounts
-- Detailed/major NSFW drawings
+- Detailed/major not-safe-for-work drawings
 - Harassment occurring for more than a month
 - Repeated offences
-- Extremism (e.g. supporting groups like Al-Qaeda, KKK, Nazism or encouraging violence)
+- Extremism (such as promoting, being involved in, wearing the outfits of and/or supporting groups like Al-Qaeda, the Ku Klux Klan, Nazism etc or otherwise encouraging violence)
 - Ban evasion
 - Pedophilia/Zoophilia
 
@@ -59,11 +60,11 @@ One-Month Ban:
 - Heavy/realistic gore
 
 One-Week Ban:
-- Minor NSFW drawing
+- Minor not-safe-for-work drawing
 - Using more than 1 account at a time
 - Inappropriate display usernames (swears)
 - Large female genitalia depictions
-- Large male genitalia depictions or explicit ones (e.g. shown going into a character's mouth)
+- Large male genitalia depictions or ones that are explicit for other reasons (shown as going into a character's mouth)
 - Breaking Roblox maturity rating (romantic themes, gambling, alcohol, drugs)
 - Impersonating other players
 
@@ -75,41 +76,53 @@ Three-Day Ban:
 One-Day Ban:
 - Bypassing swear words
 
-Warnings / Kicks / Under One-Day Ban:
+Warnings, Kicks, Under One-Day Ban:
 - "W/Sing" or giving "backshots" (chronologically warning, kick, under 1 hour ban)
 - Avatars impacting other player experiences (large avatars)
 
 Other:
-- Framing users: same duration as what they tried to frame for
-- Lying on a ban appeal: double the original ban length
-- Coordinated account usage by one person (saving pixels across multiple accounts then using them one by one):
-  One-week ban per extra account used
-- Abusing mechanics to gain unfair advantage: moderator decides duration
-- Conspiring to break rules: half or full duration of what they would have done
+- Framing users - same duration as what they tried to frame the player for
+- Lying on a ban appeal - double the length they were originally banned for
+- Coordinated account usage by one person (saving pixels on multiple accounts then using them one by one, in turn starting off with more than 20 pixels) - One-week ban per extra account used
+- Abusing in-game mechanics to gain an unfair advantage over others - moderator decides punishment duration
+- Conspiring to break the rules - Half or full duration of what they would have done
 
 What is NOT bannable:
 - Chat (unless it bypasses chat filter)
 - Griefing
 
 # Task
-Given the user's report, decide if it breaks the rules.
+Given the user's message, decide if it breaks the rules.
 
-If you are NOT completely sure it is bannable, you MUST recommend contacting a moderator / opening a report ticket.
-If you ARE sure, do NOT include that recommendation.
+CRITICAL REQUIREMENTS:
+1) You MUST locate the exact reason(s) by referencing the closest matching bullet(s) from the rules above.
+2) If there are multiple reasons, you MUST include ALL of them in the ban length output (combine categories).
+   Example ban_length: "One-Month + One-Week" or "Permanent + One-Month".
+3) If you cannot confirm entirely that it is bannable, you must mark unsure=true and recommend contacting a moderator / opening a report ticket.
+4) If you are sure, do NOT include that recommendation.
 
 # Output format (STRICT)
-Return ONLY valid JSON (no markdown, no extra text) in exactly this schema:
+Return ONLY valid JSON (no markdown, no extra text) exactly matching this schema:
 
 {
-  "ban_title": "string",            // e.g. "One-Week Ban" or "Not bannable"
-  "ban_length": "string",           // e.g. "7 days", "Permanent", "None"
-  "description": "string",          // explain which rule(s) apply and why
   "is_bannable": true/false,
   "unsure": true/false,
-  "suggestion": "string"            // empty if not unsure; otherwise tell them to contact a mod / open a ticket
+  "ban_length": "string",          // combined if multiple reasons, e.g. "One-Month + One-Week"
+  "title": "string",               // short headline
+  "reasons": [
+    {
+      "category": "string",        // e.g. "One-Week Ban"
+      "rule_text": "string",       // exact or near-exact bullet text from rules
+      "why": "string"              // short explanation
+    }
+  ],
+  "note": "string"                 // empty if sure; otherwise your mod-contact suggestion
 }
 
-Keep description concise and informative.
+Rules for content:
+- reasons MUST NOT be empty if is_bannable=true.
+- If is_bannable=false and unsure=false, you can set reasons=[].
+- Keep everything concise.
 """.strip()
 
 
@@ -124,7 +137,7 @@ def _extract_text_from_responses_api(json_obj: dict) -> str:
 
 def call_openai(system_prompt: str, user_prompt: str) -> str:
     if not OPENAI_API_KEY:
-        return "Missing OPENAI_API_KEY env var."
+        return ""
 
     url = "https://api.openai.com/v1/responses"
     payload = {
@@ -145,16 +158,9 @@ def call_openai(system_prompt: str, user_prompt: str) -> str:
         with urllib.request.urlopen(req, timeout=60) as resp:
             raw = resp.read().decode("utf-8")
         j = json.loads(raw)
-        text = _extract_text_from_responses_api(j)
-        return text or ""
-    except urllib.error.HTTPError as e:
-        try:
-            body = e.read().decode("utf-8", errors="replace")
-        except Exception:
-            body = ""
-        return f'{{"ban_title":"Error","ban_length":"None","description":"OpenAI HTTP error {e.code}: {body[:400]}","is_bannable":false,"unsure":true,"suggestion":"Try again or contact a moderator."}}'
-    except Exception as e:
-        return f'{{"ban_title":"Error","ban_length":"None","description":"OpenAI request failed: {e}","is_bannable":false,"unsure":true,"suggestion":"Try again or contact a moderator."}}'
+        return _extract_text_from_responses_api(j) or ""
+    except Exception:
+        return ""
 
 async def call_openai_async(system_prompt: str, user_prompt: str) -> str:
     return await asyncio.to_thread(call_openai, system_prompt, user_prompt)
@@ -174,51 +180,99 @@ def cooldown_ok(user_id: int) -> bool:
 
 def safe_parse_model_json(text: str) -> dict:
     """
-    Model should return JSON only. This function tries to parse it safely.
-    If parsing fails, returns a fallback structure and includes raw text.
+    Parse the model JSON. If it fails, fallback to an 'unsure' response.
     """
     text = (text or "").strip()
     try:
         obj = json.loads(text)
-        # Minimal schema defaults
+        # Normalize fields
+        is_bannable = bool(obj.get("is_bannable", False))
+        unsure = bool(obj.get("unsure", False))
+        ban_length = str(obj.get("ban_length", "Unknown")).strip() or "Unknown"
+        title = str(obj.get("title", "Decision")).strip() or "Decision"
+        reasons = obj.get("reasons", [])
+        if not isinstance(reasons, list):
+            reasons = []
+
+        cleaned_reasons = []
+        for r in reasons:
+            if not isinstance(r, dict):
+                continue
+            cleaned_reasons.append({
+                "category": str(r.get("category", "")).strip(),
+                "rule_text": str(r.get("rule_text", "")).strip(),
+                "why": str(r.get("why", "")).strip(),
+            })
+
+        note = str(obj.get("note", "")).strip()
+
+        # If bannable but no reasons, treat as unsure (so we don't mislead)
+        if is_bannable and len(cleaned_reasons) == 0:
+            return {
+                "is_bannable": False,
+                "unsure": True,
+                "ban_length": "Unknown",
+                "title": "Unsure",
+                "reasons": [],
+                "note": "I couldn’t match an exact rule confidently. Please contact a moderator / open a report ticket.",
+            }
+
+        # If unsure, ensure note exists
+        if unsure and not note:
+            note = "I’m not fully sure. Please contact a moderator / open a report ticket."
+
         return {
-            "ban_title": str(obj.get("ban_title", "Unknown")),
-            "ban_length": str(obj.get("ban_length", "Unknown")),
-            "description": str(obj.get("description", "")).strip(),
-            "is_bannable": bool(obj.get("is_bannable", False)),
-            "unsure": bool(obj.get("unsure", False)),
-            "suggestion": str(obj.get("suggestion", "")).strip(),
+            "is_bannable": is_bannable,
+            "unsure": unsure,
+            "ban_length": ban_length,
+            "title": title,
+            "reasons": cleaned_reasons,
+            "note": note,
         }
     except Exception:
         return {
-            "ban_title": "Unparsed response",
-            "ban_length": "Unknown",
-            "description": f"Could not parse model output.\nRaw:\n{text[:1500]}",
             "is_bannable": False,
             "unsure": True,
-            "suggestion": "I couldn’t confidently parse this. Please contact a moderator / open a report ticket.",
+            "ban_length": "Unknown",
+            "title": "Unsure",
+            "reasons": [],
+            "note": "I couldn’t parse the response reliably. Please contact a moderator / open a report ticket.",
         }
 
-def build_embed(result: dict, user_prompt: str) -> discord.Embed:
-    title = f"{result['ban_title']} — {result['ban_length']}"
-    desc = result["description"] or "No description provided."
+def build_pretty_message(result: dict) -> str:
+    """
+    Formats output as Discord markdown, no embed, no report.
+    """
+    status = "✅ Bannable" if result["is_bannable"] else ("⚠️ Unsure" if result["unsure"] else "❌ Not bannable")
 
-    embed = discord.Embed(
-        title=title,
-        description=desc[:4096],
-    )
+    # Top line: **Title**: Ban length
+    top = f"**{result['title']}**: {result['ban_length']}  \n{status}"
 
-    # Add the user's report as a field (trim to fit)
-    report_text = user_prompt.strip()
-    if len(report_text) > 900:
-        report_text = report_text[:900] + "…"
-    embed.add_field(name="Report", value=report_text or "(empty)", inline=False)
+    parts = [top]
 
-    # Footer used as “small text”
-    if result.get("unsure") and result.get("suggestion"):
-        embed.set_footer(text=result["suggestion"][:2048])
+    # Reasons list (exact rule text)
+    if result["reasons"]:
+        parts.append("\n**Exact rule match(es):**")
+        for idx, r in enumerate(result["reasons"], start=1):
+            cat = r["category"] or "Rule"
+            rule_text = r["rule_text"] or "(no rule text provided)"
+            why = r["why"] or ""
+            # Make rule text pop but keep it readable
+            line = f"{idx}. **{cat}** — `{rule_text}`"
+            if why:
+                line += f"\n   {why}"
+            parts.append(line)
 
-    return embed
+    # Small footer-like note (Discord doesn't have true small text; we use italic + parentheses)
+    if result["unsure"] and result["note"]:
+        parts.append(f"\n*(Suggestion: {result['note']})*")
+
+    msg = "\n".join(parts).strip()
+
+    # Safety: Discord message limit 2000 chars
+    if len(msg) > 1900:
+        msg = msg[:1900] + "\n…(trimmed)"
+    return msg
 
 @bot.event
 async def on_ready():
@@ -231,7 +285,7 @@ async def on_ready():
 
 @bot.tree.command(
     name="ask",
-    description="Check if something is bannable under the game rules (not official)."
+    description="Checks if something is bannable under the game rules (not official)."
 )
 @app_commands.describe(message="Describe what happened / what was drawn / what was said.")
 async def ask(interaction: discord.Interaction, message: str):
@@ -254,10 +308,17 @@ async def ask(interaction: discord.Interaction, message: str):
         await interaction.followup.send(f"```text\n{preview[:1800]}\n```", ephemeral=True)
 
     raw = await call_openai_async(SYSTEM_PROMPT, user_prompt)
-    result = safe_parse_model_json(raw)
-    embed = build_embed(result, user_prompt)
 
-    await interaction.followup.send(embed=embed)
+    # If OpenAI failed, do an unsure fallback
+    if not raw:
+        await interaction.followup.send(
+            "**Unsure**: Unknown\n⚠️ Unsure\n\n*(Suggestion: I couldn’t reach the checker. Please contact a moderator / open a report ticket.)*"
+        )
+        return
+
+    result = safe_parse_model_json(raw)
+    pretty = build_pretty_message(result)
+    await interaction.followup.send(pretty)
 
 @bot.tree.command(name="ping", description="Check if the bot is alive.")
 async def ping(interaction: discord.Interaction):
