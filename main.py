@@ -359,10 +359,10 @@ async def timefromimage(interaction: discord.Interaction, image: discord.Attachm
     h, m, s = seconds_to_hms(total_seconds)
 
     await interaction.followup.send(
-        f"🖼️ **Image size:** {width}×{height}\n"
-        f"🔢 **Total pixels:** {total_pixels:,}\n"
-        f"👥 **Players:** {players}\n"
-        f"⏱️ **Time:** ceil({total_pixels:,} / {players}) × {COOLDOWN_SECONDS_PER_PIXEL}s\n"
+        f"**Image size:** {width}×{height}\n"
+        f"**Total pixels:** {total_pixels:,}\n"
+        f"**Players:** {players}\n"
+        f"**Estimated Time:** ceil({total_pixels:,} / {players}) × {COOLDOWN_SECONDS_PER_PIXEL}s\n"
         f"= **{total_seconds:,} seconds** = **{h}h {m}m {s}s**"
     )
 
