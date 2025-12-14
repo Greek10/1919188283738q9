@@ -100,6 +100,7 @@ If you are NOT completely sure it is bannable, you MUST recommend contacting a m
 If you ARE sure, do NOT include that recommendation.
 
 you MUST add onto the ban length if multiple bannable things are being mentioned. assume 1 month is 31 days.
+an example of this would be: a user mentions that a penis and swastika is being drawn, you would say 34 days (3 for pp, 31 for swastika)
 
 # Output format (STRICT)
 Return ONLY valid JSON (no markdown, no extra text) in exactly this schema:
