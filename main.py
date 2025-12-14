@@ -1,7 +1,7 @@
 # Discord Slash Bot (Pydroid-friendly)
 # - Hardcoded pre-prompt (characteristics) in code
 # - /ask sends user message to ChatGPT with that system prompt
-# - Optional: shows a debug “what was sent” preview (ephemeral) toggle
+# - Bot formats response into a clean Discord Embed
 #
 # Requirements:
 #   pip install -U discord.py
@@ -9,10 +9,6 @@
 # Env vars you MUST set:
 #   DISCORD_TOKEN   = your Discord bot token
 #   OPENAI_API_KEY  = your OpenAI API key
-#
-# Notes:
-# - Pydroid/mobile bots won’t stay online if Android kills the app.
-# - Keep keys private. Don’t paste tokens in code if you’ll share it.
 
 import os
 import time
@@ -29,88 +25,96 @@ from discord.ext import commands
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN", "").strip()
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
 
-# ✅ SET YOUR CHARACTERISTICS / PRE-PROMPT HERE (hardcoded)
-SYSTEM_PROMPT = """
-these are the rules to a Roblox game based on a r/place clone.
-it follows Roblox TOS and the rules below 
-# In-game Rules
+MODEL = "gpt-4.1-mini"
+MAX_OUTPUT_TOKENS = 450
 
-**Permanent Ban: **
-Leaking personally identifiable information ("doxxing").
-Deploying bot accounts.
-Detailed/major not-safe-for-work drawings
-Harassment occurring for more than a month.
-Repeated offences.
-Extremism (such as promoting, being involved in, wearing the outfits of and/or supporting groups like Al-Qaeda, the Ku Klux Klan, Nazism etc or otherwise encouraging violence)
-ban evasion
-Pedophilia/Zoophilia
+COOLDOWN_S = 6
+_last_used = {}
 
-**One-Month Ban:**
-Slurs (canvas or chat).
-Swastikas and other offensive symbols.
-Using a macro.
-Sexual in-game talk.
-Very inappropriate display usernames (slurs).
-Links or QR codes
-Heavy/realistic gore
+SHOW_DEBUG_PREVIEW = False
 
-**One-Week Ban:**
-Minor not-safe-for-work drawing.
-Using more than 1 account at a time.
-Inappropriate display usernames (swears).
-Large female genitalia depictions.
-Large male genitalia depictions or ones that are explicit for other reasons (shown as going into a character's mouth).
-Breaking Roblox maturity rating (romantic themes, gambling, alcohol, drugs). 
-Impersonating other players
+# ✅ SYSTEM PROMPT (formatted + forces JSON output)
+SYSTEM_PROMPT = r"""
+You are a moderation helper for a Roblox r/place-clone game.
+You must follow Roblox TOS and the rules below.
 
+# In-game Rules (summary)
+Permanent Ban:
+- Leaking personally identifiable information ("doxxing")
+- Deploying bot accounts
+- Detailed/major NSFW drawings
+- Harassment occurring for more than a month
+- Repeated offences
+- Extremism (e.g. supporting groups like Al-Qaeda, KKK, Nazism or encouraging violence)
+- Ban evasion
+- Pedophilia/Zoophilia
 
-**Three-Day Ban:**
-Male genitalia depictions (upside down "T").
-Female genitalia depictions.
-Exploits (if not caught by anti-cheat).
+One-Month Ban:
+- Slurs (canvas or chat)
+- Swastikas and other offensive symbols
+- Using a macro
+- Sexual in-game talk
+- Very inappropriate display usernames (slurs)
+- Links or QR codes
+- Heavy/realistic gore
 
-**One-Day Ban:**
-Bypassing swear words.
+One-Week Ban:
+- Minor NSFW drawing
+- Using more than 1 account at a time
+- Inappropriate display usernames (swears)
+- Large female genitalia depictions
+- Large male genitalia depictions or explicit ones (e.g. shown going into a character's mouth)
+- Breaking Roblox maturity rating (romantic themes, gambling, alcohol, drugs)
+- Impersonating other players
 
-**Warnings, Kicks, Under One-Day Ban:**
-"W/Sing" or giving "backshots" (chronologically warning, kick, under 1 hour ban).
-Avatars impacting other player experiences (large avatars)
+Three-Day Ban:
+- Male genitalia depictions (upside down "T")
+- Female genitalia depictions
+- Exploits (if not caught by anti-cheat)
 
-**Other**
-Framing users - same duration as what they tried to frame the player for
-Lying on a ban appeal - double the length they were originally banned for
-Coordinated account usage by one person (saving pixels on multiple accounts then using them one by one, in turn starting off with more than 20 pixels) - One-week ban per extra account used. - one week ban
-Abusing in-game mechanics to gain an unfair advantage over others - moderator decides punishment duration
-Conspiring to break the rules -Half or full duration of what they would have done.
-** what is not bannable **
-chat (unless it bypasses chat)
-griefing 
+One-Day Ban:
+- Bypassing swear words
 
-you are meant to read the message below and respond if that is breaking the rules. If you can not confirm entirely that something is bannable then suggest the user to contact a mod or open a report ticket, if you can figure out if it's bannable then skip that part but if you are unsure then add it.
-it should be formatted like this:
-title (in bold): Ban length
-description (normal text): your usual response (locating the rules and giving an informative text)
-bottom text (small text (-#) use this before the text to make it small): if unsure, show the text of suggestion to contact a mod - this should ONLY show if you can not entirely find a reason.
+Warnings / Kicks / Under One-Day Ban:
+- "W/Sing" or giving "backshots" (chronologically warning, kick, under 1 hour ban)
+- Avatars impacting other player experiences (large avatars)
 
+Other:
+- Framing users: same duration as what they tried to frame for
+- Lying on a ban appeal: double the original ban length
+- Coordinated account usage by one person (saving pixels across multiple accounts then using them one by one):
+  One-week ban per extra account used
+- Abusing mechanics to gain unfair advantage: moderator decides duration
+- Conspiring to break rules: half or full duration of what they would have done
 
+What is NOT bannable:
+- Chat (unless it bypasses chat filter)
+- Griefing
+
+# Task
+Given the user's report, decide if it breaks the rules.
+
+If you are NOT completely sure it is bannable, you MUST recommend contacting a moderator / opening a report ticket.
+If you ARE sure, do NOT include that recommendation.
+
+# Output format (STRICT)
+Return ONLY valid JSON (no markdown, no extra text) in exactly this schema:
+
+{
+  "ban_title": "string",            // e.g. "One-Week Ban" or "Not bannable"
+  "ban_length": "string",           // e.g. "7 days", "Permanent", "None"
+  "description": "string",          // explain which rule(s) apply and why
+  "is_bannable": true/false,
+  "unsure": true/false,
+  "suggestion": "string"            // empty if not unsure; otherwise tell them to contact a mod / open a ticket
+}
+
+Keep description concise and informative.
 """.strip()
 
-# OpenAI model (adjust if you want)
-MODEL = "gpt-4.1-mini"
-MAX_OUTPUT_TOKENS = 600
-
-# Basic per-user cooldown (seconds)
-COOLDOWN_S = 6
-_last_used = {}  # user_id -> last timestamp
-
-# Optional: show a debug preview of what gets sent (ephemeral)
-SHOW_DEBUG_PREVIEW = False
 
 # -------------------- OPENAI (Responses API) --------------------
 def _extract_text_from_responses_api(json_obj: dict) -> str:
-    """
-    Extract output text from OpenAI Responses API response.
-    """
     out_text = []
     for item in json_obj.get("output", []):
         for c in item.get("content", []):
@@ -119,9 +123,6 @@ def _extract_text_from_responses_api(json_obj: dict) -> str:
     return ("\n".join(out_text)).strip()
 
 def call_openai(system_prompt: str, user_prompt: str) -> str:
-    """
-    Calls OpenAI Responses API via HTTPS (no SDK dependency).
-    """
     if not OPENAI_API_KEY:
         return "Missing OPENAI_API_KEY env var."
 
@@ -145,19 +146,19 @@ def call_openai(system_prompt: str, user_prompt: str) -> str:
             raw = resp.read().decode("utf-8")
         j = json.loads(raw)
         text = _extract_text_from_responses_api(j)
-        return text or "No output text returned."
+        return text or ""
     except urllib.error.HTTPError as e:
         try:
             body = e.read().decode("utf-8", errors="replace")
         except Exception:
             body = ""
-        return f"OpenAI HTTP error {e.code}: {body[:800]}"
+        return f'{{"ban_title":"Error","ban_length":"None","description":"OpenAI HTTP error {e.code}: {body[:400]}","is_bannable":false,"unsure":true,"suggestion":"Try again or contact a moderator."}}'
     except Exception as e:
-        return f"OpenAI request failed: {e}"
+        return f'{{"ban_title":"Error","ban_length":"None","description":"OpenAI request failed: {e}","is_bannable":false,"unsure":true,"suggestion":"Try again or contact a moderator."}}'
 
 async def call_openai_async(system_prompt: str, user_prompt: str) -> str:
-    # Run the blocking HTTPS call in a thread so Discord stays responsive
     return await asyncio.to_thread(call_openai, system_prompt, user_prompt)
+
 
 # -------------------- DISCORD BOT --------------------
 intents = discord.Intents.default()
@@ -171,21 +172,53 @@ def cooldown_ok(user_id: int) -> bool:
     _last_used[user_id] = now
     return True
 
-def chunk_for_discord(text: str, limit: int = 1900) -> list[str]:
+def safe_parse_model_json(text: str) -> dict:
     """
-    Split long text into Discord-safe chunks.
+    Model should return JSON only. This function tries to parse it safely.
+    If parsing fails, returns a fallback structure and includes raw text.
     """
-    text = text.strip()
-    if len(text) <= limit:
-        return [text] if text else ["(empty response)"]
+    text = (text or "").strip()
+    try:
+        obj = json.loads(text)
+        # Minimal schema defaults
+        return {
+            "ban_title": str(obj.get("ban_title", "Unknown")),
+            "ban_length": str(obj.get("ban_length", "Unknown")),
+            "description": str(obj.get("description", "")).strip(),
+            "is_bannable": bool(obj.get("is_bannable", False)),
+            "unsure": bool(obj.get("unsure", False)),
+            "suggestion": str(obj.get("suggestion", "")).strip(),
+        }
+    except Exception:
+        return {
+            "ban_title": "Unparsed response",
+            "ban_length": "Unknown",
+            "description": f"Could not parse model output.\nRaw:\n{text[:1500]}",
+            "is_bannable": False,
+            "unsure": True,
+            "suggestion": "I couldn’t confidently parse this. Please contact a moderator / open a report ticket.",
+        }
 
-    chunks = []
-    start = 0
-    while start < len(text):
-        end = min(start + limit, len(text))
-        chunks.append(text[start:end])
-        start = end
-    return chunks
+def build_embed(result: dict, user_prompt: str) -> discord.Embed:
+    title = f"{result['ban_title']} — {result['ban_length']}"
+    desc = result["description"] or "No description provided."
+
+    embed = discord.Embed(
+        title=title,
+        description=desc[:4096],
+    )
+
+    # Add the user's report as a field (trim to fit)
+    report_text = user_prompt.strip()
+    if len(report_text) > 900:
+        report_text = report_text[:900] + "…"
+    embed.add_field(name="Report", value=report_text or "(empty)", inline=False)
+
+    # Footer used as “small text”
+    if result.get("unsure") and result.get("suggestion"):
+        embed.set_footer(text=result["suggestion"][:2048])
+
+    return embed
 
 @bot.event
 async def on_ready():
@@ -196,8 +229,11 @@ async def on_ready():
         print("⚠️ Slash sync error:", e)
     print(f"✅ Logged in as {bot.user} (id={bot.user.id})")
 
-@bot.tree.command(name="ask", description="Tells whether something is bannable or not - do not use this to confirm anything..")
-@app_commands.describe(message="What you want to ask the assistant.")
+@bot.tree.command(
+    name="ask",
+    description="Check if something is bannable under the game rules (not official)."
+)
+@app_commands.describe(message="Describe what happened / what was drawn / what was said.")
 async def ask(interaction: discord.Interaction, message: str):
     if not cooldown_ok(interaction.user.id):
         await interaction.response.send_message(
@@ -211,28 +247,23 @@ async def ask(interaction: discord.Interaction, message: str):
         await interaction.response.send_message("Type a message to ask.", ephemeral=True)
         return
 
-    # Defer to avoid Discord 3-second timeout while we call OpenAI
     await interaction.response.defer(thinking=True)
 
     if SHOW_DEBUG_PREVIEW:
-        preview = f"SYSTEM (characteristics):\n{SYSTEM_PROMPT}\n\nUSER:\n{user_prompt}"
-        # Send ephemeral debug preview (won't spam the channel)
-        for part in chunk_for_discord(preview, limit=1800):
-            await interaction.followup.send(f"```text\n{part}\n```", ephemeral=True)
+        preview = f"SYSTEM:\n{SYSTEM_PROMPT}\n\nUSER:\n{user_prompt}"
+        await interaction.followup.send(f"```text\n{preview[:1800]}\n```", ephemeral=True)
 
-    reply = await call_openai_async(SYSTEM_PROMPT, user_prompt)
+    raw = await call_openai_async(SYSTEM_PROMPT, user_prompt)
+    result = safe_parse_model_json(raw)
+    embed = build_embed(result, user_prompt)
 
-    # Send reply in chunks if needed
-    for i, part in enumerate(chunk_for_discord(reply, limit=1900)):
-        await interaction.followup.send(part)
+    await interaction.followup.send(embed=embed)
 
 @bot.tree.command(name="ping", description="Check if the bot is alive.")
 async def ping(interaction: discord.Interaction):
     await interaction.response.send_message("🏓 Pong!")
 
-# -------------------- START --------------------
 if __name__ == "__main__":
     if not DISCORD_TOKEN:
         raise RuntimeError("Missing DISCORD_TOKEN env var.")
-    # OPENAI_API_KEY can be missing if you just want /ping to work.
     bot.run(DISCORD_TOKEN)
