@@ -378,4 +378,3 @@ if __name__ == "__main__":
     if not DISCORD_TOKEN:
         raise RuntimeError("Missing DISCORD_TOKEN env var.")
     bot.run(DISCORD_TOKEN)
-```0
