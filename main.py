@@ -1,6 +1,6 @@
-# Discord Slash Bot (Pydroid-friendly)
+# Discord Slash Bot (Pydroid/Railway-friendly)
 # - /ask = rule checker (OpenAI)
-# - /timefromimage = reads attached image size and calculates build time (15s per pixel)
+# - /timefromimage = accepts an image via SLASH OPTION (Attachment) + fallback to normal attachments
 #
 # Requirements:
 #   pip install -U discord.py pillow
@@ -15,7 +15,6 @@ import json
 import asyncio
 import math
 import urllib.request
-import urllib.error
 
 import discord
 from discord import app_commands
@@ -259,7 +258,7 @@ def build_pretty_message(result: dict) -> str:
         msg = msg[:1900] + "\n…(trimmed)"
     return msg
 
-def seconds_to_hms(total_seconds: int) -> tuple[int, int, int]:
+def seconds_to_hms(total_seconds: int):
     h = total_seconds // 3600
     total_seconds -= h * 3600
     m = total_seconds // 60
@@ -271,6 +270,7 @@ async def on_ready():
     try:
         synced = await bot.tree.sync()
         print(f"✅ Synced {len(synced)} slash commands.")
+        print("✅ Commands:", [c.name for c in synced])
     except Exception as e:
         print("⚠️ Slash sync error:", e)
     print(f"✅ Logged in as {bot.user} (id={bot.user.id})")
@@ -283,10 +283,7 @@ async def on_ready():
 @app_commands.describe(message="Describe what happened / what was drawn / what was said.")
 async def ask(interaction: discord.Interaction, message: str):
     if not cooldown_ok(interaction.user.id):
-        await interaction.response.send_message(
-            f"⏳ Slow down — try again in {COOLDOWN_S}s.",
-            ephemeral=True
-        )
+        await interaction.response.send_message(f"⏳ Slow down — try again in {COOLDOWN_S}s.", ephemeral=True)
         return
 
     user_prompt = (message or "").strip()
@@ -309,40 +306,43 @@ async def ask(interaction: discord.Interaction, message: str):
         return
 
     result = safe_parse_model_json(raw)
-    pretty = build_pretty_message(result)
-    await interaction.followup.send(pretty)
+    await interaction.followup.send(build_pretty_message(result))
 
 @bot.tree.command(
     name="timefromimage",
-    description="Attach an image: calculates build time from its pixel size (15s per pixel)."
+    description="Calculates build time from an image's pixel size (15s per pixel)."
 )
-@app_commands.describe(players="Optional: number of players building in parallel (default 1).")
-async def timefromimage(interaction: discord.Interaction, players: int = 1):
-    if not interaction.attachments:
-        await interaction.response.send_message(
-            "Attach an image when using `/timefromimage`.",
-            ephemeral=True
-        )
-        return
+@app_commands.describe(
+    image="Upload the image here (this is real slash-command image input).",
+    players="Optional: number of players building in parallel (default 1)."
+)
+async def timefromimage(interaction: discord.Interaction, image: discord.Attachment = None, players: int = 1):
+    # Fallback: allow normal attachments too (in case client doesn't show option)
+    if image is None:
+        if interaction.attachments:
+            image = interaction.attachments[0]
+        else:
+            await interaction.response.send_message(
+                "Upload an image using the `image` option (or attach one to the command message).",
+                ephemeral=True
+            )
+            return
 
     if players < 1:
         players = 1
     if players > 1000:
-        players = 1000  # sanity cap
+        players = 1000
 
-    att = interaction.attachments[0]
-    if not (att.content_type or "").startswith("image/"):
-        await interaction.response.send_message(
-            "That attachment doesn’t look like an image.",
-            ephemeral=True
-        )
+    # Best-effort type check (sometimes content_type is None)
+    if image.content_type and not image.content_type.startswith("image/"):
+        await interaction.response.send_message("That file doesn’t look like an image.", ephemeral=True)
         return
 
     await interaction.response.defer(thinking=True)
 
-    data = await att.read()
+    data = await image.read()
 
-    # Lazy import to reduce idle RAM
+    # Lazy import keeps idle RAM lower
     try:
         import io
         from PIL import Image
@@ -354,11 +354,8 @@ async def timefromimage(interaction: discord.Interaction, players: int = 1):
 
     total_pixels = width * height
 
-    # Your confirmed equation:
-    # 1 pixel charge every 15 seconds per player => ticks = ceil(pixels/players)
     ticks_needed = math.ceil(total_pixels / players)
     total_seconds = ticks_needed * COOLDOWN_SECONDS_PER_PIXEL
-
     h, m, s = seconds_to_hms(total_seconds)
 
     await interaction.followup.send(
