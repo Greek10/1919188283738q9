@@ -2,7 +2,9 @@
 # - Hardcoded pre-prompt (characteristics) in code
 # - /ask sends user message to ChatGPT with that system prompt
 # - Bot formats response into a clean Discord Embed
-# - NEW: /add (upload template) + /templates (browse templates with buttons)
+# - NEW:
+#   /add       -> upload a template image + title + author (saved to templates.json)
+#   /templates -> browse templates in a GRID-style embed page with Prev/Next buttons
 #
 # Requirements:
 #   pip install -U discord.py
@@ -38,9 +40,16 @@ SHOW_DEBUG_PREVIEW = False
 # -------------------- TEMPLATE STORAGE --------------------
 TEMPLATES_FILE = "templates.json"
 _templates_lock = asyncio.Lock()
+TEMPLATES_PER_PAGE = 6  # grid size per page (2 columns-ish due to inline fields)
 
 def _now_unix() -> int:
     return int(time.time())
+
+def clamp_text(s: str, n: int) -> str:
+    s = (s or "").strip()
+    if len(s) <= n:
+        return s
+    return s[: n - 1] + "…"
 
 async def load_templates() -> List[Dict]:
     async with _templates_lock:
@@ -49,9 +58,7 @@ async def load_templates() -> List[Dict]:
                 return []
             with open(TEMPLATES_FILE, "r", encoding="utf-8") as f:
                 data = json.load(f)
-            if isinstance(data, list):
-                return data
-            return []
+            return data if isinstance(data, list) else []
         except Exception:
             return []
 
@@ -59,12 +66,6 @@ async def save_templates(items: List[Dict]) -> None:
     async with _templates_lock:
         with open(TEMPLATES_FILE, "w", encoding="utf-8") as f:
             json.dump(items, f, ensure_ascii=False, indent=2)
-
-def clamp_text(s: str, n: int) -> str:
-    s = (s or "").strip()
-    if len(s) <= n:
-        return s
-    return s[: n - 1] + "…"
 
 # ✅ SYSTEM PROMPT (formatted + forces JSON output)
 SYSTEM_PROMPT = r"""
@@ -151,7 +152,6 @@ Return ONLY valid JSON (no markdown, no extra text) in exactly this schema:
 Keep description concise and informative.
 """.strip()
 
-
 # -------------------- OPENAI (Responses API) --------------------
 def _extract_text_from_responses_api(json_obj: dict) -> str:
     out_text = []
@@ -197,7 +197,6 @@ def call_openai(system_prompt: str, user_prompt: str) -> str:
 
 async def call_openai_async(system_prompt: str, user_prompt: str) -> str:
     return await asyncio.to_thread(call_openai, system_prompt, user_prompt)
-
 
 # -------------------- DISCORD BOT --------------------
 intents = discord.Intents.default()
@@ -248,48 +247,64 @@ def build_embed(result: dict) -> discord.Embed:
         description=desc[:4096],
     )
 
+    # "Rule" field (exact rule bullet text broken)
     rule_text = (result.get("rule") or "").strip()
     if not rule_text:
         rule_text = "No exact rule provided."
     if len(rule_text) > 900:
         rule_text = rule_text[:900] + "…"
-
     embed.add_field(name="Rule", value=rule_text, inline=False)
 
+    # Footer used as “small text”
     if result.get("unsure") and result.get("suggestion"):
         embed.set_footer(text=result["suggestion"][:2048])
 
     return embed
 
-# -------------------- TEMPLATE BROWSER UI --------------------
-def make_template_embed(tpl: Dict, idx: int, total: int) -> discord.Embed:
-    title = tpl.get("title", "Untitled")
-    author = tpl.get("author", "Unknown")
-    img_url = tpl.get("image_url", "")
-    added_by = tpl.get("added_by_name", "Unknown")
-    created_at = tpl.get("created_at", 0)
+# -------------------- TEMPLATE GRID UI --------------------
+def make_templates_grid_embed(templates: List[Dict], page: int) -> discord.Embed:
+    total = len(templates)
+    total_pages = max(1, (total + TEMPLATES_PER_PAGE - 1) // TEMPLATES_PER_PAGE)
+    page = max(0, min(page, total_pages - 1))
+
+    start = page * TEMPLATES_PER_PAGE
+    end = min(start + TEMPLATES_PER_PAGE, total)
+    chunk = templates[start:end]
 
     e = discord.Embed(
-        title=f"🧩 Template {idx+1}/{total}: {title}",
-        description=f"**Author:** {author}\n**Added by:** {added_by}\n**Added:** <t:{int(created_at)}:R>",
+        title=f"🧩 Templates — Page {page+1}/{total_pages}",
+        description=f"Showing **{start+1}–{end}** of **{total}** templates.",
     )
 
-    if img_url:
-        e.set_image(url=img_url)
+    for i, tpl in enumerate(chunk, start=start + 1):
+        title = tpl.get("title", "Untitled")
+        author = tpl.get("author", "Unknown")
+        img_url = tpl.get("image_url", "")
+        added_by = tpl.get("added_by_name", "Unknown")
+        created_at = int(tpl.get("created_at", 0) or 0)
 
-    # Show raw URL as a fallback
-    if img_url:
-        e.add_field(name="Image URL", value=clamp_text(img_url, 900), inline=False)
+        link = f"[Open image]({img_url})" if img_url else "No image"
+        added = f"<t:{created_at}:R>" if created_at else "Unknown time"
 
-    e.set_footer(text="Use the buttons to browse templates.")
+        value = (
+            f"**Author:** {clamp_text(author, 80)}\n"
+            f"**Added by:** {clamp_text(added_by, 80)} • **{added}**\n"
+            f"{link}"
+        )
+
+        # inline=True makes it appear like a grid (2 columns on most clients)
+        e.add_field(name=f"{i}) {clamp_text(title, 70)}", value=value, inline=True)
+
+    e.set_footer(text="Use Prev/Next to browse pages.")
     return e
 
-class TemplatePager(discord.ui.View):
-    def __init__(self, templates: List[Dict], owner_id: int, timeout: float = 120.0):
+class TemplateGridPager(discord.ui.View):
+    def __init__(self, templates: List[Dict], owner_id: int, timeout: float = 180.0):
         super().__init__(timeout=timeout)
         self.templates = templates
         self.owner_id = owner_id
         self.page = 0
+        self._update_buttons()
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         if interaction.user.id != self.owner_id:
@@ -297,38 +312,37 @@ class TemplatePager(discord.ui.View):
             return False
         return True
 
-    def current_embed(self) -> discord.Embed:
+    def _total_pages(self) -> int:
         total = len(self.templates)
-        return make_template_embed(self.templates[self.page], self.page, total)
+        return max(1, (total + TEMPLATES_PER_PAGE - 1) // TEMPLATES_PER_PAGE)
 
-    def update_buttons(self):
-        total = len(self.templates)
-        self.prev_button.disabled = (self.page <= 0)
-        self.next_button.disabled = (self.page >= total - 1)
+    def _update_buttons(self) -> None:
+        tp = self._total_pages()
+        self.prev_btn.disabled = (self.page <= 0)
+        self.next_btn.disabled = (self.page >= tp - 1)
+
+    def current_embed(self) -> discord.Embed:
+        return make_templates_grid_embed(self.templates, self.page)
 
     @discord.ui.button(label="⬅ Prev", style=discord.ButtonStyle.secondary)
-    async def prev_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+    async def prev_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         self.page = max(0, self.page - 1)
-        self.update_buttons()
+        self._update_buttons()
         await interaction.response.edit_message(embed=self.current_embed(), view=self)
 
     @discord.ui.button(label="Next ➡", style=discord.ButtonStyle.secondary)
-    async def next_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        self.page = min(len(self.templates) - 1, self.page + 1)
-        self.update_buttons()
+    async def next_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.page = min(self._total_pages() - 1, self.page + 1)
+        self._update_buttons()
         await interaction.response.edit_message(embed=self.current_embed(), view=self)
 
     @discord.ui.button(label="Close", style=discord.ButtonStyle.danger)
-    async def close_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+    async def close_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         for child in self.children:
             child.disabled = True
         await interaction.response.edit_message(view=self)
 
-    async def on_timeout(self):
-        for child in self.children:
-            child.disabled = True
-        # We can’t always edit on timeout without the message reference; that’s okay.
-
+# -------------------- EVENTS --------------------
 @bot.event
 async def on_ready():
     try:
@@ -366,43 +380,36 @@ async def ask(interaction: discord.Interaction, message: str):
     raw = await call_openai_async(SYSTEM_PROMPT, user_prompt)
     result = safe_parse_model_json(raw)
     embed = build_embed(result)
-
     await interaction.followup.send(embed=embed)
 
 @bot.tree.command(name="ping", description="Check if the bot is alive.")
 async def ping(interaction: discord.Interaction):
     await interaction.response.send_message("🏓 Pong!")
 
-# ---- NEW: /add (upload template) ----
+# NEW: /add — upload template image + title + author
 @bot.tree.command(name="add", description="Add a new template (image + title + author).")
 @app_commands.describe(
     image="Upload the template image",
     title="Template title",
     author="Template author"
 )
-async def add_template(
-    interaction: discord.Interaction,
-    image: discord.Attachment,
-    title: str,
-    author: str
-):
-    # basic checks
+async def add_template(interaction: discord.Interaction, image: discord.Attachment, title: str, author: str):
+    # best-effort type check
     if image.content_type and not image.content_type.startswith("image/"):
         await interaction.response.send_message("That file doesn’t look like an image.", ephemeral=True)
         return
 
-    title = clamp_text(title, 80)
-    author = clamp_text(author, 80)
+    title = clamp_text(title, 80) or "Untitled"
+    author = clamp_text(author, 80) or "Unknown"
 
     await interaction.response.defer(thinking=True)
 
-    # Save the template metadata (we store the CDN URL; no rehosting)
     templates = await load_templates()
     templates.append({
         "id": f"{_now_unix()}-{interaction.user.id}",
-        "title": title or "Untitled",
-        "author": author or "Unknown",
-        "image_url": image.url,
+        "title": title,
+        "author": author,
+        "image_url": image.url,  # Discord CDN URL
         "added_by_id": interaction.user.id,
         "added_by_name": str(interaction.user),
         "created_at": _now_unix(),
@@ -416,16 +423,15 @@ async def add_template(
     e.set_image(url=image.url)
     await interaction.followup.send(embed=e)
 
-# ---- NEW: /templates (browse templates) ----
-@bot.tree.command(name="templates", description="Browse saved templates.")
-async def templates(interaction: discord.Interaction):
+# NEW: /templates — browse templates as a grid page (6 per page)
+@bot.tree.command(name="templates", description="Browse saved templates (grid pages).")
+async def templates_cmd(interaction: discord.Interaction):
     tpls = await load_templates()
     if not tpls:
         await interaction.response.send_message("No templates have been added yet. Use `/add` first.", ephemeral=True)
         return
 
-    view = TemplatePager(tpls, owner_id=interaction.user.id, timeout=180.0)
-    view.update_buttons()
+    view = TemplateGridPager(tpls, owner_id=interaction.user.id, timeout=180.0)
     await interaction.response.send_message(embed=view.current_embed(), view=view)
 
 # -------------------- START --------------------
