@@ -1,10 +1,9 @@
 # Discord Slash Bot (Pydroid-friendly)
-# - Hardcoded pre-prompt (characteristics) in code
-# - /ask checks if something is bannable under your rules
-# - Output: clean Discord markdown (NO embeds, NO "Report" field)
+# - /ask = rule checker (OpenAI)
+# - /timefromimage = reads attached image size and calculates build time (15s per pixel)
 #
 # Requirements:
-#   pip install -U discord.py
+#   pip install -U discord.py pillow
 #
 # Env vars:
 #   DISCORD_TOKEN
@@ -14,6 +13,7 @@ import os
 import time
 import json
 import asyncio
+import math
 import urllib.request
 import urllib.error
 
@@ -32,6 +32,9 @@ COOLDOWN_S = 6
 _last_used = {}
 
 SHOW_DEBUG_PREVIEW = False
+
+# Image build-time math (your confirmed rule)
+COOLDOWN_SECONDS_PER_PIXEL = 15
 
 # ✅ SYSTEM PROMPT (forces exact rule matching + multi-reason ban-length)
 SYSTEM_PROMPT = r"""
@@ -102,23 +105,22 @@ CRITICAL REQUIREMENTS:
 4) If you are sure, do NOT include that recommendation.
 5) If a ban is false, you should still give an informative message and you may ask for more context or provide ways it can bannable.
 
-
 # Output format (STRICT)
 Return ONLY valid JSON (no markdown, no extra text) exactly matching this schema:
 
 {
   "is_bannable": true/false,
   "unsure": true/false,
-  "ban_length": "string",          // combined if multiple reasons, e.g. "One-Month + One-Week"
-  "title": "string",               // short headline
+  "ban_length": "string",
+  "title": "string",
   "reasons": [
     {
-      "category": "string",        // e.g. "One-Week Ban"
-      "rule_text": "string",       // exact or near-exact bullet text from rules
-      "why": "string"              // short explanation
+      "category": "string",
+      "rule_text": "string",
+      "why": "string"
     }
   ],
-  "note": "string"                 // empty if sure; otherwise your mod-contact suggestion
+  "note": "string"
 }
 
 Rules for content:
@@ -126,7 +128,6 @@ Rules for content:
 - If is_bannable=false and unsure=false, you can set reasons=[].
 - Keep everything concise.
 """.strip()
-
 
 # -------------------- OPENAI (Responses API) --------------------
 def _extract_text_from_responses_api(json_obj: dict) -> str:
@@ -167,7 +168,6 @@ def call_openai(system_prompt: str, user_prompt: str) -> str:
 async def call_openai_async(system_prompt: str, user_prompt: str) -> str:
     return await asyncio.to_thread(call_openai, system_prompt, user_prompt)
 
-
 # -------------------- DISCORD BOT --------------------
 intents = discord.Intents.default()
 bot = commands.Bot(command_prefix="!", intents=intents)
@@ -181,13 +181,9 @@ def cooldown_ok(user_id: int) -> bool:
     return True
 
 def safe_parse_model_json(text: str) -> dict:
-    """
-    Parse the model JSON. If it fails, fallback to an 'unsure' response.
-    """
     text = (text or "").strip()
     try:
         obj = json.loads(text)
-        # Normalize fields
         is_bannable = bool(obj.get("is_bannable", False))
         unsure = bool(obj.get("unsure", False))
         ban_length = str(obj.get("ban_length", "Unknown")).strip() or "Unknown"
@@ -208,7 +204,6 @@ def safe_parse_model_json(text: str) -> dict:
 
         note = str(obj.get("note", "")).strip()
 
-        # If bannable but no reasons, treat as unsure (so we don't mislead)
         if is_bannable and len(cleaned_reasons) == 0:
             return {
                 "is_bannable": False,
@@ -219,7 +214,6 @@ def safe_parse_model_json(text: str) -> dict:
                 "note": "I couldn’t match an exact rule confidently. Please contact a moderator / open a report ticket.",
             }
 
-        # If unsure, ensure note exists
         if unsure and not note:
             note = "I’m not fully sure. Please contact a moderator / open a report ticket."
 
@@ -242,39 +236,35 @@ def safe_parse_model_json(text: str) -> dict:
         }
 
 def build_pretty_message(result: dict) -> str:
-    """
-    Formats output as Discord markdown, no embed, no report.
-    """
     status = "✅ Bannable" if result["is_bannable"] else ("⚠️ Unsure" if result["unsure"] else "❌ Not bannable")
-
-    # Top line: **Title**: Ban length
     top = f"**{result['title']}**: {result['ban_length']}  \n{status}"
-
     parts = [top]
 
-    # Reasons list (exact rule text)
     if result["reasons"]:
         parts.append("\n**Exact rule match(es):**")
         for idx, r in enumerate(result["reasons"], start=1):
             cat = r["category"] or "Rule"
             rule_text = r["rule_text"] or "(no rule text provided)"
             why = r["why"] or ""
-            # Make rule text pop but keep it readable
             line = f"{idx}. **{cat}** — `{rule_text}`"
             if why:
                 line += f"\n   {why}"
             parts.append(line)
 
-    # Small footer-like note (Discord doesn't have true small text; we use italic + parentheses)
     if result["unsure"] and result["note"]:
         parts.append(f"\n*(Suggestion: {result['note']})*")
 
     msg = "\n".join(parts).strip()
-
-    # Safety: Discord message limit 2000 chars
     if len(msg) > 1900:
         msg = msg[:1900] + "\n…(trimmed)"
     return msg
+
+def seconds_to_hms(total_seconds: int) -> tuple[int, int, int]:
+    h = total_seconds // 3600
+    total_seconds -= h * 3600
+    m = total_seconds // 60
+    s = total_seconds - m * 60
+    return h, m, s
 
 @bot.event
 async def on_ready():
@@ -285,6 +275,7 @@ async def on_ready():
         print("⚠️ Slash sync error:", e)
     print(f"✅ Logged in as {bot.user} (id={bot.user.id})")
 
+# -------------------- COMMANDS --------------------
 @bot.tree.command(
     name="ask",
     description="Checks if something is bannable under the game rules (not official)."
@@ -311,7 +302,6 @@ async def ask(interaction: discord.Interaction, message: str):
 
     raw = await call_openai_async(SYSTEM_PROMPT, user_prompt)
 
-    # If OpenAI failed, do an unsure fallback
     if not raw:
         await interaction.followup.send(
             "**Unsure**: Unknown\n⚠️ Unsure\n\n*(Suggestion: I couldn’t reach the checker. Please contact a moderator / open a report ticket.)*"
@@ -322,11 +312,70 @@ async def ask(interaction: discord.Interaction, message: str):
     pretty = build_pretty_message(result)
     await interaction.followup.send(pretty)
 
+@bot.tree.command(
+    name="timefromimage",
+    description="Attach an image: calculates build time from its pixel size (15s per pixel)."
+)
+@app_commands.describe(players="Optional: number of players building in parallel (default 1).")
+async def timefromimage(interaction: discord.Interaction, players: int = 1):
+    if not interaction.attachments:
+        await interaction.response.send_message(
+            "Attach an image when using `/timefromimage`.",
+            ephemeral=True
+        )
+        return
+
+    if players < 1:
+        players = 1
+    if players > 1000:
+        players = 1000  # sanity cap
+
+    att = interaction.attachments[0]
+    if not (att.content_type or "").startswith("image/"):
+        await interaction.response.send_message(
+            "That attachment doesn’t look like an image.",
+            ephemeral=True
+        )
+        return
+
+    await interaction.response.defer(thinking=True)
+
+    data = await att.read()
+
+    # Lazy import to reduce idle RAM
+    try:
+        import io
+        from PIL import Image
+        img = Image.open(io.BytesIO(data))
+        width, height = img.size
+    except Exception as e:
+        await interaction.followup.send(f"Couldn’t read that image: {e}")
+        return
+
+    total_pixels = width * height
+
+    # Your confirmed equation:
+    # 1 pixel charge every 15 seconds per player => ticks = ceil(pixels/players)
+    ticks_needed = math.ceil(total_pixels / players)
+    total_seconds = ticks_needed * COOLDOWN_SECONDS_PER_PIXEL
+
+    h, m, s = seconds_to_hms(total_seconds)
+
+    await interaction.followup.send(
+        f"🖼️ **Image size:** {width}×{height}\n"
+        f"🔢 **Total pixels:** {total_pixels:,}\n"
+        f"👥 **Players:** {players}\n"
+        f"⏱️ **Time:** ceil({total_pixels:,} / {players}) × {COOLDOWN_SECONDS_PER_PIXEL}s\n"
+        f"= **{total_seconds:,} seconds** = **{h}h {m}m {s}s**"
+    )
+
 @bot.tree.command(name="ping", description="Check if the bot is alive.")
 async def ping(interaction: discord.Interaction):
     await interaction.response.send_message("🏓 Pong!")
 
+# -------------------- START --------------------
 if __name__ == "__main__":
     if not DISCORD_TOKEN:
         raise RuntimeError("Missing DISCORD_TOKEN env var.")
     bot.run(DISCORD_TOKEN)
+```0
