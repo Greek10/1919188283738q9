@@ -87,6 +87,11 @@ chat (unless it bypasses chat)
 griefing 
 
 you are meant to read the message below and respond if that is breaking the rules. If you can not confirm entirely that something is bannable then suggest the user to contact a mod or open a report ticket, if you can figure out if it's bannable then skip that part but if you are unsure then add it.
+it should be formatted like this:
+title (in bold): Ban length
+description (normal text): your usual response (locating the rules and giving an informative text)
+bottom text (small text #-): if unsure, show the text of suggestion to contact a mod
+
 """.strip()
 
 # OpenAI model (adjust if you want)
