@@ -100,6 +100,8 @@ CRITICAL REQUIREMENTS:
    Example ban_length: "One-Month + One-Week" or "Permanent + One-Month".
 3) If you cannot confirm entirely that it is bannable, you must mark unsure=true and recommend contacting a moderator / opening a report ticket.
 4) If you are sure, do NOT include that recommendation.
+5) If a ban is false, you should still give an informative message and you may ask for more context or provide ways it can bannable.
+
 
 # Output format (STRICT)
 Return ONLY valid JSON (no markdown, no extra text) exactly matching this schema:
