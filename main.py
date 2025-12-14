@@ -190,7 +190,7 @@ async def on_ready():
         print("⚠️ Slash sync error:", e)
     print(f"✅ Logged in as {bot.user} (id={bot.user.id})")
 
-@bot.tree.command(name="ask", description="Ask ChatGPT (uses the built-in characteristics pre-prompt).")
+@bot.tree.command(name="ask", description="Tells whether something is bannable or not - do not use this to confirm anything..")
 @app_commands.describe(message="What you want to ask the assistant.")
 async def ask(interaction: discord.Interaction, message: str):
     if not cooldown_ok(interaction.user.id):
