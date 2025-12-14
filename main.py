@@ -86,7 +86,7 @@ Conspiring to break the rules -Half or full duration of what they would have don
 chat (unless it bypasses chat)
 griefing 
 
-you are meant to read the message below and respond if that is breaking the rules
+you are meant to read the message below and respond if that is breaking the rules. If you can not confirm entirely that something is bannable then suggest the user to contact a mod or open a report ticket, if you can figure out if it's bannable then skip that part but if you are unsure then add it.
 """.strip()
 
 # OpenAI model (adjust if you want)
