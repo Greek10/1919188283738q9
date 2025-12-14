@@ -90,7 +90,8 @@ you are meant to read the message below and respond if that is breaking the rule
 it should be formatted like this:
 title (in bold): Ban length
 description (normal text): your usual response (locating the rules and giving an informative text)
-bottom text (small text (-#) use this before the text to make it small): if unsure, show the text of suggestion to contact a mod
+bottom text (small text (-#) use this before the text to make it small): if unsure, show the text of suggestion to contact a mod - this should ONLY show if you can not entirely find a reason.
+
 
 """.strip()
 
