@@ -410,7 +410,7 @@ async def stopmotion(
     # Send result
     file = discord.File(fp=out, filename="stopmotion.gif")
     await interaction.followup.send(
-        content=f"🎞️ Stop-motion GIF ({len(pal_frames)} frames, {fps} fps) from the last {hours} hour(s):",
+        content=f"GIF generated({len(pal_frames)} frames, {fps} fps) from the last {hours} hour(s):",
         file=file
     )
 
