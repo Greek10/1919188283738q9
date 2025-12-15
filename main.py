@@ -2,9 +2,11 @@
 # - Hardcoded pre-prompt (characteristics) in code
 # - /ask sends user message to ChatGPT with that system prompt
 # - Bot formats response into a clean Discord Embed
+# - NEW: /stopmotion -> grabs images from the past N hours in the current channel
+#        and stitches them into a stop-motion GIF (oldest -> newest)
 #
 # Requirements:
-#   pip install -U discord.py
+#   pip install -U discord.py pillow
 #
 # Env vars you MUST set:
 #   DISCORD_TOKEN   = your Discord bot token
@@ -15,7 +17,9 @@ import time
 import json
 import asyncio
 import urllib.request
-import urllib.error
+
+from io import BytesIO
+from datetime import timedelta, timezone
 
 import discord
 from discord import app_commands
@@ -219,7 +223,7 @@ async def on_ready():
     await bot.tree.sync()
     print(f"✅ Logged in as {bot.user}")
 
-# -------------------- COMMAND --------------------
+# -------------------- COMMANDS --------------------
 @bot.tree.command(
     name="ask",
     description="Check if something is bannable under the game rules (not official)."
@@ -235,6 +239,180 @@ async def ask(interaction: discord.Interaction, message: str):
     result = safe_parse(raw)
     embed = build_embed(result)
     await interaction.followup.send(embed=embed)
+
+# -------------------- STOP-MOTION GIF COMMAND --------------------
+async def _download_bytes(session, url: str, timeout_s: int = 30) -> bytes:
+    async with session.get(url, timeout=timeout_s) as resp:
+        if resp.status != 200:
+            raise RuntimeError(f"HTTP {resp.status}")
+        return await resp.read()
+
+def _fit_resize(w: int, h: int, max_side: int) -> tuple[int, int]:
+    if max(w, h) <= max_side:
+        return w, h
+    if w >= h:
+        nw = max_side
+        nh = max(1, int(h * (max_side / w)))
+    else:
+        nh = max_side
+        nw = max(1, int(w * (max_side / h)))
+    return nw, nh
+
+@bot.tree.command(
+    name="stopmotion",
+    description="Make a stop-motion GIF from images posted in this channel in the last N hours."
+)
+@app_commands.describe(
+    hours="How many hours back to look (default 24).",
+    fps="Frames per second (default 4).",
+    max_frames="Maximum number of images to include (default 60).",
+    max_side="Max width/height for frames (default 512)."
+)
+async def stopmotion(
+    interaction: discord.Interaction,
+    hours: int = 24,
+    fps: int = 4,
+    max_frames: int = 60,
+    max_side: int = 512
+):
+    # Lazy imports to reduce idle RAM (only loaded when command runs)
+    from PIL import Image
+
+    if hours < 1:
+        hours = 1
+    if hours > 168:  # 7 days cap
+        hours = 168
+
+    if fps < 1:
+        fps = 1
+    if fps > 15:
+        fps = 15
+
+    if max_frames < 1:
+        max_frames = 1
+    if max_frames > 250:
+        max_frames = 250
+
+    if max_side < 64:
+        max_side = 64
+    if max_side > 1024:
+        max_side = 1024
+
+    # Must be a text channel (or thread) that supports history
+    channel = interaction.channel
+    if not isinstance(channel, (discord.TextChannel, discord.Thread)):
+        await interaction.response.send_message("This command only works in text channels/threads.", ephemeral=True)
+        return
+
+    await interaction.response.defer(thinking=True)
+
+    cutoff = discord.utils.utcnow() - timedelta(hours=hours)
+
+    # Collect image URLs (attachments + embedded images)
+    found: list[tuple[discord.Message, str]] = []
+    try:
+        async for msg in channel.history(limit=2000, after=cutoff, oldest_first=True):
+            # Attachments first (most reliable)
+            for a in msg.attachments:
+                ct = (a.content_type or "")
+                if ct.startswith("image/") and a.url:
+                    found.append((msg, a.url))
+
+            # Embeds with images (less reliable, but helpful)
+            for e in msg.embeds:
+                # image
+                if e.image and e.image.url:
+                    found.append((msg, e.image.url))
+                # thumbnail
+                if e.thumbnail and e.thumbnail.url:
+                    found.append((msg, e.thumbnail.url))
+
+    except discord.Forbidden:
+        await interaction.followup.send("I don’t have permission to read message history in this channel.")
+        return
+
+    # De-duplicate by URL while preserving order
+    seen = set()
+    ordered = []
+    for msg, url in found:
+        if url in seen:
+            continue
+        seen.add(url)
+        ordered.append((msg, url))
+
+    if not ordered:
+        await interaction.followup.send(f"No images found in the last {hours} hour(s) in this channel.")
+        return
+
+    # If too many, keep the most recent max_frames but still in chronological order
+    if len(ordered) > max_frames:
+        ordered = ordered[-max_frames:]
+
+    # Download + decode images
+    frames: list[Image.Image] = []
+    # discord.py includes aiohttp; use it to avoid blocking
+    import aiohttp
+
+    async with aiohttp.ClientSession() as session:
+        for msg, url in ordered:
+            try:
+                b = await _download_bytes(session, url)
+                im = Image.open(BytesIO(b)).convert("RGBA")
+                # resize down to save RAM/size
+                nw, nh = _fit_resize(im.width, im.height, max_side)
+                if (nw, nh) != (im.width, im.height):
+                    im = im.resize((nw, nh), resample=Image.Resampling.LANCZOS)
+                frames.append(im)
+            except Exception:
+                # Skip bad images instead of failing whole render
+                continue
+
+    if len(frames) < 2:
+        await interaction.followup.send("I couldn’t load enough valid images to make a GIF (need at least 2).")
+        return
+
+    # Normalize all frames to the same canvas size (max frame width/height)
+    max_w = max(im.width for im in frames)
+    max_h = max(im.height for im in frames)
+
+    normalized: list[Image.Image] = []
+    for im in frames:
+        if im.width == max_w and im.height == max_h:
+            normalized.append(im)
+            continue
+        canvas = Image.new("RGBA", (max_w, max_h), (0, 0, 0, 0))
+        x = (max_w - im.width) // 2
+        y = (max_h - im.height) // 2
+        canvas.paste(im, (x, y))
+        normalized.append(canvas)
+
+    # Encode GIF in memory
+    duration_ms = int(1000 / fps)
+    out = BytesIO()
+
+    # Convert to palette mode for smaller GIFs
+    pal_frames = []
+    for im in normalized:
+        pal_frames.append(im.convert("P", palette=Image.Palette.ADAPTIVE, colors=256))
+
+    pal_frames[0].save(
+        out,
+        format="GIF",
+        save_all=True,
+        append_images=pal_frames[1:],
+        duration=duration_ms,
+        loop=0,
+        optimize=True,
+        disposal=2,
+    )
+    out.seek(0)
+
+    # Send result
+    file = discord.File(fp=out, filename="stopmotion.gif")
+    await interaction.followup.send(
+        content=f"🎞️ Stop-motion GIF ({len(pal_frames)} frames, {fps} fps) from the last {hours} hour(s):",
+        file=file
+    )
 
 # -------------------- START --------------------
 if __name__ == "__main__":
