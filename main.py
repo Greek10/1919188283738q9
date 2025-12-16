@@ -1,9 +1,6 @@
 # Discord Slash Bot (Pydroid-friendly)
 # - /ask -> OpenAI rule helper (Embed output)
 # - /stopmotion -> makes a stop-motion GIF from images in channel history
-# - NEW: /archive_start -> every N minutes, grabs latest canvas screenshot from a source channel
-#        and re-uploads it to a destination channel (keeps history)
-#        /archive_stop, /archive_status
 #
 # Requirements:
 #   pip install -U discord.py pillow
@@ -274,7 +271,7 @@ async def stopmotion(
     max_frames: int = 60,
     max_side: int = 512
 ):
-    from PIL import Image  # lazy import
+    from PIL import Image  # lazy import to reduce idle RAM
 
     if hours < 1: hours = 1
     if hours > 168: hours = 168
@@ -375,177 +372,6 @@ async def stopmotion(
         content=f"GIF generated ({len(pal_frames)} frames, {fps} fps) from the last {hours} hour(s):",
         file=file
     )
-
-# -------------------- BACKGROUND CANVAS ARCHIVER --------------------
-# Runs ONLY after /archive_start. Low-RAM: downloads 1 image, uploads it, then releases memory.
-
-_archive_task: asyncio.Task | None = None
-_archive_settings: dict | None = None
-_last_archived_message_id: int | None = None
-
-async def _find_latest_image_message(channel: discord.TextChannel | discord.Thread) -> tuple[int, str] | None:
-    """
-    Returns (message_id, image_url) for the newest image-like message in the channel.
-    Checks attachments first, then embed images.
-    """
-    async for msg in channel.history(limit=30, oldest_first=False):
-        for a in msg.attachments:
-            ct = (a.content_type or "")
-            if ct.startswith("image/") and a.url:
-                return msg.id, a.url
-        for e in msg.embeds:
-            if e.image and e.image.url:
-                return msg.id, e.image.url
-            if e.thumbnail and e.thumbnail.url:
-                return msg.id, e.thumbnail.url
-    return None
-
-async def _archive_loop():
-    global _archive_settings, _archive_task, _last_archived_message_id
-
-    import aiohttp
-
-    try:
-        while _archive_settings is not None:
-            interval = int(_archive_settings["interval_minutes"])
-            source_id = int(_archive_settings["source_channel_id"])
-            dest_id = int(_archive_settings["dest_channel_id"])
-
-            source = bot.get_channel(source_id)
-            dest = bot.get_channel(dest_id)
-
-            if not isinstance(source, (discord.TextChannel, discord.Thread)) or not isinstance(dest, (discord.TextChannel, discord.Thread)):
-                # If channels missing (deleted / bot lacks access), stop loop
-                _archive_settings = None
-                break
-
-            try:
-                latest = await _find_latest_image_message(source)
-                if latest:
-                    msg_id, url = latest
-                    if _last_archived_message_id != msg_id:
-                        _last_archived_message_id = msg_id
-
-                        # download + re-upload (keeps history even if original is deleted)
-                        async with aiohttp.ClientSession() as session:
-                            data = await _download_bytes(session, url, timeout_s=30)
-
-                        filename = f"canvas_{int(time.time())}.png"
-                        f = discord.File(fp=BytesIO(data), filename=filename)
-
-                        ts = int(time.time())
-                        await dest.send(
-                            content=f"🖼️ Canvas snapshot — <t:{ts}:f> (<t:{ts}:R>)",
-                            file=f
-                        )
-
-                        # free memory ASAP
-                        del data, f
-
-            except Exception:
-                # Ignore one-off failures; keep running
-                pass
-
-            # Sleep at the end so the command can stop quickly after the current cycle
-            await asyncio.sleep(max(60, interval * 60))  # enforce at least 1 minute
-    finally:
-        _archive_task = None
-
-def _archive_running() -> bool:
-    return _archive_task is not None and not _archive_task.done() and _archive_settings is not None
-
-@bot.tree.command(
-    name="archive_start",
-    description="Start archiving the latest image from a channel every N minutes into another channel."
-)
-@app_commands.describe(
-    source_channel="Channel that receives the canvas updates (images).",
-    destination_channel="Channel where snapshots should be posted.",
-    interval_minutes="How often to archive (minutes). Example: 5"
-)
-@app_commands.checks.has_permissions(manage_guild=True)
-async def archive_start(
-    interaction: discord.Interaction,
-    source_channel: discord.TextChannel,
-    destination_channel: discord.TextChannel,
-    interval_minutes: int = 5
-):
-    global _archive_task, _archive_settings, _last_archived_message_id
-
-    if interval_minutes < 1:
-        interval_minutes = 1
-    if interval_minutes > 120:
-        interval_minutes = 120
-
-    if _archive_running():
-        await interaction.response.send_message(
-            "Archive is already running. Use `/archive_stop` first.",
-            ephemeral=True
-        )
-        return
-
-    _last_archived_message_id = None
-    _archive_settings = {
-        "source_channel_id": source_channel.id,
-        "dest_channel_id": destination_channel.id,
-        "interval_minutes": interval_minutes,
-    }
-
-    _archive_task = asyncio.create_task(_archive_loop())
-    await interaction.response.send_message(
-        f"✅ Started archiving.\n"
-        f"**Source:** {source_channel.mention}\n"
-        f"**Destination:** {destination_channel.mention}\n"
-        f"**Interval:** {interval_minutes} minute(s)",
-        ephemeral=True
-    )
-
-@bot.tree.command(
-    name="archive_stop",
-    description="Stop the canvas snapshot archiver."
-)
-@app_commands.checks.has_permissions(manage_guild=True)
-async def archive_stop(interaction: discord.Interaction):
-    global _archive_settings
-
-    if not _archive_running():
-        await interaction.response.send_message("Archive is not running.", ephemeral=True)
-        return
-
-    _archive_settings = None
-    await interaction.response.send_message("🛑 Stopping archive… (it will stop after the current cycle)", ephemeral=True)
-
-@bot.tree.command(
-    name="archive_status",
-    description="Show current archiver status."
-)
-async def archive_status(interaction: discord.Interaction):
-    if not _archive_running():
-        await interaction.response.send_message("Archive is **OFF**.", ephemeral=True)
-        return
-
-    src = _archive_settings["source_channel_id"]
-    dst = _archive_settings["dest_channel_id"]
-    interval = _archive_settings["interval_minutes"]
-
-    src_ch = bot.get_channel(int(src))
-    dst_ch = bot.get_channel(int(dst))
-
-    await interaction.response.send_message(
-        "Archive is **ON** ✅\n"
-        f"**Source:** {src_ch.mention if src_ch else src}\n"
-        f"**Destination:** {dst_ch.mention if dst_ch else dst}\n"
-        f"**Interval:** {interval} minute(s)",
-        ephemeral=True
-    )
-
-@archive_start.error
-@archive_stop.error
-async def _archive_perm_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
-    if isinstance(error, app_commands.MissingPermissions):
-        await interaction.response.send_message("You need **Manage Server** to use that command.", ephemeral=True)
-    else:
-        await interaction.response.send_message(f"Error: {error}", ephemeral=True)
 
 # -------------------- START --------------------
 if __name__ == "__main__":
