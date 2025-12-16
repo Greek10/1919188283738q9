@@ -466,11 +466,11 @@ async def stopmotion(
 
 # -------------------- MARKAREA (TEMPLATE PROGRESS PREVIEW) --------------------
 @bot.tree.command(
-    name="markarea",
-    description="Template progresser: crop both, show template + red mismatch light, and progress %."
+    name="template",
+    description="Template progresser."
 )
 @app_commands.describe(
-    source_channel="Channel with the latest canvas update image.",
+    source_channel="Channel where canvas updates occurs.",
     template="Template image (attachment option).",
     x1="Corner 1 X", y1="Corner 1 Y",
     x2="Corner 2 X", y2="Corner 2 Y",
