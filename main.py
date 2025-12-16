@@ -1,9 +1,13 @@
 # Discord Slash Bot (Pydroid-friendly)
 # - /ask -> OpenAI rule helper (Embed output)
 # - /stopmotion -> makes a stop-motion GIF from images in channel history
-# - /markarea -> crops BOTH canvas + template using same coords (bottom-left origin),
-#                overlays them (canvas=red, template=grey, both transparent),
-#                and outputs PROGRESS % = how close canvas is to template (pixel match rate).
+# - /markarea -> template progresser:
+#       * crops BOTH canvas + template using same coords (bottom-left origin)
+#       * output preview shows TEMPLATE normally
+#       * canvas never appears
+#       * mismatched pixels get a RED "light" overlay
+#       * matched pixels show the actual template color (clean)
+#       * progress % = exact pixel matches / template non-transparent pixels
 #
 # COORDINATE SYSTEM:
 #   User inputs use BOTTOM-LEFT as (0,0).
@@ -250,34 +254,64 @@ async def _find_latest_image_url(channel: discord.TextChannel | discord.Thread) 
                 return e.thumbnail.url
     return None
 
-def _tint_layer(size, rgb: tuple[int, int, int], alpha_from, alpha_scale: int):
+def _make_template_progress_preview(canvas_crop, template_crop, red_alpha: int = 140):
     """
-    Creates an RGBA layer of solid `rgb` whose alpha comes from alpha_from (PIL 'L' image),
-    multiplied by alpha_scale (0..255).
+    Output image shows template normally.
+    Where template pixel (alpha>0) does NOT match canvas RGB exactly -> add red 'light' overlay.
+    Where they match -> show pure template color (no red).
+    Canvas image never appears.
     """
     from PIL import Image
-    layer = Image.new("RGBA", size, (rgb[0], rgb[1], rgb[2], 0))
-    # alpha = (alpha_from * alpha_scale) / 255
-    a = alpha_from.point(lambda v: (v * alpha_scale) // 255)
-    layer.putalpha(a)
-    return layer
 
-def _progress_percent(canvas_rgba, template_rgba, tolerance: int = 0) -> tuple[float, int, int]:
+    w, h = template_crop.size
+    out = template_crop.copy().convert("RGBA")
+
+    cpx = canvas_crop.load()
+    tpx = template_crop.load()
+    opx = out.load()
+
+    # Red overlay where mismatch, but keep the template visible
+    # alpha of red overlay is scaled by template alpha (so transparent areas stay transparent)
+    red_alpha = _clamp_int(red_alpha, 0, 255)
+
+    for y in range(h):
+        for x in range(w):
+            tr, tg, tb, ta = tpx[x, y]
+            if ta == 0:
+                # keep transparent as-is
+                continue
+
+            cr, cg, cb, ca = cpx[x, y]
+
+            # exact match on RGB
+            if (cr, cg, cb) == (tr, tg, tb):
+                # show template pixel clean
+                opx[x, y] = (tr, tg, tb, ta)
+            else:
+                # mismatch -> template pixel + red "light" on top
+                # blend: result = (1-a)*template + a*red
+                a = (red_alpha * ta) // 255  # effective alpha 0..255
+                inv = 255 - a
+                rr = (tr * inv + 255 * a) // 255
+                rg = (tg * inv + 0 * a) // 255
+                rb = (tb * inv + 0 * a) // 255
+                opx[x, y] = (rr, rg, rb, ta)
+
+    return out
+
+def _exact_progress_percent(canvas_rgba, template_rgba) -> tuple[float, int, int]:
     """
-    Progress = % of template (non-transparent) pixels that match canvas pixels.
-    Match rule: RGB distance per-channel <= tolerance (0 = exact match).
+    Progress = exact pixel matches / template non-transparent pixels.
+    Match = exact RGB equality. (Template alpha==0 pixels ignored.)
     Returns (percent, matched, total_considered)
     """
-    c = canvas_rgba
-    t = template_rgba
-    if c.size != t.size:
+    if canvas_rgba.size != template_rgba.size:
         return 0.0, 0, 0
 
-    cpx = c.load()
-    tpx = t.load()
-    w, h = c.size
+    cpx = canvas_rgba.load()
+    tpx = template_rgba.load()
+    w, h = template_rgba.size
 
-    tol = max(0, int(tolerance))
     matched = 0
     total = 0
 
@@ -285,11 +319,10 @@ def _progress_percent(canvas_rgba, template_rgba, tolerance: int = 0) -> tuple[f
         for x in range(w):
             tr, tg, tb, ta = tpx[x, y]
             if ta == 0:
-                continue  # ignore transparent template pixels
+                continue
             cr, cg, cb, ca = cpx[x, y]
             total += 1
-            # per-channel tolerance (fast + predictable)
-            if abs(cr - tr) <= tol and abs(cg - tg) <= tol and abs(cb - tb) <= tol:
+            if (cr, cg, cb) == (tr, tg, tb):
                 matched += 1
 
     pct = (matched / total * 100.0) if total else 0.0
@@ -305,7 +338,6 @@ async def ask(interaction: discord.Interaction, message: str):
     if not cooldown_ok(interaction.user.id):
         await interaction.response.send_message("⏳ Cooldown active.", ephemeral=True)
         return
-
     await interaction.response.defer(thinking=True)
     raw = await call_openai_async(SYSTEM_PROMPT, message)
     await interaction.followup.send(embed=build_embed(safe_parse(raw)))
@@ -439,15 +471,14 @@ async def stopmotion(
         file=discord.File(fp=out, filename="stopmotion.gif")
     )
 
-# -------------------- MARKAREA (OVERLAY + TEMPLATE PROGRESS) --------------------
+# -------------------- MARKAREA (TEMPLATE PROGRESS PREVIEW) --------------------
 @bot.tree.command(
     name="markarea",
-    description="Template progresser: crop both, overlay (red vs grey), and compute progress %."
+    description="Template progresser: crop both, show template + red mismatch light, and progress %."
 )
 @app_commands.describe(
     source_channel="Channel with the latest canvas update image.",
     template="Template image (attachment option).",
-    tolerance="Color tolerance (0=exact). Higher = more lenient (e.g. 10-20).",
     x1="Corner 1 X", y1="Corner 1 Y",
     x2="Corner 2 X", y2="Corner 2 Y",
     x3="Corner 3 X", y3="Corner 3 Y",
@@ -457,15 +488,12 @@ async def markarea(
     interaction: discord.Interaction,
     source_channel: discord.TextChannel,
     template: discord.Attachment,
-    tolerance: int,
     x1: int, y1: int,
     x2: int, y2: int,
     x3: int, y3: int,
     x4: int, y4: int,
 ):
     from PIL import Image
-
-    tolerance = _clamp_int(int(tolerance), 0, 80)
 
     if not (template.content_type or "").startswith("image/"):
         await interaction.response.send_message("That template doesn’t look like an image.", ephemeral=True)
@@ -534,12 +562,11 @@ async def markarea(
 
     # Template:
     # - If already exactly box size, do NOT crop
-    # - Else crop it using SAME coordinate box (meaning template must be full-canvas-sized or match coordinate system)
+    # - Else crop it using SAME coordinate box (template must be full-canvas-sized or aligned)
     if (TW, TH) == (box_w, box_h):
         tmpl_crop = tmpl
         tmpl_note = "Template matched region size → no crop."
     else:
-        # Convert user coords -> template image coords using template height
         def to_tmpl_img_pt(xu: int, yu: int) -> tuple[int, int]:
             xi = _clamp_int(xu, 0, TW - 1)
             yi = _clamp_int(_user_to_image_y(yu, TH), 0, TH - 1)
@@ -570,38 +597,29 @@ async def markarea(
         tmpl_crop = tmpl.crop((t_left, t_top, t_right, t_bottom))
         tmpl_note = "Template cropped to the same coordinate box."
 
-    # Progress %: how close canvas is to template (only template non-transparent pixels count)
-    pct, matched, total = _progress_percent(canvas_crop, tmpl_crop, tolerance=tolerance)
+    # Progress % (exact)
+    pct, matched, total = _exact_progress_percent(canvas_crop, tmpl_crop)
 
-    # Overlay preview:
-    # - canvas tinted RED @ 55% alpha
-    # - template tinted GREY @ 55% alpha
-    # Keep alpha shapes from the original crops so transparent pixels don't smear.
-    cA = canvas_crop.split()[3]
-    tA = tmpl_crop.split()[3]
+    # Preview: template visible; mismatches get red light overlay
+    preview = _make_template_progress_preview(canvas_crop, tmpl_crop, red_alpha=150)
 
-    red_layer = _tint_layer(canvas_crop.size, (255, 0, 0), cA, alpha_scale=140)     # ~55%
-    grey_layer = _tint_layer(tmpl_crop.size, (140, 140, 140), tA, alpha_scale=140) # ~55%
+    out_preview = BytesIO()
+    preview.save(out_preview, format="PNG")
+    out_preview.seek(0)
 
-    overlay = Image.alpha_composite(red_layer, grey_layer)
-
-    out_overlay = BytesIO()
-    overlay.save(out_overlay, format="PNG")
-    out_overlay.seek(0)
-
-    # Send overlay + stats
     await interaction.followup.send(
         content=(
-            f"🧩 **Template progress** (region **{box_w}×{box_h}**) — tol={tolerance}\n"
+            f"🧩 **Template progress** — region **{box_w}×{box_h}**\n"
             f"- Matching pixels: **{matched:,} / {total:,}** (template non-transparent)\n"
             f"- ✅ **Progress:** **{pct:.2f}%**\n"
-            f"Note: {tmpl_note}"
+            f"Note: {tmpl_note}\n\n"
+            f"🟥 Red light = pixels that still don’t match.\n"
+            f"🎨 Clean template color = pixels that match."
         ),
-        file=discord.File(fp=out_overlay, filename="progress_overlay.png")
+        file=discord.File(fp=out_preview, filename="template_progress.png")
     )
 
-    # free memory
-    del canvas_bytes, template_bytes, canvas, tmpl, canvas_crop, tmpl_crop, overlay
+    del canvas_bytes, template_bytes, canvas, tmpl, canvas_crop, tmpl_crop, preview
 
 # -------------------- START --------------------
 if __name__ == "__main__":
