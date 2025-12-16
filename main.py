@@ -1,6 +1,8 @@
 # Discord Slash Bot (Pydroid-friendly)
 # - /ask -> OpenAI rule helper (Embed output)
 # - /stopmotion -> makes a stop-motion GIF from images in channel history
+# - NEW: /markarea -> grabs most recent canvas update image from a chosen channel,
+#        draws a polygon/box using 4 user-provided corner coordinates, and returns annotated image.
 #
 # Requirements:
 #   pip install -U discord.py pillow
@@ -372,6 +374,135 @@ async def stopmotion(
         content=f"GIF generated ({len(pal_frames)} frames, {fps} fps) from the last {hours} hour(s):",
         file=file
     )
+
+# -------------------- MARK AREA COMMAND --------------------
+async def _find_latest_image_url(channel: discord.TextChannel | discord.Thread) -> str | None:
+    """
+    Finds the most recent image URL in a channel (attachments first, then embed images).
+    """
+    async for msg in channel.history(limit=50, oldest_first=False):
+        for a in msg.attachments:
+            ct = (a.content_type or "")
+            if ct.startswith("image/") and a.url:
+                return a.url
+        for e in msg.embeds:
+            if e.image and e.image.url:
+                return e.image.url
+            if e.thumbnail and e.thumbnail.url:
+                return e.thumbnail.url
+    return None
+
+def _clamp_int(v: int, lo: int, hi: int) -> int:
+    if v < lo:
+        return lo
+    if v > hi:
+        return hi
+    return v
+
+@bot.tree.command(
+    name="markarea",
+    description="Grab the latest canvas image from a channel and draw a 4-corner outline on it."
+)
+@app_commands.describe(
+    source_channel="Channel that contains the latest canvas update image.",
+    x1="Corner 1 X", y1="Corner 1 Y",
+    x2="Corner 2 X", y2="Corner 2 Y",
+    x3="Corner 3 X", y3="Corner 3 Y",
+    x4="Corner 4 X", y4="Corner 4 Y",
+)
+async def markarea(
+    interaction: discord.Interaction,
+    source_channel: discord.TextChannel,
+    x1: int, y1: int,
+    x2: int, y2: int,
+    x3: int, y3: int,
+    x4: int, y4: int,
+):
+    # Lazy imports: only loaded during this command to reduce idle RAM
+    from PIL import Image, ImageDraw
+
+    await interaction.response.defer(thinking=True)
+
+    # Find latest image URL in the chosen channel
+    try:
+        url = await _find_latest_image_url(source_channel)
+    except discord.Forbidden:
+        await interaction.followup.send("I don’t have permission to read message history in that channel.")
+        return
+
+    if not url:
+        await interaction.followup.send("I couldn’t find any recent images in that channel.")
+        return
+
+    # Download image bytes
+    import aiohttp
+    try:
+        async with aiohttp.ClientSession() as session:
+            img_bytes = await _download_bytes(session, url, timeout_s=30)
+    except Exception as e:
+        await interaction.followup.send(f"Failed to download the latest image: {e}")
+        return
+
+    # Open and draw polygon
+    try:
+        im = Image.open(BytesIO(img_bytes)).convert("RGBA")
+    except Exception as e:
+        await interaction.followup.send(f"Couldn’t open that image: {e}")
+        return
+
+    w, h = im.size
+
+    # Clamp coords to image bounds (prevents crashes if user inputs out-of-range)
+    p1 = (_clamp_int(x1, 0, w - 1), _clamp_int(y1, 0, h - 1))
+    p2 = (_clamp_int(x2, 0, w - 1), _clamp_int(y2, 0, h - 1))
+    p3 = (_clamp_int(x3, 0, w - 1), _clamp_int(y3, 0, h - 1))
+    p4 = (_clamp_int(x4, 0, w - 1), _clamp_int(y4, 0, h - 1))
+
+    draw = ImageDraw.Draw(im, "RGBA")
+
+    # Line thickness scales a bit with image size
+    thickness = max(2, min(12, (max(w, h) // 300)))
+
+    # Semi-transparent fill to make the area obvious (still "rough outline")
+    fill = (255, 0, 0, 45)     # translucent red
+    outline = (255, 0, 0, 220) # solid-ish red
+
+    # Draw polygon (connects corners in the order the user provides)
+    polygon = [p1, p2, p3, p4]
+    draw.polygon(polygon, fill=fill, outline=outline)
+
+    # Draw thicker outline by re-drawing lines
+    def thick_line(a, b):
+        draw.line([a, b], fill=outline, width=thickness)
+
+    thick_line(p1, p2)
+    thick_line(p2, p3)
+    thick_line(p3, p4)
+    thick_line(p4, p1)
+
+    # Mark the corners (tiny circles) + labels 1-4
+    r = max(4, thickness + 2)
+    for idx, (px, py) in enumerate([p1, p2, p3, p4], start=1):
+        draw.ellipse((px - r, py - r, px + r, py + r), fill=(255, 255, 255, 230), outline=(0, 0, 0, 200))
+        draw.text((px + r + 2, py - r - 2), str(idx), fill=(255, 255, 255, 240))
+
+    # Output image
+    out = BytesIO()
+    im.save(out, format="PNG")
+    out.seek(0)
+
+    file = discord.File(fp=out, filename="marked_area.png")
+    await interaction.followup.send(
+        content=(
+            f"✅ Marked area on latest image from {source_channel.mention}\n"
+            f"Image size: **{w}×{h}**\n"
+            f"Corners: {p1}, {p2}, {p3}, {p4}"
+        ),
+        file=file
+    )
+
+    # Free memory ASAP
+    del img_bytes, im
 
 # -------------------- START --------------------
 if __name__ == "__main__":
