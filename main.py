@@ -1,8 +1,15 @@
 # Discord Slash Bot (Pydroid-friendly)
 # - /ask -> OpenAI rule helper (Embed output)
 # - /stopmotion -> makes a stop-motion GIF from images in channel history
-# - /markarea -> grabs latest canvas update image from a chosen channel,
-#                uses 4 corner coords to crop to that region (no drawing)
+# - /markarea -> user provides a TEMPLATE image (slash attachment option),
+#                bot grabs latest canvas update image from a chosen channel,
+#                places template into the region defined by 4 coords (no cropping),
+#                and compares COLORS vs the canvas region as a percentage.
+#
+# COORDINATE SYSTEM:
+#   User inputs use BOTTOM-LEFT as (0,0).
+#   Image processing uses TOP-LEFT as (0,0).
+#   Conversion: y_img = (H - 1) - y_user
 #
 # Requirements:
 #   pip install -U discord.py pillow
@@ -207,19 +214,78 @@ def build_embed(res: dict) -> discord.Embed:
         title=f"{res['ban_title']} — {res['ban_length']}",
         description=res["description"] or "No description provided.",
     )
-
     rule = res["rule"] or "No exact rule provided."
     embed.add_field(name="Rule", value=rule[:900], inline=False)
-
     if res["unsure"] and res["suggestion"]:
         embed.set_footer(text=res["suggestion"][:2048])
-
     return embed
 
 @bot.event
 async def on_ready():
     await bot.tree.sync()
     print(f"✅ Logged in as {bot.user}")
+
+# -------------------- COMMON HELPERS --------------------
+async def _download_bytes(session, url: str, timeout_s: int = 30) -> bytes:
+    async with session.get(url, timeout=timeout_s) as resp:
+        if resp.status != 200:
+            raise RuntimeError(f"HTTP {resp.status}")
+        return await resp.read()
+
+def _clamp_int(v: int, lo: int, hi: int) -> int:
+    if v < lo: return lo
+    if v > hi: return hi
+    return v
+
+def _user_to_image_y(y_user: int, img_h: int) -> int:
+    # user coordinate system: bottom-left origin
+    # image coordinate system: top-left origin
+    return (img_h - 1) - y_user
+
+async def _find_latest_image_url(channel: discord.TextChannel | discord.Thread) -> str | None:
+    async for msg in channel.history(limit=50, oldest_first=False):
+        for a in msg.attachments:
+            ct = (a.content_type or "")
+            if ct.startswith("image/") and a.url:
+                return a.url
+        for e in msg.embeds:
+            if e.image and e.image.url:
+                return e.image.url
+            if e.thumbnail and e.thumbnail.url:
+                return e.thumbnail.url
+    return None
+
+def _palette_color_set(img_rgba, sample_max_side: int = 512, colors: int = 256) -> set[tuple[int, int, int]]:
+    """
+    Returns a SET of RGB colors used by the image after adaptive palette quantization.
+    Makes comparisons stable (avoids compression noise creating millions of near-colors).
+    """
+    from PIL import Image
+
+    im = img_rgba
+    w, h = im.size
+
+    # downscale for speed if huge
+    if max(w, h) > sample_max_side:
+        if w >= h:
+            nw = sample_max_side
+            nh = max(1, int(h * (sample_max_side / w)))
+        else:
+            nh = sample_max_side
+            nw = max(1, int(w * (sample_max_side / h)))
+        im = im.resize((nw, nh), resample=Image.Resampling.BILINEAR)
+
+    pal = im.convert("P", palette=Image.Palette.ADAPTIVE, colors=colors)
+    used = pal.getcolors(maxcolors=colors * 4) or []
+    used_indices = {idx for (_, idx) in used}
+
+    palette = pal.getpalette() or []
+    out = set()
+    for idx in used_indices:
+        base = idx * 3
+        if base + 2 < len(palette):
+            out.add((palette[base], palette[base + 1], palette[base + 2]))
+    return out
 
 # -------------------- COMMANDS --------------------
 @bot.tree.command(
@@ -235,16 +301,9 @@ async def ask(interaction: discord.Interaction, message: str):
     await interaction.response.defer(thinking=True)
     raw = await call_openai_async(SYSTEM_PROMPT, message)
     result = safe_parse(raw)
-    embed = build_embed(result)
-    await interaction.followup.send(embed=embed)
+    await interaction.followup.send(embed=build_embed(result))
 
 # -------------------- STOP-MOTION GIF COMMAND --------------------
-async def _download_bytes(session, url: str, timeout_s: int = 30) -> bytes:
-    async with session.get(url, timeout=timeout_s) as resp:
-        if resp.status != 200:
-            raise RuntimeError(f"HTTP {resp.status}")
-        return await resp.read()
-
 def _fit_resize(w: int, h: int, max_side: int) -> tuple[int, int]:
     if max(w, h) <= max_side:
         return w, h
@@ -355,7 +414,6 @@ async def stopmotion(
 
     duration_ms = int(1000 / fps)
     out = BytesIO()
-
     pal_frames = [im.convert("P", palette=Image.Palette.ADAPTIVE, colors=256) for im in normalized]
     pal_frames[0].save(
         out,
@@ -369,37 +427,19 @@ async def stopmotion(
     )
     out.seek(0)
 
-    file = discord.File(fp=out, filename="stopmotion.gif")
     await interaction.followup.send(
         content=f"GIF generated ({len(pal_frames)} frames, {fps} fps) from the last {hours} hour(s):",
-        file=file
+        file=discord.File(fp=out, filename="stopmotion.gif")
     )
 
-# -------------------- MARK AREA (CROP) COMMAND --------------------
-async def _find_latest_image_url(channel: discord.TextChannel | discord.Thread) -> str | None:
-    async for msg in channel.history(limit=50, oldest_first=False):
-        for a in msg.attachments:
-            ct = (a.content_type or "")
-            if ct.startswith("image/") and a.url:
-                return a.url
-        for e in msg.embeds:
-            if e.image and e.image.url:
-                return e.image.url
-            if e.thumbnail and e.thumbnail.url:
-                return e.thumbnail.url
-    return None
-
-def _clamp_int(v: int, lo: int, hi: int) -> int:
-    if v < lo: return lo
-    if v > hi: return hi
-    return v
-
+# -------------------- MARK AREA (BOTTOM-LEFT COORDS + TEMPLATE PLACE + COLOR COMPARE) --------------------
 @bot.tree.command(
     name="markarea",
-    description="Grab latest canvas image from a channel and crop to the region defined by 4 corners."
+    description="Place a template image into a canvas region (bottom-left coords) and compare colors vs that region."
 )
 @app_commands.describe(
-    source_channel="Channel that contains the latest canvas update image.",
+    source_channel="Channel with the latest canvas update image.",
+    template="Template image to place (attachment option).",
     x1="Corner 1 X", y1="Corner 1 Y",
     x2="Corner 2 X", y2="Corner 2 Y",
     x3="Corner 3 X", y3="Corner 3 Y",
@@ -408,6 +448,7 @@ def _clamp_int(v: int, lo: int, hi: int) -> int:
 async def markarea(
     interaction: discord.Interaction,
     source_channel: discord.TextChannel,
+    template: discord.Attachment,
     x1: int, y1: int,
     x2: int, y2: int,
     x3: int, y3: int,
@@ -415,76 +456,127 @@ async def markarea(
 ):
     from PIL import Image  # lazy import
 
+    if not (template.content_type or "").startswith("image/"):
+        await interaction.response.send_message("That template doesn’t look like an image.", ephemeral=True)
+        return
+
     await interaction.response.defer(thinking=True)
 
+    # Latest canvas image URL
     try:
-        url = await _find_latest_image_url(source_channel)
+        canvas_url = await _find_latest_image_url(source_channel)
     except discord.Forbidden:
         await interaction.followup.send("I don’t have permission to read message history in that channel.")
         return
 
-    if not url:
+    if not canvas_url:
         await interaction.followup.send("I couldn’t find any recent images in that channel.")
         return
 
+    # Download both
     import aiohttp
     try:
         async with aiohttp.ClientSession() as session:
-            img_bytes = await _download_bytes(session, url, timeout_s=30)
+            canvas_bytes = await _download_bytes(session, canvas_url, timeout_s=30)
+        template_bytes = await template.read()
     except Exception as e:
-        await interaction.followup.send(f"Failed to download the latest image: {e}")
+        await interaction.followup.send(f"Failed to download images: {e}")
+        return
+
+    # Open
+    try:
+        canvas = Image.open(BytesIO(canvas_bytes)).convert("RGBA")
+    except Exception as e:
+        await interaction.followup.send(f"Couldn’t open the canvas image: {e}")
         return
 
     try:
-        im = Image.open(BytesIO(img_bytes)).convert("RGBA")
+        user_img = Image.open(BytesIO(template_bytes)).convert("RGBA")
     except Exception as e:
-        await interaction.followup.send(f"Couldn’t open that image: {e}")
+        await interaction.followup.send(f"Couldn’t open your template image: {e}")
         return
 
-    w, h = im.size
+    W, H = canvas.size
 
-    # Clamp points to bounds
-    pts = [
-        (_clamp_int(x1, 0, w - 1), _clamp_int(y1, 0, h - 1)),
-        (_clamp_int(x2, 0, w - 1), _clamp_int(y2, 0, h - 1)),
-        (_clamp_int(x3, 0, w - 1), _clamp_int(y3, 0, h - 1)),
-        (_clamp_int(x4, 0, w - 1), _clamp_int(y4, 0, h - 1)),
-    ]
+    # Convert user (bottom-left) Y to image (top-left) Y, then clamp
+    def to_img_pt(xu: int, yu: int) -> tuple[int, int]:
+        xi = _clamp_int(xu, 0, W - 1)
+        yi = _clamp_int(_user_to_image_y(yu, H), 0, H - 1)
+        return (xi, yi)
 
-    # For a crop, we take the bounding rectangle of the 4 corners
-    xs = [p[0] for p in pts]
-    ys = [p[1] for p in pts]
+    p1 = to_img_pt(x1, y1)
+    p2 = to_img_pt(x2, y2)
+    p3 = to_img_pt(x3, y3)
+    p4 = to_img_pt(x4, y4)
+
+    xs = [p1[0], p2[0], p3[0], p4[0]]
+    ys = [p1[1], p2[1], p3[1], p4[1]]
+
     left = max(0, min(xs))
-    right = min(w, max(xs) + 1)
+    right = min(W, max(xs) + 1)
     top = max(0, min(ys))
-    bottom = min(h, max(ys) + 1)
+    bottom = min(H, max(ys) + 1)
 
-    # Validate crop area
-    if right - left < 2 or bottom - top < 2:
-        await interaction.followup.send("Those coordinates produce a crop that’s too small. Try wider corners.")
+    box_w = right - left
+    box_h = bottom - top
+
+    if box_w < 2 or box_h < 2:
+        await interaction.followup.send("Those coordinates create a region that’s too small. Try wider corners.")
         return
 
-    cropped = im.crop((left, top, right, bottom))
+    # Canvas region (cropped only for analysis)
+    canvas_region = canvas.crop((left, top, right, bottom))
 
+    # Template is NOT cropped — resized to fit region (may stretch)
+    user_fit = user_img.resize((box_w, box_h), resample=Image.Resampling.LANCZOS)
+
+    # Overlay preview: paste template into canvas at region
+    overlay = canvas.copy()
+    overlay.paste(user_fit, (left, top), user_fit)
+
+    # Color comparison (palette quantized)
+    canvas_colors = _palette_color_set(canvas_region, sample_max_side=512, colors=256)
+    user_colors = _palette_color_set(user_fit, sample_max_side=512, colors=256)
+
+    if not user_colors:
+        shared_count = 0
+        shared_pct = 0.0
+    else:
+        shared_count = len(canvas_colors.intersection(user_colors))
+        # As requested: 0% if canvas shares no colors with input image
+        shared_pct = (shared_count / len(user_colors)) * 100.0
+
+    # Send overlay image
     out = BytesIO()
-    cropped.save(out, format="PNG")
+    overlay.save(out, format="PNG")
     out.seek(0)
 
-    file = discord.File(fp=out, filename="cropped_area.png")
+    # Convert box back to user (bottom-left) display for clarity
+    # top_img -> y_user_top, bottom_img-1 -> y_user_bottom
+    y_user_top = (H - 1) - top
+    y_user_bottom = (H - 1) - (bottom - 1)
+
     await interaction.followup.send(
         content=(
-            f"✅ Cropped from latest image in {source_channel.mention}\n"
-            f"Original: **{w}×{h}** | Crop: **{cropped.size[0]}×{cropped.size[1]}**\n"
-            f"Box: left={left}, top={top}, right={right-1}, bottom={bottom-1}"
+            f"🧩 **Overlay preview** placed into the canvas region.\n"
+            f"Canvas: **{W}×{H}**\n"
+            f"Region (user coords, bottom-left): "
+            f"**left={left}, bottom={y_user_bottom}, right={right-1}, top={y_user_top}** "
+            f"(size **{box_w}×{box_h}**)\n\n"
+            f"🎨 **Color comparison (quantized to 256 colors):**\n"
+            f"- Canvas region colors: **{len(canvas_colors)}**\n"
+            f"- Your template colors: **{len(user_colors)}**\n"
+            f"- Shared colors: **{shared_count}**\n"
+            f"- **Shared color %:** **{shared_pct:.2f}%**"
         ),
-        file=file
+        file=discord.File(fp=out, filename="overlay_preview.png")
     )
 
     # free memory ASAP
-    del img_bytes, im, cropped
+    del canvas_bytes, template_bytes, canvas, user_img, canvas_region, user_fit, overlay
 
 # -------------------- START --------------------
 if __name__ == "__main__":
     if not DISCORD_TOKEN:
-        raise RuntimeError("Missing DISCORD_TOKEN env var.")
+     raise RuntimeError("Missing DISCORD_TOKEN env var.")
     bot.run(DISCORD_TOKEN)
