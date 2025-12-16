@@ -1,15 +1,15 @@
 # Discord Slash Bot (Pydroid-friendly)
 # - /ask -> OpenAI rule helper (Embed output)
 # - /stopmotion -> makes a stop-motion GIF from images in channel history
-# - NEW: /markarea -> grabs most recent canvas update image from a chosen channel,
-#        draws a polygon/box using 4 user-provided corner coordinates, and returns annotated image.
+# - /markarea -> grabs latest canvas update image from a chosen channel,
+#                uses 4 corner coords to crop to that region (no drawing)
 #
 # Requirements:
 #   pip install -U discord.py pillow
 #
-# Env vars you MUST set:
-#   DISCORD_TOKEN   = your Discord bot token
-#   OPENAI_API_KEY  = your OpenAI API key
+# Env vars:
+#   DISCORD_TOKEN
+#   OPENAI_API_KEY
 
 import os
 import time
@@ -273,7 +273,7 @@ async def stopmotion(
     max_frames: int = 60,
     max_side: int = 512
 ):
-    from PIL import Image  # lazy import to reduce idle RAM
+    from PIL import Image  # lazy import
 
     if hours < 1: hours = 1
     if hours > 168: hours = 168
@@ -375,11 +375,8 @@ async def stopmotion(
         file=file
     )
 
-# -------------------- MARK AREA COMMAND --------------------
+# -------------------- MARK AREA (CROP) COMMAND --------------------
 async def _find_latest_image_url(channel: discord.TextChannel | discord.Thread) -> str | None:
-    """
-    Finds the most recent image URL in a channel (attachments first, then embed images).
-    """
     async for msg in channel.history(limit=50, oldest_first=False):
         for a in msg.attachments:
             ct = (a.content_type or "")
@@ -393,15 +390,13 @@ async def _find_latest_image_url(channel: discord.TextChannel | discord.Thread) 
     return None
 
 def _clamp_int(v: int, lo: int, hi: int) -> int:
-    if v < lo:
-        return lo
-    if v > hi:
-        return hi
+    if v < lo: return lo
+    if v > hi: return hi
     return v
 
 @bot.tree.command(
     name="markarea",
-    description="Grab the latest canvas image from a channel and draw a 4-corner outline on it."
+    description="Grab latest canvas image from a channel and crop to the region defined by 4 corners."
 )
 @app_commands.describe(
     source_channel="Channel that contains the latest canvas update image.",
@@ -418,12 +413,10 @@ async def markarea(
     x3: int, y3: int,
     x4: int, y4: int,
 ):
-    # Lazy imports: only loaded during this command to reduce idle RAM
-    from PIL import Image, ImageDraw
+    from PIL import Image  # lazy import
 
     await interaction.response.defer(thinking=True)
 
-    # Find latest image URL in the chosen channel
     try:
         url = await _find_latest_image_url(source_channel)
     except discord.Forbidden:
@@ -434,7 +427,6 @@ async def markarea(
         await interaction.followup.send("I couldn’t find any recent images in that channel.")
         return
 
-    # Download image bytes
     import aiohttp
     try:
         async with aiohttp.ClientSession() as session:
@@ -443,7 +435,6 @@ async def markarea(
         await interaction.followup.send(f"Failed to download the latest image: {e}")
         return
 
-    # Open and draw polygon
     try:
         im = Image.open(BytesIO(img_bytes)).convert("RGBA")
     except Exception as e:
@@ -452,57 +443,45 @@ async def markarea(
 
     w, h = im.size
 
-    # Clamp coords to image bounds (prevents crashes if user inputs out-of-range)
-    p1 = (_clamp_int(x1, 0, w - 1), _clamp_int(y1, 0, h - 1))
-    p2 = (_clamp_int(x2, 0, w - 1), _clamp_int(y2, 0, h - 1))
-    p3 = (_clamp_int(x3, 0, w - 1), _clamp_int(y3, 0, h - 1))
-    p4 = (_clamp_int(x4, 0, w - 1), _clamp_int(y4, 0, h - 1))
+    # Clamp points to bounds
+    pts = [
+        (_clamp_int(x1, 0, w - 1), _clamp_int(y1, 0, h - 1)),
+        (_clamp_int(x2, 0, w - 1), _clamp_int(y2, 0, h - 1)),
+        (_clamp_int(x3, 0, w - 1), _clamp_int(y3, 0, h - 1)),
+        (_clamp_int(x4, 0, w - 1), _clamp_int(y4, 0, h - 1)),
+    ]
 
-    draw = ImageDraw.Draw(im, "RGBA")
+    # For a crop, we take the bounding rectangle of the 4 corners
+    xs = [p[0] for p in pts]
+    ys = [p[1] for p in pts]
+    left = max(0, min(xs))
+    right = min(w, max(xs) + 1)
+    top = max(0, min(ys))
+    bottom = min(h, max(ys) + 1)
 
-    # Line thickness scales a bit with image size
-    thickness = max(2, min(12, (max(w, h) // 300)))
+    # Validate crop area
+    if right - left < 2 or bottom - top < 2:
+        await interaction.followup.send("Those coordinates produce a crop that’s too small. Try wider corners.")
+        return
 
-    # Semi-transparent fill to make the area obvious (still "rough outline")
-    fill = (255, 0, 0, 45)     # translucent red
-    outline = (255, 0, 0, 220) # solid-ish red
+    cropped = im.crop((left, top, right, bottom))
 
-    # Draw polygon (connects corners in the order the user provides)
-    polygon = [p1, p2, p3, p4]
-    draw.polygon(polygon, fill=fill, outline=outline)
-
-    # Draw thicker outline by re-drawing lines
-    def thick_line(a, b):
-        draw.line([a, b], fill=outline, width=thickness)
-
-    thick_line(p1, p2)
-    thick_line(p2, p3)
-    thick_line(p3, p4)
-    thick_line(p4, p1)
-
-    # Mark the corners (tiny circles) + labels 1-4
-    r = max(4, thickness + 2)
-    for idx, (px, py) in enumerate([p1, p2, p3, p4], start=1):
-        draw.ellipse((px - r, py - r, px + r, py + r), fill=(255, 255, 255, 230), outline=(0, 0, 0, 200))
-        draw.text((px + r + 2, py - r - 2), str(idx), fill=(255, 255, 255, 240))
-
-    # Output image
     out = BytesIO()
-    im.save(out, format="PNG")
+    cropped.save(out, format="PNG")
     out.seek(0)
 
-    file = discord.File(fp=out, filename="marked_area.png")
+    file = discord.File(fp=out, filename="cropped_area.png")
     await interaction.followup.send(
         content=(
-            f"✅ Marked area on latest image from {source_channel.mention}\n"
-            f"Image size: **{w}×{h}**\n"
-            f"Corners: {p1}, {p2}, {p3}, {p4}"
+            f"✅ Cropped from latest image in {source_channel.mention}\n"
+            f"Original: **{w}×{h}** | Crop: **{cropped.size[0]}×{cropped.size[1]}**\n"
+            f"Box: left={left}, top={top}, right={right-1}, bottom={bottom-1}"
         ),
         file=file
     )
 
-    # Free memory ASAP
-    del img_bytes, im
+    # free memory ASAP
+    del img_bytes, im, cropped
 
 # -------------------- START --------------------
 if __name__ == "__main__":
