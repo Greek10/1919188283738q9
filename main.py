@@ -270,27 +270,20 @@ def _make_template_progress_preview(canvas_crop, template_crop, red_alpha: int =
     tpx = template_crop.load()
     opx = out.load()
 
-    # Red overlay where mismatch, but keep the template visible
-    # alpha of red overlay is scaled by template alpha (so transparent areas stay transparent)
     red_alpha = _clamp_int(red_alpha, 0, 255)
 
     for y in range(h):
         for x in range(w):
             tr, tg, tb, ta = tpx[x, y]
             if ta == 0:
-                # keep transparent as-is
                 continue
 
             cr, cg, cb, ca = cpx[x, y]
 
-            # exact match on RGB
             if (cr, cg, cb) == (tr, tg, tb):
-                # show template pixel clean
                 opx[x, y] = (tr, tg, tb, ta)
             else:
-                # mismatch -> template pixel + red "light" on top
-                # blend: result = (1-a)*template + a*red
-                a = (red_alpha * ta) // 255  # effective alpha 0..255
+                a = (red_alpha * ta) // 255
                 inv = 255 - a
                 rr = (tr * inv + 255 * a) // 255
                 rg = (tg * inv + 0 * a) // 255
@@ -565,7 +558,6 @@ async def markarea(
     # - Else crop it using SAME coordinate box (template must be full-canvas-sized or aligned)
     if (TW, TH) == (box_w, box_h):
         tmpl_crop = tmpl
-        tmpl_note = "Template matched region size → no crop."
     else:
         def to_tmpl_img_pt(xu: int, yu: int) -> tuple[int, int]:
             xi = _clamp_int(xu, 0, TW - 1)
@@ -595,7 +587,6 @@ async def markarea(
             return
 
         tmpl_crop = tmpl.crop((t_left, t_top, t_right, t_bottom))
-        tmpl_note = "Template cropped to the same coordinate box."
 
     # Progress % (exact)
     pct, matched, total = _exact_progress_percent(canvas_crop, tmpl_crop)
@@ -607,14 +598,15 @@ async def markarea(
     preview.save(out_preview, format="PNG")
     out_preview.seek(0)
 
+    # Cleaner /ask-style text (no "note" lines, no legend)
     await interaction.followup.send(
-    content=(
-        f"🧩 **Template Progress Report**\n"
-        f"**Region:** {box_w}×{box_h}\n\n"
-        f"**Matched pixels:** {matched:,} / {total:,}\n"
-        f"**Completion:** **{pct:.2f}%**"
-    ),
-    file=discord.File(fp=out_overlay, filename="template_progress.png")
+        content=(
+            f"🧩 **Template Progress Report**\n"
+            f"**Region:** {box_w}×{box_h}\n\n"
+            f"**Matched pixels:** {matched:,} / {total:,}\n"
+            f"**Completion:** **{pct:.2f}%**"
+        ),
+        file=discord.File(fp=out_preview, filename="template_progress.png")
     )
 
     del canvas_bytes, template_bytes, canvas, tmpl, canvas_crop, tmpl_crop, preview
