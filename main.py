@@ -471,11 +471,11 @@ async def stopmotion(
 
 # -------------------- MARKAREA --------------------
 @bot.tree.command(
-    name="markarea",
-    description="Template progresser: crop both, show template + red mismatch light, and progress %."
+    name="template",
+    description="Template progresser."
 )
 @app_commands.describe(
-    source_channel="Channel with the latest canvas update image.",
+    source_channel="Channel where the canvas updates occurs.",
     template="Template image (attachment option).",
     coords="4 corners like (x1,y1)(x2,y2)(x3,y3)(x4,y4)"
 )
@@ -597,11 +597,11 @@ async def markarea(
 
         await interaction.followup.send(
             content=(
-                f"🧩 **Template Progress Report**\n"
+                f" **Template Progress**\n"
                 f"━━━━━━━━━━━━━━━━━━\n"
-                f"📐 **Region**: `{box_w}×{box_h}`\n"
-                f"🟩 **Matched**: `{matched:,} / {total:,}`\n"
-                f"📊 **Completion**: **{pct:.2f}%**"
+                f" **Region**: `{box_w}×{box_h}`\n"
+                f" **Pixels Completetion**: `{matched:,} / {total:,}`\n"
+                f" **Percentage Completion**: **{pct:.2f}%**"
             ),
             file=discord.File(fp=out_preview, filename="template_progress.png")
         )
