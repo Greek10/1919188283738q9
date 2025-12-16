@@ -1,4 +1,4 @@
-# Discord Slash Bot (Pydroid-friendly)
+# Discord Slash Bot
 # - /ask -> OpenAI rule helper (Embed output)
 # - /stopmotion -> makes a stop-motion GIF from images in channel history
 # - /markarea -> crops BOTH canvas + template using the same coordinates (bottom-left origin),
