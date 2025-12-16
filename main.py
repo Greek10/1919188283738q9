@@ -608,15 +608,13 @@ async def markarea(
     out_preview.seek(0)
 
     await interaction.followup.send(
-        content=(
-            f"🧩 **Template progress** — region **{box_w}×{box_h}**\n"
-            f"- Matching pixels: **{matched:,} / {total:,}** (template non-transparent)\n"
-            f"- ✅ **Progress:** **{pct:.2f}%**\n"
-            f"Note: {tmpl_note}\n\n"
-            f"🟥 Red light = pixels that still don’t match.\n"
-            f"🎨 Clean template color = pixels that match."
-        ),
-        file=discord.File(fp=out_preview, filename="template_progress.png")
+    content=(
+        f"🧩 **Template Progress Report**\n"
+        f"**Region:** {box_w}×{box_h}\n\n"
+        f"**Matched pixels:** {matched:,} / {total:,}\n"
+        f"**Completion:** **{pct:.2f}%**"
+    ),
+    file=discord.File(fp=out_overlay, filename="template_progress.png")
     )
 
     del canvas_bytes, template_bytes, canvas, tmpl, canvas_crop, tmpl_crop, preview
