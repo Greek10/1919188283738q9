@@ -604,7 +604,7 @@ async def markarea(
             content=(
                 f"🧩 **Template Progress Report**\n"
                 f"━━━━━━━━━━━━━━━━━━\n"
-                f"**Size**: `{box_w}×{box_h}`\n"
+                f" **Size**: `{box_w}×{box_h}`\n"
                 f" **Pixels Completetion**: `{matched:,} / {total:,}`\n"
                 f" **Percentage Completion**: **{pct:.2f}%**"
             ),
