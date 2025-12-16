@@ -604,9 +604,9 @@ async def markarea(
             content=(
                 f"🧩 **Template Progress Report**\n"
                 f"━━━━━━━━━━━━━━━━━━\n"
-                f"📐 **Region**: `{box_w}×{box_h}`\n"
-                f"🟩 **Matched**: `{matched:,} / {total:,}`\n"
-                f"📊 **Completion**: **{pct:.2f}%**"
+                f"**Size**: `{box_w}×{box_h}`\n"
+                f" **Pixels Completetion**: `{matched:,} / {total:,}`\n"
+                f" **Percentage Completion**: **{pct:.2f}%**"
             ),
             file=discord.File(fp=out_preview, filename="template_progress.png")
         )
