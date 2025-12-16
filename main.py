@@ -1,14 +1,13 @@
 # Discord Slash Bot (Pydroid-friendly)
 # - /ask -> OpenAI rule helper (Embed output)
 # - /stopmotion -> makes a stop-motion GIF from images in channel history
-# - /markarea -> user provides a TEMPLATE image (slash attachment option),
-#                bot grabs latest canvas update image from a chosen channel,
-#                places template into the region defined by 4 coords (no cropping),
-#                and compares COLORS vs the canvas region as a percentage.
+# - /markarea -> crops BOTH canvas + template using the same coordinates (bottom-left origin),
+#                unless the template is already exactly the crop size (then no crop),
+#                then compares colors and outputs shared-color percentage.
 #
 # COORDINATE SYSTEM:
 #   User inputs use BOTTOM-LEFT as (0,0).
-#   Image processing uses TOP-LEFT as (0,0).
+#   PIL images use TOP-LEFT as (0,0).
 #   Conversion: y_img = (H - 1) - y_user
 #
 # Requirements:
@@ -39,8 +38,6 @@ MAX_OUTPUT_TOKENS = 450
 
 COOLDOWN_S = 6
 _last_used = {}
-
-SHOW_DEBUG_PREVIEW = False
 
 # ✅ SYSTEM PROMPT (UNCHANGED)
 SYSTEM_PROMPT = r"""
@@ -238,8 +235,6 @@ def _clamp_int(v: int, lo: int, hi: int) -> int:
     return v
 
 def _user_to_image_y(y_user: int, img_h: int) -> int:
-    # user coordinate system: bottom-left origin
-    # image coordinate system: top-left origin
     return (img_h - 1) - y_user
 
 async def _find_latest_image_url(channel: discord.TextChannel | discord.Thread) -> str | None:
@@ -257,15 +252,13 @@ async def _find_latest_image_url(channel: discord.TextChannel | discord.Thread) 
 
 def _palette_color_set(img_rgba, sample_max_side: int = 512, colors: int = 256) -> set[tuple[int, int, int]]:
     """
-    Returns a SET of RGB colors used by the image after adaptive palette quantization.
-    Makes comparisons stable (avoids compression noise creating millions of near-colors).
+    Color set after adaptive 256-color quantization (stable vs compression noise).
     """
     from PIL import Image
 
     im = img_rgba
     w, h = im.size
 
-    # downscale for speed if huge
     if max(w, h) > sample_max_side:
         if w >= h:
             nw = sample_max_side
@@ -300,8 +293,7 @@ async def ask(interaction: discord.Interaction, message: str):
 
     await interaction.response.defer(thinking=True)
     raw = await call_openai_async(SYSTEM_PROMPT, message)
-    result = safe_parse(raw)
-    await interaction.followup.send(embed=build_embed(result))
+    await interaction.followup.send(embed=build_embed(safe_parse(raw)))
 
 # -------------------- STOP-MOTION GIF COMMAND --------------------
 def _fit_resize(w: int, h: int, max_side: int) -> tuple[int, int]:
@@ -332,7 +324,7 @@ async def stopmotion(
     max_frames: int = 60,
     max_side: int = 512
 ):
-    from PIL import Image  # lazy import
+    from PIL import Image
 
     if hours < 1: hours = 1
     if hours > 168: hours = 168
@@ -351,29 +343,30 @@ async def stopmotion(
     await interaction.response.defer(thinking=True)
     cutoff = discord.utils.utcnow() - timedelta(hours=hours)
 
-    found: list[tuple[discord.Message, str]] = []
+    found: list[str] = []
     try:
         async for msg in channel.history(limit=2000, after=cutoff, oldest_first=True):
             for a in msg.attachments:
                 ct = (a.content_type or "")
                 if ct.startswith("image/") and a.url:
-                    found.append((msg, a.url))
+                    found.append(a.url)
             for e in msg.embeds:
                 if e.image and e.image.url:
-                    found.append((msg, e.image.url))
+                    found.append(e.image.url)
                 if e.thumbnail and e.thumbnail.url:
-                    found.append((msg, e.thumbnail.url))
+                    found.append(e.thumbnail.url)
     except discord.Forbidden:
         await interaction.followup.send("I don’t have permission to read message history in this channel.")
         return
 
+    # de-dupe preserving order
     seen = set()
     ordered = []
-    for msg, url in found:
+    for url in found:
         if url in seen:
             continue
         seen.add(url)
-        ordered.append((msg, url))
+        ordered.append(url)
 
     if not ordered:
         await interaction.followup.send(f"No images found in the last {hours} hour(s) in this channel.")
@@ -385,7 +378,7 @@ async def stopmotion(
     frames: list[Image.Image] = []
     import aiohttp
     async with aiohttp.ClientSession() as session:
-        for _, url in ordered:
+        for url in ordered:
             try:
                 b = await _download_bytes(session, url)
                 im = Image.open(BytesIO(b)).convert("RGBA")
@@ -432,14 +425,14 @@ async def stopmotion(
         file=discord.File(fp=out, filename="stopmotion.gif")
     )
 
-# -------------------- MARK AREA (BOTTOM-LEFT COORDS + TEMPLATE PLACE + COLOR COMPARE) --------------------
+# -------------------- MARK AREA (CROP BOTH) --------------------
 @bot.tree.command(
     name="markarea",
-    description="Place a template image into a canvas region (bottom-left coords) and compare colors vs that region."
+    description="Crop BOTH canvas+template using the same coords (bottom-left origin) and compare colors."
 )
 @app_commands.describe(
     source_channel="Channel with the latest canvas update image.",
-    template="Template image to place (attachment option).",
+    template="Template image (attachment option).",
     x1="Corner 1 X", y1="Corner 1 Y",
     x2="Corner 2 X", y2="Corner 2 Y",
     x3="Corner 3 X", y3="Corner 3 Y",
@@ -454,7 +447,7 @@ async def markarea(
     x3: int, y3: int,
     x4: int, y4: int,
 ):
-    from PIL import Image  # lazy import
+    from PIL import Image
 
     if not (template.content_type or "").startswith("image/"):
         await interaction.response.send_message("That template doesn’t look like an image.", ephemeral=True)
@@ -473,7 +466,6 @@ async def markarea(
         await interaction.followup.send("I couldn’t find any recent images in that channel.")
         return
 
-    # Download both
     import aiohttp
     try:
         async with aiohttp.ClientSession() as session:
@@ -483,39 +475,34 @@ async def markarea(
         await interaction.followup.send(f"Failed to download images: {e}")
         return
 
-    # Open
     try:
         canvas = Image.open(BytesIO(canvas_bytes)).convert("RGBA")
+        tmpl = Image.open(BytesIO(template_bytes)).convert("RGBA")
     except Exception as e:
-        await interaction.followup.send(f"Couldn’t open the canvas image: {e}")
+        await interaction.followup.send(f"Couldn’t open images: {e}")
         return
 
-    try:
-        user_img = Image.open(BytesIO(template_bytes)).convert("RGBA")
-    except Exception as e:
-        await interaction.followup.send(f"Couldn’t open your template image: {e}")
-        return
+    CW, CH = canvas.size
+    TW, TH = tmpl.size
 
-    W, H = canvas.size
-
-    # Convert user (bottom-left) Y to image (top-left) Y, then clamp
-    def to_img_pt(xu: int, yu: int) -> tuple[int, int]:
-        xi = _clamp_int(xu, 0, W - 1)
-        yi = _clamp_int(_user_to_image_y(yu, H), 0, H - 1)
+    # Convert bottom-left user coords -> image coords for CANVAS
+    def to_canvas_img_pt(xu: int, yu: int) -> tuple[int, int]:
+        xi = _clamp_int(xu, 0, CW - 1)
+        yi = _clamp_int(_user_to_image_y(yu, CH), 0, CH - 1)
         return (xi, yi)
 
-    p1 = to_img_pt(x1, y1)
-    p2 = to_img_pt(x2, y2)
-    p3 = to_img_pt(x3, y3)
-    p4 = to_img_pt(x4, y4)
+    p1 = to_canvas_img_pt(x1, y1)
+    p2 = to_canvas_img_pt(x2, y2)
+    p3 = to_canvas_img_pt(x3, y3)
+    p4 = to_canvas_img_pt(x4, y4)
 
     xs = [p1[0], p2[0], p3[0], p4[0]]
     ys = [p1[1], p2[1], p3[1], p4[1]]
 
     left = max(0, min(xs))
-    right = min(W, max(xs) + 1)
+    right = min(CW, max(xs) + 1)
     top = max(0, min(ys))
-    bottom = min(H, max(ys) + 1)
+    bottom = min(CH, max(ys) + 1)
 
     box_w = right - left
     box_h = bottom - top
@@ -524,59 +511,91 @@ async def markarea(
         await interaction.followup.send("Those coordinates create a region that’s too small. Try wider corners.")
         return
 
-    # Canvas region (cropped only for analysis)
+    # 1) Crop canvas always
     canvas_region = canvas.crop((left, top, right, bottom))
 
-    # Template is NOT cropped — resized to fit region (may stretch)
-    user_fit = user_img.resize((box_w, box_h), resample=Image.Resampling.LANCZOS)
+    # 2) Template: if it is ALREADY exactly region size, do NOT crop it
+    if (TW, TH) == (box_w, box_h):
+        tmpl_region = tmpl
+        tmpl_note = "Template matched region size → no crop."
+    else:
+        # Otherwise crop template to THE SAME BOX (same pixel coords), but using template height for Y conversion.
+        # This only makes sense if the template is a full-canvas-sized image (or at least large enough).
+        # Convert the SAME user coords -> template image coords:
+        def to_tmpl_img_pt(xu: int, yu: int) -> tuple[int, int]:
+            xi = _clamp_int(xu, 0, TW - 1)
+            yi = _clamp_int(_user_to_image_y(yu, TH), 0, TH - 1)
+            return (xi, yi)
 
-    # Overlay preview: paste template into canvas at region
-    overlay = canvas.copy()
-    overlay.paste(user_fit, (left, top), user_fit)
+        tp1 = to_tmpl_img_pt(x1, y1)
+        tp2 = to_tmpl_img_pt(x2, y2)
+        tp3 = to_tmpl_img_pt(x3, y3)
+        tp4 = to_tmpl_img_pt(x4, y4)
 
-    # Color comparison (palette quantized)
+        txs = [tp1[0], tp2[0], tp3[0], tp4[0]]
+        tys = [tp1[1], tp2[1], tp3[1], tp4[1]]
+
+        t_left = max(0, min(txs))
+        t_right = min(TW, max(txs) + 1)
+        t_top = max(0, min(tys))
+        t_bottom = min(TH, max(tys) + 1)
+
+        # If template is smaller than the intended region size, the crop will be smaller — that’s bad for comparison.
+        t_box_w = t_right - t_left
+        t_box_h = t_bottom - t_top
+        if t_box_w != box_w or t_box_h != box_h:
+            await interaction.followup.send(
+                "Your template image doesn’t cover that coordinate region (different size / not full-canvas). "
+                "Either upload a full canvas-sized template, or upload one that is exactly the region size."
+            )
+            return
+
+        tmpl_region = tmpl.crop((t_left, t_top, t_right, t_bottom))
+        tmpl_note = "Template cropped to the same coordinate box."
+
+    # Color comparison (quantized)
     canvas_colors = _palette_color_set(canvas_region, sample_max_side=512, colors=256)
-    user_colors = _palette_color_set(user_fit, sample_max_side=512, colors=256)
+    tmpl_colors = _palette_color_set(tmpl_region, sample_max_side=512, colors=256)
 
-    if not user_colors:
+    if not tmpl_colors:
         shared_count = 0
         shared_pct = 0.0
     else:
-        shared_count = len(canvas_colors.intersection(user_colors))
-        # As requested: 0% if canvas shares no colors with input image
-        shared_pct = (shared_count / len(user_colors)) * 100.0
+        shared_count = len(canvas_colors.intersection(tmpl_colors))
+        # as you asked: 0% if canvas shares no colors with template
+        shared_pct = (shared_count / len(tmpl_colors)) * 100.0
 
-    # Send overlay image
-    out = BytesIO()
-    overlay.save(out, format="PNG")
-    out.seek(0)
+    # Send BOTH crops so you can visually confirm they match
+    out1 = BytesIO()
+    canvas_region.save(out1, format="PNG")
+    out1.seek(0)
 
-    # Convert box back to user (bottom-left) display for clarity
-    # top_img -> y_user_top, bottom_img-1 -> y_user_bottom
-    y_user_top = (H - 1) - top
-    y_user_bottom = (H - 1) - (bottom - 1)
+    out2 = BytesIO()
+    tmpl_region.save(out2, format="PNG")
+    out2.seek(0)
 
     await interaction.followup.send(
         content=(
-            f"🧩 **Overlay preview** placed into the canvas region.\n"
-            f"Canvas: **{W}×{H}**\n"
-            f"Region (user coords, bottom-left): "
-            f"**left={left}, bottom={y_user_bottom}, right={right-1}, top={y_user_top}** "
-            f"(size **{box_w}×{box_h}**)\n\n"
-            f"🎨 **Color comparison (quantized to 256 colors):**\n"
-            f"- Canvas region colors: **{len(canvas_colors)}**\n"
-            f"- Your template colors: **{len(user_colors)}**\n"
+            f"✅ Cropped both images with your coords (bottom-left origin).\n"
+            f"Canvas crop: **{box_w}×{box_h}** | Template crop: **{tmpl_region.size[0]}×{tmpl_region.size[1]}**\n"
+            f"Note: {tmpl_note}\n\n"
+            f"🎨 **Color comparison (256-color quantized):**\n"
+            f"- Canvas colors: **{len(canvas_colors)}**\n"
+            f"- Template colors: **{len(tmpl_colors)}**\n"
             f"- Shared colors: **{shared_count}**\n"
             f"- **Shared color %:** **{shared_pct:.2f}%**"
         ),
-        file=discord.File(fp=out, filename="overlay_preview.png")
+        files=[
+            discord.File(fp=out1, filename="canvas_crop.png"),
+            discord.File(fp=out2, filename="template_crop.png"),
+        ]
     )
 
-    # free memory ASAP
-    del canvas_bytes, template_bytes, canvas, user_img, canvas_region, user_fit, overlay
+    # free memory
+    del canvas_bytes, template_bytes, canvas, tmpl, canvas_region, tmpl_region
 
 # -------------------- START --------------------
 if __name__ == "__main__":
     if not DISCORD_TOKEN:
-     raise RuntimeError("Missing DISCORD_TOKEN env var.")
+        raise RuntimeError("Missing DISCORD_TOKEN env var.")
     bot.run(DISCORD_TOKEN)
