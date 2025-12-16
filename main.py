@@ -1,9 +1,9 @@
-# Discord Slash Bot
+# Discord Slash Bot (Pydroid-friendly)
 # - /ask -> OpenAI rule helper (Embed output)
 # - /stopmotion -> makes a stop-motion GIF from images in channel history
-# - /markarea -> crops BOTH canvas + template using the same coordinates (bottom-left origin),
-#                unless the template is already exactly the crop size (then no crop),
-#                then compares colors and outputs shared-color percentage.
+# - /markarea -> crops BOTH canvas + template using same coords (bottom-left origin),
+#                overlays them (canvas=red, template=grey, both transparent),
+#                and outputs PROGRESS % = how close canvas is to template (pixel match rate).
 #
 # COORDINATE SYSTEM:
 #   User inputs use BOTTOM-LEFT as (0,0).
@@ -250,35 +250,50 @@ async def _find_latest_image_url(channel: discord.TextChannel | discord.Thread) 
                 return e.thumbnail.url
     return None
 
-def _palette_color_set(img_rgba, sample_max_side: int = 512, colors: int = 256) -> set[tuple[int, int, int]]:
+def _tint_layer(size, rgb: tuple[int, int, int], alpha_from, alpha_scale: int):
     """
-    Color set after adaptive 256-color quantization (stable vs compression noise).
+    Creates an RGBA layer of solid `rgb` whose alpha comes from alpha_from (PIL 'L' image),
+    multiplied by alpha_scale (0..255).
     """
     from PIL import Image
+    layer = Image.new("RGBA", size, (rgb[0], rgb[1], rgb[2], 0))
+    # alpha = (alpha_from * alpha_scale) / 255
+    a = alpha_from.point(lambda v: (v * alpha_scale) // 255)
+    layer.putalpha(a)
+    return layer
 
-    im = img_rgba
-    w, h = im.size
+def _progress_percent(canvas_rgba, template_rgba, tolerance: int = 0) -> tuple[float, int, int]:
+    """
+    Progress = % of template (non-transparent) pixels that match canvas pixels.
+    Match rule: RGB distance per-channel <= tolerance (0 = exact match).
+    Returns (percent, matched, total_considered)
+    """
+    c = canvas_rgba
+    t = template_rgba
+    if c.size != t.size:
+        return 0.0, 0, 0
 
-    if max(w, h) > sample_max_side:
-        if w >= h:
-            nw = sample_max_side
-            nh = max(1, int(h * (sample_max_side / w)))
-        else:
-            nh = sample_max_side
-            nw = max(1, int(w * (sample_max_side / h)))
-        im = im.resize((nw, nh), resample=Image.Resampling.BILINEAR)
+    cpx = c.load()
+    tpx = t.load()
+    w, h = c.size
 
-    pal = im.convert("P", palette=Image.Palette.ADAPTIVE, colors=colors)
-    used = pal.getcolors(maxcolors=colors * 4) or []
-    used_indices = {idx for (_, idx) in used}
+    tol = max(0, int(tolerance))
+    matched = 0
+    total = 0
 
-    palette = pal.getpalette() or []
-    out = set()
-    for idx in used_indices:
-        base = idx * 3
-        if base + 2 < len(palette):
-            out.add((palette[base], palette[base + 1], palette[base + 2]))
-    return out
+    for y in range(h):
+        for x in range(w):
+            tr, tg, tb, ta = tpx[x, y]
+            if ta == 0:
+                continue  # ignore transparent template pixels
+            cr, cg, cb, ca = cpx[x, y]
+            total += 1
+            # per-channel tolerance (fast + predictable)
+            if abs(cr - tr) <= tol and abs(cg - tg) <= tol and abs(cb - tb) <= tol:
+                matched += 1
+
+    pct = (matched / total * 100.0) if total else 0.0
+    return pct, matched, total
 
 # -------------------- COMMANDS --------------------
 @bot.tree.command(
@@ -359,7 +374,6 @@ async def stopmotion(
         await interaction.followup.send("I don’t have permission to read message history in this channel.")
         return
 
-    # de-dupe preserving order
     seen = set()
     ordered = []
     for url in found:
@@ -425,14 +439,15 @@ async def stopmotion(
         file=discord.File(fp=out, filename="stopmotion.gif")
     )
 
-# -------------------- MARK AREA (CROP BOTH) --------------------
+# -------------------- MARKAREA (OVERLAY + TEMPLATE PROGRESS) --------------------
 @bot.tree.command(
     name="markarea",
-    description="Crop BOTH canvas+template using the same coords (bottom-left origin) and compare colors."
+    description="Template progresser: crop both, overlay (red vs grey), and compute progress %."
 )
 @app_commands.describe(
     source_channel="Channel with the latest canvas update image.",
     template="Template image (attachment option).",
+    tolerance="Color tolerance (0=exact). Higher = more lenient (e.g. 10-20).",
     x1="Corner 1 X", y1="Corner 1 Y",
     x2="Corner 2 X", y2="Corner 2 Y",
     x3="Corner 3 X", y3="Corner 3 Y",
@@ -442,12 +457,15 @@ async def markarea(
     interaction: discord.Interaction,
     source_channel: discord.TextChannel,
     template: discord.Attachment,
+    tolerance: int,
     x1: int, y1: int,
     x2: int, y2: int,
     x3: int, y3: int,
     x4: int, y4: int,
 ):
     from PIL import Image
+
+    tolerance = _clamp_int(int(tolerance), 0, 80)
 
     if not (template.content_type or "").startswith("image/"):
         await interaction.response.send_message("That template doesn’t look like an image.", ephemeral=True)
@@ -511,17 +529,17 @@ async def markarea(
         await interaction.followup.send("Those coordinates create a region that’s too small. Try wider corners.")
         return
 
-    # 1) Crop canvas always
-    canvas_region = canvas.crop((left, top, right, bottom))
+    # Always crop canvas to region
+    canvas_crop = canvas.crop((left, top, right, bottom))
 
-    # 2) Template: if it is ALREADY exactly region size, do NOT crop it
+    # Template:
+    # - If already exactly box size, do NOT crop
+    # - Else crop it using SAME coordinate box (meaning template must be full-canvas-sized or match coordinate system)
     if (TW, TH) == (box_w, box_h):
-        tmpl_region = tmpl
+        tmpl_crop = tmpl
         tmpl_note = "Template matched region size → no crop."
     else:
-        # Otherwise crop template to THE SAME BOX (same pixel coords), but using template height for Y conversion.
-        # This only makes sense if the template is a full-canvas-sized image (or at least large enough).
-        # Convert the SAME user coords -> template image coords:
+        # Convert user coords -> template image coords using template height
         def to_tmpl_img_pt(xu: int, yu: int) -> tuple[int, int]:
             xi = _clamp_int(xu, 0, TW - 1)
             yi = _clamp_int(_user_to_image_y(yu, TH), 0, TH - 1)
@@ -540,59 +558,50 @@ async def markarea(
         t_top = max(0, min(tys))
         t_bottom = min(TH, max(tys) + 1)
 
-        # If template is smaller than the intended region size, the crop will be smaller — that’s bad for comparison.
-        t_box_w = t_right - t_left
-        t_box_h = t_bottom - t_top
-        if t_box_w != box_w or t_box_h != box_h:
+        if (t_right - t_left) != box_w or (t_bottom - t_top) != box_h:
             await interaction.followup.send(
-                "Your template image doesn’t cover that coordinate region (different size / not full-canvas). "
-                "Either upload a full canvas-sized template, or upload one that is exactly the region size."
+                "Your template image doesn’t cover that coordinate region. "
+                "Upload either:\n"
+                "- a full canvas-sized template (same coordinate system), OR\n"
+                "- a template that is exactly the region size."
             )
             return
 
-        tmpl_region = tmpl.crop((t_left, t_top, t_right, t_bottom))
+        tmpl_crop = tmpl.crop((t_left, t_top, t_right, t_bottom))
         tmpl_note = "Template cropped to the same coordinate box."
 
-    # Color comparison (quantized)
-    canvas_colors = _palette_color_set(canvas_region, sample_max_side=512, colors=256)
-    tmpl_colors = _palette_color_set(tmpl_region, sample_max_side=512, colors=256)
+    # Progress %: how close canvas is to template (only template non-transparent pixels count)
+    pct, matched, total = _progress_percent(canvas_crop, tmpl_crop, tolerance=tolerance)
 
-    if not tmpl_colors:
-        shared_count = 0
-        shared_pct = 0.0
-    else:
-        shared_count = len(canvas_colors.intersection(tmpl_colors))
-        # as you asked: 0% if canvas shares no colors with template
-        shared_pct = (shared_count / len(tmpl_colors)) * 100.0
+    # Overlay preview:
+    # - canvas tinted RED @ 55% alpha
+    # - template tinted GREY @ 55% alpha
+    # Keep alpha shapes from the original crops so transparent pixels don't smear.
+    cA = canvas_crop.split()[3]
+    tA = tmpl_crop.split()[3]
 
-    # Send BOTH crops so you can visually confirm they match
-    out1 = BytesIO()
-    canvas_region.save(out1, format="PNG")
-    out1.seek(0)
+    red_layer = _tint_layer(canvas_crop.size, (255, 0, 0), cA, alpha_scale=140)     # ~55%
+    grey_layer = _tint_layer(tmpl_crop.size, (140, 140, 140), tA, alpha_scale=140) # ~55%
 
-    out2 = BytesIO()
-    tmpl_region.save(out2, format="PNG")
-    out2.seek(0)
+    overlay = Image.alpha_composite(red_layer, grey_layer)
 
+    out_overlay = BytesIO()
+    overlay.save(out_overlay, format="PNG")
+    out_overlay.seek(0)
+
+    # Send overlay + stats
     await interaction.followup.send(
         content=(
-            f"✅ Cropped both images with your coords (bottom-left origin).\n"
-            f"Canvas crop: **{box_w}×{box_h}** | Template crop: **{tmpl_region.size[0]}×{tmpl_region.size[1]}**\n"
-            f"Note: {tmpl_note}\n\n"
-            f"🎨 **Color comparison (256-color quantized):**\n"
-            f"- Canvas colors: **{len(canvas_colors)}**\n"
-            f"- Template colors: **{len(tmpl_colors)}**\n"
-            f"- Shared colors: **{shared_count}**\n"
-            f"- **Shared color %:** **{shared_pct:.2f}%**"
+            f"🧩 **Template progress** (region **{box_w}×{box_h}**) — tol={tolerance}\n"
+            f"- Matching pixels: **{matched:,} / {total:,}** (template non-transparent)\n"
+            f"- ✅ **Progress:** **{pct:.2f}%**\n"
+            f"Note: {tmpl_note}"
         ),
-        files=[
-            discord.File(fp=out1, filename="canvas_crop.png"),
-            discord.File(fp=out2, filename="template_crop.png"),
-        ]
+        file=discord.File(fp=out_overlay, filename="progress_overlay.png")
     )
 
     # free memory
-    del canvas_bytes, template_bytes, canvas, tmpl, canvas_region, tmpl_region
+    del canvas_bytes, template_bytes, canvas, tmpl, canvas_crop, tmpl_crop, overlay
 
 # -------------------- START --------------------
 if __name__ == "__main__":
