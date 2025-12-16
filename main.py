@@ -28,6 +28,7 @@ import asyncio
 import urllib.request
 from io import BytesIO
 from datetime import timedelta
+import re
 
 import discord
 from discord import app_commands
@@ -255,12 +256,6 @@ async def _find_latest_image_url(channel: discord.TextChannel | discord.Thread) 
     return None
 
 def _make_template_progress_preview(canvas_crop, template_crop, red_alpha: int = 140):
-    """
-    Output image shows template normally.
-    Where template pixel (alpha>0) does NOT match canvas RGB exactly -> add red 'light' overlay.
-    Where they match -> show pure template color (no red).
-    Canvas image never appears.
-    """
     from PIL import Image
 
     w, h = template_crop.size
@@ -293,11 +288,6 @@ def _make_template_progress_preview(canvas_crop, template_crop, red_alpha: int =
     return out
 
 def _exact_progress_percent(canvas_rgba, template_rgba) -> tuple[float, int, int]:
-    """
-    Progress = exact pixel matches / template non-transparent pixels.
-    Match = exact RGB equality. (Template alpha==0 pixels ignored.)
-    Returns (percent, matched, total_considered)
-    """
     if canvas_rgba.size != template_rgba.size:
         return 0.0, 0, 0
 
@@ -320,6 +310,21 @@ def _exact_progress_percent(canvas_rgba, template_rgba) -> tuple[float, int, int
 
     pct = (matched / total * 100.0) if total else 0.0
     return pct, matched, total
+
+def parse_coords_4pairs(coords: str):
+    """
+    Accepts formats like:
+      (x1,y1)(x2,y2)(x3,y3)(x4,y4)
+      (x1, y1) (x2, y2) (x3, y3) (x4, y4)
+    Returns list of 4 tuples [(x,y),...]
+    """
+    if not coords:
+        raise ValueError("Missing coords.")
+    matches = re.findall(r"\(\s*(-?\d+)\s*,\s*(-?\d+)\s*\)", coords)
+    if len(matches) != 4:
+        raise ValueError("Coords must be exactly 4 pairs like (x1,y1)(x2,y2)(x3,y3)(x4,y4).")
+    pts = [(int(x), int(y)) for (x, y) in matches]
+    return pts
 
 # -------------------- COMMANDS --------------------
 @bot.tree.command(
@@ -464,27 +469,21 @@ async def stopmotion(
         file=discord.File(fp=out, filename="stopmotion.gif")
     )
 
-# -------------------- MARKAREA (TEMPLATE PROGRESS PREVIEW) --------------------
+# -------------------- MARKAREA --------------------
 @bot.tree.command(
-    name="template",
-    description="Template progresser."
+    name="markarea",
+    description="Template progresser: crop both, show template + red mismatch light, and progress %."
 )
 @app_commands.describe(
-    source_channel="Channel where canvas updates occurs.",
+    source_channel="Channel with the latest canvas update image.",
     template="Template image (attachment option).",
-    x1="Corner 1 X", y1="Corner 1 Y",
-    x2="Corner 2 X", y2="Corner 2 Y",
-    x3="Corner 3 X", y3="Corner 3 Y",
-    x4="Corner 4 X", y4="Corner 4 Y",
+    coords="4 corners like (x1,y1)(x2,y2)(x3,y3)(x4,y4)"
 )
 async def markarea(
     interaction: discord.Interaction,
     source_channel: discord.TextChannel,
     template: discord.Attachment,
-    x1: int, y1: int,
-    x2: int, y2: int,
-    x3: int, y3: int,
-    x4: int, y4: int,
+    coords: str
 ):
     from PIL import Image
 
@@ -495,7 +494,12 @@ async def markarea(
     await interaction.response.defer(thinking=True)
 
     try:
-        # Latest canvas image URL
+        (x1, y1), (x2, y2), (x3, y3), (x4, y4) = parse_coords_4pairs(coords)
+    except Exception as e:
+        await interaction.followup.send(f"❌ Bad coords. Use: `(x1,y1)(x2,y2)(x3,y3)(x4,y4)`\nError: `{e}`")
+        return
+
+    try:
         try:
             canvas_url = await _find_latest_image_url(source_channel)
         except discord.Forbidden:
@@ -525,7 +529,6 @@ async def markarea(
         CW, CH = canvas.size
         TW, TH = tmpl.size
 
-        # Convert bottom-left user coords -> image coords for CANVAS
         def to_canvas_img_pt(xu: int, yu: int) -> tuple[int, int]:
             xi = _clamp_int(xu, 0, CW - 1)
             yi = _clamp_int(_user_to_image_y(yu, CH), 0, CH - 1)
@@ -551,12 +554,8 @@ async def markarea(
             await interaction.followup.send("Those coordinates create a region that’s too small. Try wider corners.")
             return
 
-        # Always crop canvas to region
         canvas_crop = canvas.crop((left, top, right, bottom))
 
-        # Template:
-        # - If already exactly box size, do NOT crop
-        # - Else crop it using SAME coordinate box
         if (TW, TH) == (box_w, box_h):
             tmpl_crop = tmpl
         else:
@@ -580,7 +579,7 @@ async def markarea(
 
             if (t_right - t_left) != box_w or (t_bottom - t_top) != box_h:
                 await interaction.followup.send(
-                    "Your template image doesn’t cover that coordinate region. "
+                    "Your template image doesn’t cover that coordinate region.\n"
                     "Upload either:\n"
                     "- a full canvas-sized template (same coordinate system), OR\n"
                     "- a template that is exactly the region size."
@@ -589,33 +588,27 @@ async def markarea(
 
             tmpl_crop = tmpl.crop((t_left, t_top, t_right, t_bottom))
 
-        # Progress % (exact)
         pct, matched, total = _exact_progress_percent(canvas_crop, tmpl_crop)
-
-        # Preview image
         preview = _make_template_progress_preview(canvas_crop, tmpl_crop, red_alpha=150)
 
         out_preview = BytesIO()
         preview.save(out_preview, format="PNG")
         out_preview.seek(0)
 
-        # ✅ Nicer /markarea layout (only text changed)
         await interaction.followup.send(
             content=(
-                f" **Template Progress**\n"
+                f"🧩 **Template Progress Report**\n"
                 f"━━━━━━━━━━━━━━━━━━\n"
-                f" **Size**: `{box_w}×{box_h}`\n"
-                f" **Pixels Completetion**: `{matched:,} / {total:,}`\n"
-                f" **Percentage Completion**: **{pct:.2f}%**"
+                f"📐 **Region**: `{box_w}×{box_h}`\n"
+                f"🟩 **Matched**: `{matched:,} / {total:,}`\n"
+                f"📊 **Completion**: **{pct:.2f}%**"
             ),
             file=discord.File(fp=out_preview, filename="template_progress.png")
         )
 
-        # free memory
         del canvas_bytes, template_bytes, canvas, tmpl, canvas_crop, tmpl_crop, preview
 
     except Exception as e:
-        # prevents “thinking forever”
         await interaction.followup.send(f"❌ /markarea failed: `{type(e).__name__}: {e}`")
 
 # -------------------- START --------------------
