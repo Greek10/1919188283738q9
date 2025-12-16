@@ -602,7 +602,7 @@ async def markarea(
         # ✅ Nicer /markarea layout (only text changed)
         await interaction.followup.send(
             content=(
-                f"🧩 **Template Progress Report**\n"
+                f" **Template Progress**\n"
                 f"━━━━━━━━━━━━━━━━━━\n"
                 f" **Size**: `{box_w}×{box_h}`\n"
                 f" **Pixels Completetion**: `{matched:,} / {total:,}`\n"
