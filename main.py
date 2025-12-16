@@ -6,7 +6,7 @@
 #       * output preview shows TEMPLATE normally
 #       * canvas never appears
 #       * mismatched pixels get a RED "light" overlay
-#       * matched pixels show the actual template color (clean)
+#       * matched pixels show the actual template color
 #       * progress % = exact pixel matches / template non-transparent pixels
 #
 # COORDINATE SYSTEM:
