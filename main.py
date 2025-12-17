@@ -1,8 +1,9 @@
 # Discord Slash Bot (Pydroid-friendly)
 # - /ask -> OpenAI rule helper (Embed output)
 # - /stopmotion -> makes a stop-motion GIF from images in channel history
-# - /markarea -> template progresser (single run)
+# - /template -> template progresser (single run)
 # - /check -> LIVE template progresser (repeats every N minutes, auto-stops after duration)
+#           + NEW: optional role ping on progress drop (attack alert)
 #
 # Requirements:
 #   pip install -U discord.py pillow
@@ -476,6 +477,7 @@ async def stopmotion(interaction: discord.Interaction, hours: int = 24, fps: int
         ordered = ordered[-max_frames:]
 
     frames: list[Image.Image] = []
+    import aiohttp
     async with aiohttp.ClientSession() as session:
         for url in ordered:
             try:
@@ -514,14 +516,14 @@ async def stopmotion(interaction: discord.Interaction, hours: int = 24, fps: int
         file=discord.File(fp=out, filename="stopmotion.gif")
     )
 
-# -------------------- /MARKAREA (single run) --------------------
+# -------------------- /TEMPLATE (single run) --------------------
 @bot.tree.command(name="template", description="Template progresser.")
 @app_commands.describe(
     source_channel="Channel with the latest canvas update image.",
     template="Template image attachment.",
     coords="(x1,y1)(x2,y2)(x3,y3)(x4,y4)"
 )
-async def markarea(interaction: discord.Interaction, source_channel: discord.TextChannel, template: discord.Attachment, coords: str):
+async def template_cmd(interaction: discord.Interaction, source_channel: discord.TextChannel, template: discord.Attachment, coords: str):
     if not (template.content_type or "").startswith("image/"):
         await interaction.response.send_message("That template doesn’t look like an image.", ephemeral=True)
         return
@@ -538,19 +540,18 @@ async def markarea(interaction: discord.Interaction, source_channel: discord.Tex
         out = BytesIO(png_bytes)
         await interaction.followup.send(
             content=(
-                f" **Template Progress**\n"
+                f"**Template Progress**\n"
                 f"━━━━━━━━━━━━━━━━━━\n"
-                f" **Region**: `{box_w}×{box_h}`\n"
-                f" **Pixels Completetion**: `{matched:,} / {total:,}`\n"
-                f" **Percentage Completion**: **{pct:.2f}%**"
+                f"**Region:** `{box_w}×{box_h}`\n"
+                f"**Pixels Completed:** `{matched:,} / {total:,}`\n"
+                f"**Percentage Completion:** **{pct:.2f}%**"
             ),
             file=discord.File(fp=out, filename="template_progress.png")
         )
     except Exception as e:
-        await interaction.followup.send(f"❌ /markarea failed: `{type(e).__name__}: {e}`")
+        await interaction.followup.send(f"❌ /template failed: `{type(e).__name__}: {e}`")
 
-# -------------------- /CHECK (LIVE) --------------------
-# One active check per user per guild.
+# -------------------- /CHECK (LIVE + ALERT PING) --------------------
 _active_checks: dict[tuple[int, int], asyncio.Task] = {}
 
 @bot.tree.command(name="check", description="Live template progresser: repeats updates until duration ends.")
@@ -561,7 +562,10 @@ _active_checks: dict[tuple[int, int], asyncio.Task] = {}
     template="Template image attachment (required for start).",
     coords="(x1,y1)(x2,y2)(x3,y3)(x4,y4) (required for start).",
     interval_minutes="How often to update (default 12).",
-    duration_minutes="How long to run before auto-stopping (default 60)."
+    duration_minutes="How long to run before auto-stopping (default 60).",
+    alert_role="Optional: role to ping when progress goes DOWN.",
+    min_drop_pixels="Optional: minimum pixel drop to trigger ping (default 1).",
+    ping_cooldown_minutes="Optional: minimum minutes between pings (default 10)."
 )
 async def check(
     interaction: discord.Interaction,
@@ -571,7 +575,10 @@ async def check(
     template: discord.Attachment | None = None,
     coords: str | None = None,
     interval_minutes: int = 12,
-    duration_minutes: int = 60
+    duration_minutes: int = 60,
+    alert_role: discord.Role | None = None,
+    min_drop_pixels: int = 1,
+    ping_cooldown_minutes: int = 10,
 ):
     guild_id = interaction.guild_id or 0
     user_id = interaction.user.id
@@ -582,7 +589,6 @@ async def check(
         await interaction.response.send_message("Mode must be `start` or `stop`.", ephemeral=True)
         return
 
-    # STOP
     if mode == "stop":
         task = _active_checks.pop(key, None)
         if task and not task.done():
@@ -604,42 +610,41 @@ async def check(
         await interaction.response.send_message("That template doesn’t look like an image.", ephemeral=True)
         return
 
-    if interval_minutes < 1:
-        interval_minutes = 1
-    if interval_minutes > 120:
-        interval_minutes = 120
+    interval_minutes = _clamp_int(interval_minutes, 1, 120)
+    duration_minutes = _clamp_int(duration_minutes, 1, 24 * 60)
+    min_drop_pixels = _clamp_int(min_drop_pixels, 1, 10_000_000)
+    ping_cooldown_minutes = _clamp_int(ping_cooldown_minutes, 1, 180)
 
-    if duration_minutes < 1:
-        duration_minutes = 1
-    if duration_minutes > 24 * 60:
-        duration_minutes = 24 * 60
-
-    # choose where updates are posted
     out_ch = output_channel or interaction.channel
     if not isinstance(out_ch, discord.TextChannel):
         await interaction.response.send_message("Output channel must be a normal text channel.", ephemeral=True)
         return
 
-    # cancel old if exists
     old = _active_checks.pop(key, None)
     if old and not old.done():
         old.cancel()
 
-    # read template once (keeps RAM low; no repeated reads)
     template_bytes = await template.read()
+
+    ping_info = ""
+    if alert_role is not None:
+        ping_info = f"\n• Alerts: will ping {alert_role.mention} on drops (≥{min_drop_pixels} px), cooldown {ping_cooldown_minutes}m"
 
     await interaction.response.send_message(
         f"✅ Live check started.\n"
         f"• Updates: every **{interval_minutes} min**\n"
         f"• Duration: **{duration_minutes} min**\n"
-        f"• Output: {out_ch.mention}",
+        f"• Output: {out_ch.mention}"
+        f"{ping_info}",
         ephemeral=True
     )
 
     async def runner():
-        start_ts = time.time()
-        end_ts = start_ts + duration_minutes * 60
-        first = True
+        end_ts = time.time() + duration_minutes * 60
+
+        prev_matched: int | None = None
+        prev_pct: float | None = None
+        last_ping_ts = 0.0
 
         while time.time() < end_ts:
             try:
@@ -649,24 +654,53 @@ async def check(
                     coords=coords,
                 )
 
+                # Detect drop (attack)
+                drop = 0
+                is_drop = False
+                if prev_matched is not None:
+                    drop = prev_matched - matched
+                    if drop >= min_drop_pixels:
+                        is_drop = True
+
+                prev_matched = matched
+                prev_pct = pct
+
                 out = BytesIO(png_bytes)
-                msg = (
-                    f" **Live Template Check**\n"
+
+                base_msg = (
+                    f"**Live Template Check**\n"
                     f"━━━━━━━━━━━━━━━━━━\n"
-                    f" **Region**: `{box_w}×{box_h}`\n"
-                    f" **Pixels Completed**: `{matched:,} / {total:,}`\n"
-                    f" **Percentage Completion**: **{pct:.2f}%**"
+                    f"**Region:** `{box_w}×{box_h}`\n"
+                    f"**Pixels Completed:** `{matched:,} / {total:,}`\n"
+                    f"**Percentage Completion:** **{pct:.2f}%**"
                 )
-                await out_ch.send(content=msg, file=discord.File(fp=out, filename="template_progress.png"))
+
+                # Optional ping on drop with cooldown
+                if alert_role is not None and is_drop:
+                    now = time.time()
+                    if now - last_ping_ts >= ping_cooldown_minutes * 60:
+                        last_ping_ts = now
+                        await out_ch.send(
+                            content=f"{alert_role.mention} users may be attacking (−{drop:,} matched pixels)\n\n{base_msg}",
+                            file=discord.File(fp=out, filename="template_progress.png")
+                        )
+                    else:
+                        # Cooldown active: send update without ping
+                        await out_ch.send(
+                            content=base_msg,
+                            file=discord.File(fp=out, filename="template_progress.png")
+                        )
+                else:
+                    await out_ch.send(
+                        content=base_msg,
+                        file=discord.File(fp=out, filename="template_progress.png")
+                    )
 
             except asyncio.CancelledError:
                 raise
             except Exception as e:
                 await out_ch.send(f"⚠️ Live check error: `{type(e).__name__}: {e}`")
 
-            # sleep until next tick (skip sleeping before first run)
-            if first:
-                first = False
             await asyncio.sleep(interval_minutes * 60)
 
         await out_ch.send("✅ Live check finished (duration reached).")
