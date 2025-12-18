@@ -2,7 +2,8 @@
 # - /ask -> OpenAI rule helper (Embed output)
 # - /stopmotion -> makes a stop-motion GIF from images in channel history
 # - /template -> template progresser (single run) + ETA estimate
-# - /check -> LIVE template progresser (repeats every N minutes, auto-stops after duration) + ETA estimate
+# - /check -> LIVE template progresser (repeats every N minutes, auto-stops after duration)
+#            + ETA estimate + OPTIONAL role ping if progress goes backwards
 #
 # Requirements:
 #   pip install -U discord.py pillow
@@ -19,7 +20,7 @@ import urllib.request
 from io import BytesIO
 from datetime import timedelta
 import re
-import math  # ✅ added for ETA math
+import math
 
 import discord
 from discord import app_commands
@@ -35,7 +36,7 @@ MAX_OUTPUT_TOKENS = 450
 COOLDOWN_S = 6
 _last_used = {}
 
-# ✅ ETA settings (your confirmed rule)
+# ETA rule (your confirmed rule)
 COOLDOWN_SECONDS_PER_PIXEL = 15
 
 # ✅ SYSTEM PROMPT (UNCHANGED)
@@ -310,7 +311,6 @@ def _exact_progress_percent(canvas_rgba, template_rgba) -> tuple[float, int, int
     pct = (matched / total * 100.0) if total else 0.0
     return pct, matched, total
 
-# ✅ ETA helpers (added)
 def _seconds_to_hms(total_seconds: int) -> tuple[int, int, int]:
     total_seconds = max(0, int(total_seconds))
     h = total_seconds // 3600
@@ -320,9 +320,6 @@ def _seconds_to_hms(total_seconds: int) -> tuple[int, int, int]:
     return h, m, s
 
 def _eta_from_progress(matched: int, total: int, builders: int) -> tuple[int, int, int, int, int]:
-    """
-    returns (remaining_pixels, eta_seconds, h, m, s)
-    """
     builders = max(1, int(builders))
     total = max(0, int(total))
     matched = max(0, min(int(matched), total))
@@ -338,10 +335,6 @@ async def run_markarea_once(
     template_bytes: bytes,
     coords: str,
 ):
-    """
-    Returns: (png_bytes, box_w, box_h, matched, total, pct)
-    Raises exceptions on errors.
-    """
     from PIL import Image
     import aiohttp
 
@@ -502,6 +495,7 @@ async def stopmotion(interaction: discord.Interaction, hours: int = 24, fps: int
         ordered = ordered[-max_frames:]
 
     frames: list[Image.Image] = []
+    import aiohttp
     async with aiohttp.ClientSession() as session:
         for url in ordered:
             try:
@@ -548,7 +542,7 @@ async def stopmotion(interaction: discord.Interaction, hours: int = 24, fps: int
     coords="(x1,y1)(x2,y2)(x3,y3)(x4,y4)",
     builders="How many people placing pixels in parallel (default 1)."
 )
-async def markarea(interaction: discord.Interaction, source_channel: discord.TextChannel, template: discord.Attachment, coords: str, builders: int = 1):
+async def template_cmd(interaction: discord.Interaction, source_channel: discord.TextChannel, template: discord.Attachment, coords: str, builders: int = 1):
     if not (template.content_type or "").startswith("image/"):
         await interaction.response.send_message("That template doesn’t look like an image.", ephemeral=True)
         return
@@ -562,7 +556,6 @@ async def markarea(interaction: discord.Interaction, source_channel: discord.Tex
             coords=coords,
         )
 
-        # ✅ ETA
         remaining, eta_seconds, h, m, s = _eta_from_progress(matched, total, builders)
 
         out = BytesIO(png_bytes)
@@ -581,7 +574,6 @@ async def markarea(interaction: discord.Interaction, source_channel: discord.Tex
         await interaction.followup.send(f"❌ /template failed: `{type(e).__name__}: {e}`")
 
 # -------------------- /CHECK (LIVE) --------------------
-# One active check per user per guild.
 _active_checks: dict[tuple[int, int], asyncio.Task] = {}
 
 @bot.tree.command(name="check", description="Live template progresser: repeats updates until duration ends.")
@@ -593,7 +585,8 @@ _active_checks: dict[tuple[int, int], asyncio.Task] = {}
     coords="(x1,y1)(x2,y2)(x3,y3)(x4,y4) (required for start).",
     interval_minutes="How often to update (default 12).",
     duration_minutes="How long to run before auto-stopping (default 60).",
-    builders="How many people placing pixels in parallel (default 1)."
+    builders="How many people placing pixels in parallel (default 1).",
+    ping_role="Role to ping if progress goes backwards (optional)."
 )
 async def check(
     interaction: discord.Interaction,
@@ -604,7 +597,8 @@ async def check(
     coords: str | None = None,
     interval_minutes: int = 12,
     duration_minutes: int = 60,
-    builders: int = 1
+    builders: int = 1,
+    ping_role: discord.Role | None = None
 ):
     guild_id = interaction.guild_id or 0
     user_id = interaction.user.id
@@ -637,30 +631,23 @@ async def check(
         await interaction.response.send_message("That template doesn’t look like an image.", ephemeral=True)
         return
 
-    if interval_minutes < 1:
-        interval_minutes = 1
-    if interval_minutes > 120:
-        interval_minutes = 120
-
-    if duration_minutes < 1:
-        duration_minutes = 1
-    if duration_minutes > 24 * 60:
-        duration_minutes = 24 * 60
+    if interval_minutes < 1: interval_minutes = 1
+    if interval_minutes > 120: interval_minutes = 120
+    if duration_minutes < 1: duration_minutes = 1
+    if duration_minutes > 24 * 60: duration_minutes = 24 * 60
 
     builders = max(1, int(builders))
 
-    # choose where updates are posted
     out_ch = output_channel or interaction.channel
     if not isinstance(out_ch, discord.TextChannel):
         await interaction.response.send_message("Output channel must be a normal text channel.", ephemeral=True)
         return
 
-    # cancel old if exists
+    # cancel old
     old = _active_checks.pop(key, None)
     if old and not old.done():
         old.cancel()
 
-    # read template once (keeps RAM low; no repeated reads)
     template_bytes = await template.read()
 
     await interaction.response.send_message(
@@ -668,13 +655,14 @@ async def check(
         f"• Updates: every **{interval_minutes} min**\n"
         f"• Duration: **{duration_minutes} min**\n"
         f"• Output: {out_ch.mention}\n"
-        f"• Builders: **{builders}**",
+        f"• Builders: **{builders}**\n"
+        f"• Ping role: {ping_role.mention if ping_role else 'None'}",
         ephemeral=True
     )
 
     async def runner():
         end_ts = time.time() + duration_minutes * 60
-        first = True
+        last_matched: int | None = None
 
         while time.time() < end_ts:
             try:
@@ -684,7 +672,13 @@ async def check(
                     coords=coords,
                 )
 
-                # ✅ ETA
+                # Regression detection (pixels removed)
+                if last_matched is not None and matched < last_matched and ping_role is not None:
+                    lost = last_matched - matched
+                    await out_ch.send(f"{ping_role.mention} ⚠️ **Users may be attacking** — progress went backwards (**-{lost:,}** matched pixels).")
+
+                last_matched = matched
+
                 remaining, eta_seconds, h, m, s = _eta_from_progress(matched, total, builders)
 
                 out = BytesIO(png_bytes)
@@ -703,8 +697,6 @@ async def check(
             except Exception as e:
                 await out_ch.send(f"⚠️ Live check error: `{type(e).__name__}: {e}`")
 
-            if first:
-                first = False
             await asyncio.sleep(interval_minutes * 60)
 
         await out_ch.send("✅ Live check finished (duration reached).")
