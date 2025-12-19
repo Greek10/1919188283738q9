@@ -1,12 +1,15 @@
 # Discord Slash Bot (Pydroid-friendly)
 # - /ask -> OpenAI rule helper (Embed output)
 # - /stopmotion -> makes a stop-motion GIF from images in channel history
-# - /template -> template progresser (single run) + ETA estimate
+# - /template -> template progresser (single run)
 # - /check -> LIVE template progresser (repeats every N minutes, auto-stops after duration)
-#            + ETA estimate + OPTIONAL role ping if progress goes backwards
+#            + optional role ping on regression (attack)
+#            + ETA estimate when it has at least 2 samples
+# - /snapshots -> NEW: periodically grabs the most recent screenshot in a source channel
+#                and re-posts it into an archive channel at a user-set interval
 #
 # Requirements:
-#   pip install -U discord.py pillow
+#   pip install -U discord.py pillow aiohttp
 #
 # Env vars:
 #   DISCORD_TOKEN
@@ -20,7 +23,7 @@ import urllib.request
 from io import BytesIO
 from datetime import timedelta
 import re
-import math
+from typing import Optional, Tuple
 
 import discord
 from discord import app_commands
@@ -35,9 +38,6 @@ MAX_OUTPUT_TOKENS = 450
 
 COOLDOWN_S = 6
 _last_used = {}
-
-# ETA rule (your confirmed rule)
-COOLDOWN_SECONDS_PER_PIXEL = 15
 
 # ✅ SYSTEM PROMPT (UNCHANGED)
 SYSTEM_PROMPT = r"""
@@ -219,7 +219,10 @@ def build_embed(res: dict) -> discord.Embed:
 
 @bot.event
 async def on_ready():
-    await bot.tree.sync()
+    try:
+        await bot.tree.sync()
+    except Exception as e:
+        print("⚠️ Slash sync error:", e)
     print(f"✅ Logged in as {bot.user}")
 
 # -------------------- COMMON HELPERS --------------------
@@ -235,10 +238,11 @@ def _clamp_int(v: int, lo: int, hi: int) -> int:
     return v
 
 def _user_to_image_y(y_user: int, img_h: int) -> int:
+    # User uses bottom-left origin; image uses top-left.
     return (img_h - 1) - y_user
 
-async def _find_latest_image_url(channel: discord.TextChannel | discord.Thread) -> str | None:
-    async for msg in channel.history(limit=50, oldest_first=False):
+async def _find_latest_image_url(channel: discord.TextChannel | discord.Thread, limit: int = 50) -> Optional[str]:
+    async for msg in channel.history(limit=limit, oldest_first=False):
         for a in msg.attachments:
             ct = (a.content_type or "")
             if ct.startswith("image/") and a.url:
@@ -256,7 +260,12 @@ def parse_coords_4pairs(coords: str):
         raise ValueError("Coords must be exactly 4 pairs like (x1,y1)(x2,y2)(x3,y3)(x4,y4).")
     return [(int(x), int(y)) for x, y in matches]
 
-def _make_template_progress_preview(canvas_crop, template_crop, red_alpha: int = 140):
+def _make_template_progress_preview(canvas_crop, template_crop, red_alpha: int = 150):
+    """
+    Output = template normally.
+    If template pixel alpha>0 and canvas RGB != template RGB -> apply red 'light' overlay.
+    If matches -> show clean template color.
+    """
     from PIL import Image
 
     w, h = template_crop.size
@@ -274,7 +283,8 @@ def _make_template_progress_preview(canvas_crop, template_crop, red_alpha: int =
             if ta == 0:
                 continue
 
-            cr, cg, cb, ca = cpx[x, y]
+            cr, cg, cb, _ = cpx[x, y]
+
             if (cr, cg, cb) == (tr, tg, tb):
                 opx[x, y] = (tr, tg, tb, ta)
             else:
@@ -287,7 +297,10 @@ def _make_template_progress_preview(canvas_crop, template_crop, red_alpha: int =
 
     return out
 
-def _exact_progress_percent(canvas_rgba, template_rgba) -> tuple[float, int, int]:
+def _exact_progress_percent(canvas_rgba, template_rgba) -> Tuple[float, int, int]:
+    """
+    Progress = exact RGB matches / template non-transparent pixels.
+    """
     if canvas_rgba.size != template_rgba.size:
         return 0.0, 0, 0
 
@@ -303,7 +316,7 @@ def _exact_progress_percent(canvas_rgba, template_rgba) -> tuple[float, int, int
             tr, tg, tb, ta = tpx[x, y]
             if ta == 0:
                 continue
-            cr, cg, cb, ca = cpx[x, y]
+            cr, cg, cb, _ = cpx[x, y]
             total += 1
             if (cr, cg, cb) == (tr, tg, tb):
                 matched += 1
@@ -311,23 +324,19 @@ def _exact_progress_percent(canvas_rgba, template_rgba) -> tuple[float, int, int
     pct = (matched / total * 100.0) if total else 0.0
     return pct, matched, total
 
-def _seconds_to_hms(total_seconds: int) -> tuple[int, int, int]:
-    total_seconds = max(0, int(total_seconds))
-    h = total_seconds // 3600
-    total_seconds -= h * 3600
-    m = total_seconds // 60
-    s = total_seconds - m * 60
-    return h, m, s
-
-def _eta_from_progress(matched: int, total: int, builders: int) -> tuple[int, int, int, int, int]:
-    builders = max(1, int(builders))
-    total = max(0, int(total))
-    matched = max(0, min(int(matched), total))
-    remaining = total - matched
-    ticks = math.ceil(remaining / builders) if remaining > 0 else 0
-    eta_seconds = ticks * COOLDOWN_SECONDS_PER_PIXEL
-    h, m, s = _seconds_to_hms(eta_seconds)
-    return remaining, eta_seconds, h, m, s
+def _fmt_eta_minutes(minutes: float) -> str:
+    if minutes <= 0 or minutes != minutes or minutes == float("inf"):
+        return "Unknown"
+    secs = int(minutes * 60)
+    h = secs // 3600
+    secs -= h * 3600
+    m = secs // 60
+    s = secs - m * 60
+    if h > 0:
+        return f"{h}h {m}m {s}s"
+    if m > 0:
+        return f"{m}m {s}s"
+    return f"{s}s"
 
 async def run_markarea_once(
     *,
@@ -335,6 +344,9 @@ async def run_markarea_once(
     template_bytes: bytes,
     coords: str,
 ):
+    """
+    Returns: (png_bytes, box_w, box_h, matched, total, pct)
+    """
     from PIL import Image
     import aiohttp
 
@@ -379,7 +391,9 @@ async def run_markarea_once(
 
     canvas_crop = canvas.crop((left, top, right, bottom))
 
-    # Template crop rules unchanged:
+    # Template crop rule:
+    # - If already region-sized -> no crop
+    # - Else crop using same coords in template coordinate system
     if (TW, TH) == (box_w, box_h):
         tmpl_crop = tmpl
     else:
@@ -495,7 +509,6 @@ async def stopmotion(interaction: discord.Interaction, hours: int = 24, fps: int
         ordered = ordered[-max_frames:]
 
     frames: list[Image.Image] = []
-    import aiohttp
     async with aiohttp.ClientSession() as session:
         for url in ordered:
             try:
@@ -535,14 +548,13 @@ async def stopmotion(interaction: discord.Interaction, hours: int = 24, fps: int
     )
 
 # -------------------- /TEMPLATE (single run) --------------------
-@bot.tree.command(name="template", description="Template progresser.")
+@bot.tree.command(name="template", description="Template progresser (single run).")
 @app_commands.describe(
     source_channel="Channel with the latest canvas update image.",
     template="Template image attachment.",
-    coords="(x1,y1)(x2,y2)(x3,y3)(x4,y4)",
-    builders="How many people placing pixels in parallel (default 1)."
+    coords="(x1,y1)(x2,y2)(x3,y3)(x4,y4)"
 )
-async def template_cmd(interaction: discord.Interaction, source_channel: discord.TextChannel, template: discord.Attachment, coords: str, builders: int = 1):
+async def template_cmd(interaction: discord.Interaction, source_channel: discord.TextChannel, template: discord.Attachment, coords: str):
     if not (template.content_type or "").startswith("image/"):
         await interaction.response.send_message("That template doesn’t look like an image.", ephemeral=True)
         return
@@ -556,17 +568,17 @@ async def template_cmd(interaction: discord.Interaction, source_channel: discord
             coords=coords,
         )
 
-        remaining, eta_seconds, h, m, s = _eta_from_progress(matched, total, builders)
-
+        remaining = max(0, total - matched)
         out = BytesIO(png_bytes)
+
         await interaction.followup.send(
             content=(
-                f" **Template Progress**\n"
+                f"**Template Progress**\n"
                 f"━━━━━━━━━━━━━━━━━━\n"
-                f" **Region**: `{box_w}×{box_h}`\n"
-                f" **Pixels Completetion**: `{matched:,} / {total:,}`\n"
-                f" **Percentage Completion**: **{pct:.2f}%**\n"
-                f" **Estimated Time Remaining**: **{h}h {m}m {s}s**  (`{remaining:,}` px, builders={max(1, int(builders))}, {COOLDOWN_SECONDS_PER_PIXEL}s/px)"
+                f"**Region:** `{box_w}×{box_h}`\n"
+                f"**Pixels:** `{matched:,} / {total:,}` (remaining `{remaining:,}`)\n"
+                f"**Completion:** **{pct:.2f}%**\n"
+                f"**ETA:** `Unknown` (needs multiple updates to estimate)"
             ),
             file=discord.File(fp=out, filename="template_progress.png")
         )
@@ -574,6 +586,7 @@ async def template_cmd(interaction: discord.Interaction, source_channel: discord
         await interaction.followup.send(f"❌ /template failed: `{type(e).__name__}: {e}`")
 
 # -------------------- /CHECK (LIVE) --------------------
+# One active check per user per guild.
 _active_checks: dict[tuple[int, int], asyncio.Task] = {}
 
 @bot.tree.command(name="check", description="Live template progresser: repeats updates until duration ends.")
@@ -585,20 +598,22 @@ _active_checks: dict[tuple[int, int], asyncio.Task] = {}
     coords="(x1,y1)(x2,y2)(x3,y3)(x4,y4) (required for start).",
     interval_minutes="How often to update (default 12).",
     duration_minutes="How long to run before auto-stopping (default 60).",
-    builders="How many people placing pixels in parallel (default 1).",
-    ping_role="Role to ping if progress goes backwards (optional)."
+    ping_role="Optional: role to ping when regression is detected.",
+    attack_threshold="Only ping if pixels decrease by at least this many since last update (default 1).",
+    confirm_attacks="Require 2 negative updates in a row before pinging (default true)."
 )
 async def check(
     interaction: discord.Interaction,
     mode: str,
-    source_channel: discord.TextChannel | None = None,
-    output_channel: discord.TextChannel | None = None,
-    template: discord.Attachment | None = None,
-    coords: str | None = None,
+    source_channel: Optional[discord.TextChannel] = None,
+    output_channel: Optional[discord.TextChannel] = None,
+    template: Optional[discord.Attachment] = None,
+    coords: Optional[str] = None,
     interval_minutes: int = 12,
     duration_minutes: int = 60,
-    builders: int = 1,
-    ping_role: discord.Role | None = None
+    ping_role: Optional[discord.Role] = None,
+    attack_threshold: int = 1,
+    confirm_attacks: bool = True,
 ):
     guild_id = interaction.guild_id or 0
     user_id = interaction.user.id
@@ -631,19 +646,27 @@ async def check(
         await interaction.response.send_message("That template doesn’t look like an image.", ephemeral=True)
         return
 
-    if interval_minutes < 1: interval_minutes = 1
-    if interval_minutes > 120: interval_minutes = 120
-    if duration_minutes < 1: duration_minutes = 1
-    if duration_minutes > 24 * 60: duration_minutes = 24 * 60
+    if interval_minutes < 1:
+        interval_minutes = 1
+    if interval_minutes > 120:
+        interval_minutes = 120
 
-    builders = max(1, int(builders))
+    if duration_minutes < 1:
+        duration_minutes = 1
+    if duration_minutes > 24 * 60:
+        duration_minutes = 24 * 60
+
+    if attack_threshold < 1:
+        attack_threshold = 1
+    if attack_threshold > 999999:
+        attack_threshold = 999999
 
     out_ch = output_channel or interaction.channel
     if not isinstance(out_ch, discord.TextChannel):
         await interaction.response.send_message("Output channel must be a normal text channel.", ephemeral=True)
         return
 
-    # cancel old
+    # cancel old if exists
     old = _active_checks.pop(key, None)
     if old and not old.done():
         old.cancel()
@@ -654,15 +677,18 @@ async def check(
         f"✅ Live check started.\n"
         f"• Updates: every **{interval_minutes} min**\n"
         f"• Duration: **{duration_minutes} min**\n"
-        f"• Output: {out_ch.mention}\n"
-        f"• Builders: **{builders}**\n"
-        f"• Ping role: {ping_role.mention if ping_role else 'None'}",
+        f"• Output: {out_ch.mention}",
         ephemeral=True
     )
 
     async def runner():
-        end_ts = time.time() + duration_minutes * 60
-        last_matched: int | None = None
+        start_ts = time.time()
+        end_ts = start_ts + duration_minutes * 60
+
+        last_matched: Optional[int] = None
+        last_total: Optional[int] = None
+        last_ts: Optional[float] = None
+        negative_streak = 0
 
         while time.time() < end_ts:
             try:
@@ -672,25 +698,69 @@ async def check(
                     coords=coords,
                 )
 
-                # Regression detection (pixels removed)
-                if last_matched is not None and matched < last_matched and ping_role is not None:
-                    lost = last_matched - matched
-                    await out_ch.send(f"{ping_role.mention} ⚠️ **Users may be attacking** — progress went backwards (**-{lost:,}** matched pixels).")
+                # delta calc
+                delta_str = "—"
+                eta_str = "Unknown"
+                finish_str = "Unknown"
+                remaining = max(0, total - matched)
 
-                last_matched = matched
+                now_ts = time.time()
+                if last_matched is not None and last_ts is not None and total > 0:
+                    delta = matched - last_matched
+                    if delta > 0:
+                        delta_str = f"+{delta:,}"
+                        negative_streak = 0
+                    elif delta < 0:
+                        delta_str = f"{delta:,}"
+                        negative_streak += 1
+                    else:
+                        delta_str = "0"
+                        negative_streak = 0
 
-                remaining, eta_seconds, h, m, s = _eta_from_progress(matched, total, builders)
+                    # ETA estimate only if we have positive rate
+                    dt_min = max(0.001, (now_ts - last_ts) / 60.0)
+                    rate_ppm = (matched - last_matched) / dt_min  # pixels per minute
+                    if rate_ppm > 0:
+                        eta_min = remaining / rate_ppm
+                        eta_str = _fmt_eta_minutes(eta_min)
+                        finish_unix = time.time() + eta_min * 60
+                        finish_dt = discord.utils.utcnow() + timedelta(seconds=int(eta_min * 60))
+                        finish_str = finish_dt.strftime("%Y-%m-%d %H:%M UTC")
 
+                    # Attack ping logic
+                    if delta < 0 and abs(delta) >= attack_threshold and ping_role is not None:
+                        confirmed = True
+                        if confirm_attacks:
+                            confirmed = (negative_streak >= 2)
+                        if confirmed:
+                            await out_ch.send(
+                                content=f"{ping_role.mention} ⚠️ **Attack suspected** — progress dropped by **{abs(delta):,}** pixels.",
+                                allowed_mentions=discord.AllowedMentions(roles=True)
+                            )
+                            negative_streak = 0  # reset so it doesn't spam
+
+                # post update
                 out = BytesIO(png_bytes)
                 msg = (
-                    f" **Live Template Check**\n"
+                    f"**Live Template Check**\n"
                     f"━━━━━━━━━━━━━━━━━━\n"
-                    f" **Region**: `{box_w}×{box_h}`\n"
-                    f" **Pixels Completed**: `{matched:,} / {total:,}`\n"
-                    f" **Percentage Completion**: **{pct:.2f}%**\n"
-                    f" **Estimated Time Remaining**: **{h}h {m}m {s}s**  (`{remaining:,}` px, builders={builders}, {COOLDOWN_SECONDS_PER_PIXEL}s/px)"
+                    f"**Region:** `{box_w}×{box_h}`\n"
+                    f"**Pixels:** `{matched:,} / {total:,}` (remaining `{remaining:,}`)\n"
+                    f"**Completion:** **{pct:.2f}%**\n"
+                    f"**Change:** `{delta_str}`\n"
+                    f"**ETA:** `{eta_str}`\n"
+                    f"**Finish (UTC):** `{finish_str}`"
                 )
                 await out_ch.send(content=msg, file=discord.File(fp=out, filename="template_progress.png"))
+
+                # auto-stop on completion
+                if total > 0 and matched >= total:
+                    await out_ch.send("✅ Template complete — live check stopped automatically.")
+                    break
+
+                last_matched = matched
+                last_total = total
+                last_ts = now_ts
 
             except asyncio.CancelledError:
                 raise
@@ -699,10 +769,128 @@ async def check(
 
             await asyncio.sleep(interval_minutes * 60)
 
-        await out_ch.send("✅ Live check finished (duration reached).")
+        await out_ch.send("✅ Live check finished.")
 
     task = asyncio.create_task(runner())
     _active_checks[key] = task
+
+# -------------------- /SNAPSHOTS (archive latest screenshot repeatedly) --------------------
+# One active snapshot job per guild (simple + clean).
+_active_snapshots: dict[int, asyncio.Task] = {}
+
+@bot.tree.command(name="snapshots", description="Archive the most recent screenshot from a channel at a set interval.")
+@app_commands.describe(
+    mode="start or stop",
+    source_channel="Channel where the canvas bot posts the (updating) screenshot.",
+    archive_channel="Channel where snapshots should be posted.",
+    interval_minutes="Minutes between snapshots (default 5).",
+    duration_minutes="How long to run before auto-stopping (default 60).",
+    only_when_changed="If true, only posts when the latest image URL changes (default true)."
+)
+async def snapshots(
+    interaction: discord.Interaction,
+    mode: str,
+    source_channel: Optional[discord.TextChannel] = None,
+    archive_channel: Optional[discord.TextChannel] = None,
+    interval_minutes: int = 5,
+    duration_minutes: int = 60,
+    only_when_changed: bool = True
+):
+    guild_id = interaction.guild_id or 0
+    mode = (mode or "").lower().strip()
+
+    if mode not in ("start", "stop"):
+        await interaction.response.send_message("Mode must be `start` or `stop`.", ephemeral=True)
+        return
+
+    if mode == "stop":
+        task = _active_snapshots.pop(guild_id, None)
+        if task and not task.done():
+            task.cancel()
+            await interaction.response.send_message("🛑 Snapshot job stopped.", ephemeral=True)
+        else:
+            await interaction.response.send_message("No snapshot job running in this server.", ephemeral=True)
+        return
+
+    # start
+    if source_channel is None or archive_channel is None:
+        await interaction.response.send_message(
+            "For `mode=start`, you must provide `source_channel` and `archive_channel`.",
+            ephemeral=True
+        )
+        return
+
+    if interval_minutes < 1:
+        interval_minutes = 1
+    if interval_minutes > 60:
+        interval_minutes = 60
+
+    if duration_minutes < 1:
+        duration_minutes = 1
+    if duration_minutes > 24 * 60:
+        duration_minutes = 24 * 60
+
+    # cancel old if exists
+    old = _active_snapshots.pop(guild_id, None)
+    if old and not old.done():
+        old.cancel()
+
+    await interaction.response.send_message(
+        f"✅ Snapshots started.\n"
+        f"• Source: {source_channel.mention}\n"
+        f"• Archive: {archive_channel.mention}\n"
+        f"• Interval: **{interval_minutes} min**\n"
+        f"• Duration: **{duration_minutes} min**",
+        ephemeral=True
+    )
+
+    async def runner():
+        import aiohttp
+
+        start_ts = time.time()
+        end_ts = start_ts + duration_minutes * 60
+        last_url: Optional[str] = None
+
+        while time.time() < end_ts:
+            try:
+                url = await _find_latest_image_url(source_channel, limit=80)
+                if not url:
+                    await archive_channel.send("⚠️ No recent image found to snapshot.")
+                else:
+                    should_post = True
+                    if only_when_changed and last_url is not None and url == last_url:
+                        should_post = False
+
+                    if should_post:
+                        async with aiohttp.ClientSession() as session:
+                            img_bytes = await _download_bytes(session, url, timeout_s=30)
+
+                        ts = discord.utils.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
+                        file = discord.File(fp=BytesIO(img_bytes), filename="snapshot.png")
+                        await archive_channel.send(
+                            content=f"**Canvas Snapshot** — `{ts}`",
+                            file=file
+                        )
+                        last_url = url
+
+            except asyncio.CancelledError:
+                raise
+            except discord.Forbidden:
+                # If we can't read history or post, stop to avoid infinite errors.
+                try:
+                    await interaction.followup.send("❌ Missing permissions (read history and/or send messages). Stopping snapshots.", ephemeral=True)
+                except Exception:
+                    pass
+                break
+            except Exception as e:
+                await archive_channel.send(f"⚠️ Snapshot error: `{type(e).__name__}: {e}`")
+
+            await asyncio.sleep(interval_minutes * 60)
+
+        await archive_channel.send("✅ Snapshots finished.")
+
+    task = asyncio.create_task(runner())
+    _active_snapshots[guild_id] = task
 
 # -------------------- START --------------------
 if __name__ == "__main__":
