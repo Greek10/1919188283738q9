@@ -1,7 +1,7 @@
 # Discord Slash Bot (Pydroid-friendly)
 # - /ask -> OpenAI rule helper (Embed output)
 # - /stopmotion -> makes a stop-motion GIF from images in channel history
-# - /template -> template progresser (single run)
+# - /template -> template progresser (single run
 # - /check -> LIVE template progresser (repeats every N minutes, auto-stops after duration)
 #            + optional role ping on regression (attack)
 #            + ETA estimate when it has at least 2 samples
