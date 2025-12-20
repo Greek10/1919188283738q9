@@ -4,9 +4,10 @@
 # - /template -> template progresser (single run) + ETA estimate
 # - /check -> LIVE template progresser (repeats every N minutes, auto-stops after duration)
 #            + ETA estimate + OPTIONAL role ping if progress goes backwards
+# - /snapshots -> archives the *latest* image from a source channel into an archive channel on an interval
 #
 # Requirements:
-#   pip install -U discord.py pillow
+#   pip install -U discord.py pillow aiohttp
 #
 # Env vars:
 #   DISCORD_TOKEN
@@ -495,7 +496,6 @@ async def stopmotion(interaction: discord.Interaction, hours: int = 24, fps: int
         ordered = ordered[-max_frames:]
 
     frames: list[Image.Image] = []
-    import aiohttp
     async with aiohttp.ClientSession() as session:
         for url in ordered:
             try:
@@ -703,6 +703,116 @@ async def check(
 
     task = asyncio.create_task(runner())
     _active_checks[key] = task
+
+# -------------------- /SNAPSHOTS (ARCHIVE LATEST IMAGE ON INTERVAL) --------------------
+# One active snapshot job per guild (simple).
+_active_snapshots: dict[int, asyncio.Task] = {}
+
+@bot.tree.command(name="snapshots", description="Archive the latest image from a channel every N minutes.")
+@app_commands.describe(
+    mode="start or stop",
+    source_channel="Channel where the canvas bot posts the image.",
+    archive_channel="Channel where snapshots should be posted.",
+    interval_minutes="Minutes between snapshots (default 5).",
+    duration_minutes="How long to run before auto-stopping (default 60).",
+    only_when_changed="Only post when the latest image changes (default true)."
+)
+async def snapshots(
+    interaction: discord.Interaction,
+    mode: str,
+    source_channel: discord.TextChannel | None = None,
+    archive_channel: discord.TextChannel | None = None,
+    interval_minutes: int = 5,
+    duration_minutes: int = 60,
+    only_when_changed: bool = True
+):
+    import aiohttp
+
+    guild_id = interaction.guild_id or 0
+    mode = (mode or "").lower().strip()
+
+    if mode not in ("start", "stop"):
+        await interaction.response.send_message("Mode must be `start` or `stop`.", ephemeral=True)
+        return
+
+    # STOP
+    if mode == "stop":
+        task = _active_snapshots.pop(guild_id, None)
+        if task and not task.done():
+            task.cancel()
+            await interaction.response.send_message("🛑 Snapshots stopped.", ephemeral=True)
+        else:
+            await interaction.response.send_message("No snapshots job running in this server.", ephemeral=True)
+        return
+
+    # START validation
+    if source_channel is None or archive_channel is None:
+        await interaction.response.send_message(
+            "For `mode=start`, you must provide: `source_channel` and `archive_channel`.",
+            ephemeral=True
+        )
+        return
+
+    if interval_minutes < 1: interval_minutes = 1
+    if interval_minutes > 60: interval_minutes = 60
+
+    if duration_minutes < 1: duration_minutes = 1
+    if duration_minutes > 24 * 60: duration_minutes = 24 * 60
+
+    # cancel old (per-guild)
+    old = _active_snapshots.pop(guild_id, None)
+    if old and not old.done():
+        old.cancel()
+
+    await interaction.response.send_message(
+        f"✅ Snapshots started.\n"
+        f"• Source: {source_channel.mention}\n"
+        f"• Archive: {archive_channel.mention}\n"
+        f"• Interval: **{interval_minutes} min**\n"
+        f"• Duration: **{duration_minutes} min**\n"
+        f"• Only when changed: **{only_when_changed}**",
+        ephemeral=True
+    )
+
+    async def runner():
+        end_ts = time.time() + duration_minutes * 60
+        last_url: str | None = None
+
+        while time.time() < end_ts:
+            try:
+                url = await _find_latest_image_url(source_channel)
+                if not url:
+                    await archive_channel.send("⚠️ No recent image found to snapshot.")
+                else:
+                    if (not only_when_changed) or (last_url is None) or (url != last_url):
+                        async with aiohttp.ClientSession() as session:
+                            img_bytes = await _download_bytes(session, url, timeout_s=30)
+
+                        stamp = discord.utils.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
+                        await archive_channel.send(
+                            content=f"**Canvas Snapshot** — `{stamp}`",
+                            file=discord.File(fp=BytesIO(img_bytes), filename="snapshot.png")
+                        )
+                        last_url = url
+
+            except asyncio.CancelledError:
+                raise
+            except discord.Forbidden:
+                # Can't read history or post; stop to avoid spam.
+                try:
+                    await archive_channel.send("❌ Missing permissions (read history and/or send messages). Snapshots stopped.")
+                except Exception:
+                    pass
+                break
+            except Exception as e:
+                await archive_channel.send(f"⚠️ Snapshot error: `{type(e).__name__}: {e}`")
+
+            await asyncio.sleep(interval_minutes * 60)
+
+        await archive_channel.send("✅ Snapshots finished (duration reached).")
+
+    task = asyncio.create_task(runner())
+    _active_snapshots[guild_id] = task
 
 # -------------------- START --------------------
 if __name__ == "__main__":
