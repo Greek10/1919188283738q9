@@ -617,7 +617,7 @@ async def template_cmd(
 # -------------------- /CHECK (LIVE, unchanged) --------------------
 _active_checks: dict[tuple[int, int], asyncio.Task] = {}
 
-@bot.tree.command(name="LiveProgress", description="Live template progresser: posts on every source update.")
+@bot.tree.command(name="live_progress", description="Live template progresser: posts on every source update.")
 @app_commands.describe(
     mode="start or stop",
     source_channel="Channel containing the latest canvas updates.",
