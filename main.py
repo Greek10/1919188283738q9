@@ -1,18 +1,3 @@
-# Discord Slash Bot (Pydroid-friendly)
-# - /ask -> OpenAI rule helper (Embed output)
-# - /stopmotion -> makes a stop-motion GIF from images in channel history
-# - /template -> template progresser (single run) + ETA estimate + nicer format
-# - /check -> LIVE template progresser (watches source channel every 30s for change)
-#            posts ONLY when progress changes (silent otherwise)
-#            shows recent progress (+/- pixels + +/- percent) + ETA estimate
-#
-# Requirements:
-#   pip install -U discord.py pillow
-#
-# Env vars:
-#   DISCORD_TOKEN
-#   OPENAI_API_KEY
-
 import os
 import time
 import json
@@ -360,7 +345,7 @@ def _eta_from_progress(matched: int, total: int, builders: int) -> tuple[int, in
     h, m, s = _seconds_to_hms(eta_seconds)
     return remaining, eta_seconds, h, m, s
 
-# ---- fancy "screenshot-like" embed formatting ----
+# ---- fancy embed formatting (like your screenshot) ----
 def _fmt_pct(p: float) -> str:
     return f"{p:.1f}%"
 
@@ -380,13 +365,14 @@ def _progress_embed(
     eta_hms: tuple[int, int, int] | None = None,
     remaining_px: int | None = None,
     builders: int | None = None,
+    image_filename: str = "template_progress.png",
 ) -> discord.Embed:
     embed = discord.Embed(
         title=title,
         description=f"**{_fmt_int(matched)}/{_fmt_int(total)}** pixels completed (**{_fmt_pct(pct)}**)",
     )
 
-    # Recent progress (like screenshot)
+    # Recent progress
     if delta_matched is not None:
         sign = "+" if delta_matched > 0 else ""
         value = f"`{sign}{_fmt_int(delta_matched)}` pixels"
@@ -406,6 +392,9 @@ def _progress_embed(
         )
 
     embed.set_footer(text=f"{COOLDOWN_SECONDS_PER_PIXEL}s per pixel charge (per builder)")
+
+    # Put the attached image inside the embed
+    embed.set_image(url=f"attachment://{image_filename}")
     return embed
 
 async def run_markarea_once(
@@ -647,18 +636,15 @@ async def template_cmd(interaction: discord.Interaction, source_channel: discord
             matched=matched,
             total=total,
             pct=pct,
-            delta_matched=None,
-            delta_pct=None,
             eta_hms=(h, m, s),
             remaining_px=remaining,
             builders=builders,
+            image_filename="template_progress.png",
         )
 
-        out = BytesIO(png_bytes)
-        await interaction.followup.send(
-            embed=embed,
-            file=discord.File(fp=out, filename="template_progress.png")
-        )
+        file = discord.File(fp=BytesIO(png_bytes), filename="template_progress.png")
+        await interaction.followup.send(embed=embed, file=file)
+
     except Exception as e:
         await interaction.followup.send(f"❌ /template failed: `{type(e).__name__}: {e}`")
 
@@ -674,7 +660,8 @@ _active_checks: dict[tuple[int, int], asyncio.Task] = {}
     template="Template image attachment (required for start).",
     coords="(x1,y1)(x2,y2)(x3,y3)(x4,y4) (required for start).",
     duration_minutes="How long to run before auto-stopping (default 60).",
-    builders="How many people placing pixels in parallel (default 1)."
+    builders="How many people placing pixels in parallel (default 1).",
+    ping_role="Role to ping if progress goes backwards (optional)."
 )
 async def check(
     interaction: discord.Interaction,
@@ -684,7 +671,8 @@ async def check(
     template: discord.Attachment | None = None,
     coords: str | None = None,
     duration_minutes: int = 60,
-    builders: int = 1
+    builders: int = 1,
+    ping_role: discord.Role | None = None
 ):
     guild_id = interaction.guild_id or 0
     user_id = interaction.user.id
@@ -739,7 +727,8 @@ async def check(
         f"• Output: {out_ch.mention}\n"
         f"• Builders: **{builders}**\n"
         f"• Duration: **{duration_minutes} min**\n"
-        f"• Poll: **30s** (posts only when progress changes)",
+        f"• Poll: **30s** (posts only when progress changes)\n"
+        f"• Ping role: {ping_role.mention if ping_role else 'None'}",
         ephemeral=True
     )
 
@@ -753,11 +742,9 @@ async def check(
 
         while time.time() < end_ts:
             try:
-                # Check if source channel changed (new message or edit)
                 marker = await _get_latest_canvas_marker(source_channel)
                 changed_source = marker != last_marker and marker[2] is not None
 
-                # If the source changed OR we have no baseline yet, run an update
                 if changed_source or last_matched is None:
                     png_bytes, box_w, box_h, matched, total, pct = await run_markarea_once(
                         source_channel=source_channel,
@@ -765,23 +752,30 @@ async def check(
                         coords=coords,
                     )
 
-                    # Compute deltas (only if we have a baseline)
+                    # deltas (only valid if same total)
                     delta_matched = None
                     delta_pct = None
                     if last_matched is not None and last_total == total and last_pct is not None:
                         delta_matched = matched - last_matched
                         delta_pct = pct - last_pct
 
-                    # Only post when progress actually changes (after baseline established)
+                        # ping if regression
+                        if ping_role is not None and delta_matched < 0:
+                            lost = -delta_matched
+                            # percentage decrease (positive number)
+                            dec_pct = (-delta_pct) if (delta_pct is not None and delta_pct < 0) else None
+                            extra = f" (**-{dec_pct:.2f}%**)" if dec_pct is not None else ""
+                            await out_ch.send(f"{ping_role.mention} ⚠️ **Users may be attacking** — progress went backwards (**-{lost:,}** pixels){extra}.")
+
+                    # Only post when matched changed (after baseline)
                     should_post = True
                     if last_matched is not None and matched == last_matched:
                         should_post = False
 
                     if should_post:
                         remaining, eta_seconds, h, m, s = _eta_from_progress(matched, total, builders)
-                        title = "Progress"
                         embed = _progress_embed(
-                            title=title,
+                            title="Progress",
                             box_w=box_w,
                             box_h=box_h,
                             matched=matched,
@@ -792,21 +786,16 @@ async def check(
                             eta_hms=(h, m, s),
                             remaining_px=remaining,
                             builders=builders,
+                            image_filename="template_progress.png",
                         )
+                        file = discord.File(fp=BytesIO(png_bytes), filename="template_progress.png")
+                        await out_ch.send(embed=embed, file=file)
 
-                        out = BytesIO(png_bytes)
-                        await out_ch.send(
-                            embed=embed,
-                            file=discord.File(fp=out, filename="template_progress.png")
-                        )
-
-                    # Update baselines
                     last_marker = marker
                     last_matched = matched
                     last_total = total
                     last_pct = pct
 
-                # Sleep 30s
                 await asyncio.sleep(30)
 
             except asyncio.CancelledError:
