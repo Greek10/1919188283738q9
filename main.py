@@ -1,12 +1,10 @@
 # Discord Slash Bot (Pydroid-friendly)
 # - /ask -> OpenAI rule helper (Embed output)
 # - /stopmotion -> makes a stop-motion GIF from images in channel history
-# - /template -> template progresser (single run) + ETA estimate + fancy embed + image INSIDE embed
+# - /template -> template progresser (single run) + ETA estimate
+#                NOW supports EITHER a source channel OR a direct canvas image upload
 # - /check -> LIVE template progresser (polls source channel every 30s for new/edited latest-image msg)
-#            posts EVERY time the source channel updates (new msg or edited msg), even if progress didn't change
-#            shows recent progress (+/- pixels + +/- percent) + ETA estimate
-#            OPTIONAL role ping if progress goes backwards
-#            image preview is attached + shown inside the embed
+#            posts when the source updates; shows recent progress deltas; optional role ping on regression
 #
 # Requirements:
 #   pip install -U discord.py pillow
@@ -40,10 +38,10 @@ MAX_OUTPUT_TOKENS = 450
 COOLDOWN_S = 6
 _last_used = {}
 
-# ETA rule (your confirmed rule)
+# ETA rule
 COOLDOWN_SECONDS_PER_PIXEL = 15
 
-# ✅ SYSTEM PROMPT (UNCHANGED)
+# -------------------- MODERATION SYSTEM PROMPT --------------------
 SYSTEM_PROMPT = r"""
 You are a moderation helper for a Roblox r/place-clone game.
 You must follow Roblox TOS and the rules below.
@@ -92,8 +90,7 @@ Warnings / Kicks / Under One-Day Ban:
 Other:
 - Framing users: same duration as what they tried to frame for
 - Lying on a ban appeal: double the original ban length
-- Coordinated account usage by one person (saving pixels across multiple accounts then using them one by one):
-  One-week ban per extra account used
+- Coordinated account usage by one person: One-week ban per extra account used
 - Abusing mechanics to gain unfair advantage: moderator decides duration
 - Conspiring to break rules: half or full duration of what they would have done
 
@@ -101,27 +98,19 @@ What is NOT bannable:
 - Chat (unless it bypasses chat filter)
 - Griefing
 
-remember you MAY look into the actual roblox rules and see if the thing being described is against the rules. you MAY tell the user that and see what they think about it.
-
 # Task
 Given the user's report, decide if it breaks the rules.
 
-If you are NOT completely sure it is bannable, you MUST recommend contacting a moderator / opening a report ticket.
+If you are NOT completely sure it is bannable, recommend contacting a moderator.
 If you ARE sure, do NOT include that recommendation.
 
-you MUST add onto the ban length if multiple bannable things are being mentioned. assume 1 month is 31 days.
-an example of this would be: a user mentions that a penis and swastika is being drawn, you would say 34 days (3 for pp, 31 for swastika)
+You MUST add onto the ban length if multiple bannable things are mentioned (assume 31-day months).
 
 # settings
-if a user puts any of these at the start of the prompt then it means the following and you MUST abide by them:
+D: - Discord issue -> judge if it warrants in-game ban; if unsure on length, say moderators must define it
+MA: - Mod abuse checker
 
-D: - Discord issue, see if it will warrant an in-game ban by how extreme it is. if you think it's bannable but don't know the length then just say the moderators need to define it
-
-MA: - Mod abuse issue,the user can input a ban and see if it may be mod abuse or not
-
-# Output format (STRICT)
-Return ONLY valid JSON (no markdown, no extra text) in exactly this schema:
-
+# Output format (STRICT JSON)
 {
   "ban_title": "string",
   "ban_length": "string",
@@ -145,7 +134,6 @@ def _extract_text_from_responses_api(json_obj: dict) -> str:
 def call_openai(system_prompt: str, user_prompt: str) -> str:
     if not OPENAI_API_KEY:
         return ""
-
     url = "https://api.openai.com/v1/responses"
     payload = {
         "model": MODEL,
@@ -155,7 +143,6 @@ def call_openai(system_prompt: str, user_prompt: str) -> str:
         ],
         "max_output_tokens": MAX_OUTPUT_TOKENS,
     }
-
     req = urllib.request.Request(
         url,
         data=json.dumps(payload).encode(),
@@ -165,7 +152,6 @@ def call_openai(system_prompt: str, user_prompt: str) -> str:
         },
         method="POST",
     )
-
     try:
         with urllib.request.urlopen(req, timeout=60) as r:
             data = json.loads(r.read().decode())
@@ -241,11 +227,7 @@ def _clamp_int(v: int, lo: int, hi: int) -> int:
 def _user_to_image_y(y_user: int, img_h: int) -> int:
     return (img_h - 1) - y_user
 
-async def _get_latest_canvas_marker(channel: discord.TextChannel | discord.Thread) -> tuple[Optional[int], Optional[float], Optional[str]]:
-    """
-    Marker to detect updates in the source channel:
-    returns (message_id, edited_timestamp, image_url) for the latest image message found.
-    """
+async def _get_latest_canvas_marker(channel: discord.TextChannel | discord.Thread):
     async for msg in channel.history(limit=50, oldest_first=False):
         image_url = None
         for a in msg.attachments:
@@ -261,11 +243,9 @@ async def _get_latest_canvas_marker(channel: discord.TextChannel | discord.Threa
                 if e.thumbnail and e.thumbnail.url:
                     image_url = e.thumbnail.url
                     break
-
         if image_url:
             edited_ts = msg.edited_at.timestamp() if msg.edited_at else None
             return msg.id, edited_ts, image_url
-
     return None, None, None
 
 async def _find_latest_image_url(channel: discord.TextChannel | discord.Thread) -> str | None:
@@ -279,23 +259,18 @@ def parse_coords_4pairs(coords: str):
     return [(int(x), int(y)) for x, y in matches]
 
 def _make_template_progress_preview(canvas_crop, template_crop, red_alpha: int = 140):
-    from PIL import Image  # lazy
-
+    from PIL import Image
     w, h = template_crop.size
     out = template_crop.copy().convert("RGBA")
-
     cpx = canvas_crop.load()
     tpx = template_crop.load()
     opx = out.load()
-
     red_alpha = _clamp_int(red_alpha, 0, 255)
-
     for y in range(h):
         for x in range(w):
             tr, tg, tb, ta = tpx[x, y]
-            if ta == 0:
+            if ta == 0:  # ignore transparent template pixels
                 continue
-
             cr, cg, cb, ca = cpx[x, y]
             if (cr, cg, cb) == (tr, tg, tb):
                 opx[x, y] = (tr, tg, tb, ta)
@@ -306,20 +281,16 @@ def _make_template_progress_preview(canvas_crop, template_crop, red_alpha: int =
                 rg = (tg * inv + 0 * a) // 255
                 rb = (tb * inv + 0 * a) // 255
                 opx[x, y] = (rr, rg, rb, ta)
-
     return out
 
-def _exact_progress_percent(canvas_rgba, template_rgba) -> tuple[float, int, int]:
+def _exact_progress_percent(canvas_rgba, template_rgba):
     if canvas_rgba.size != template_rgba.size:
         return 0.0, 0, 0
-
     cpx = canvas_rgba.load()
     tpx = template_rgba.load()
     w, h = template_rgba.size
-
     matched = 0
     total = 0
-
     for y in range(h):
         for x in range(w):
             tr, tg, tb, ta = tpx[x, y]
@@ -329,11 +300,10 @@ def _exact_progress_percent(canvas_rgba, template_rgba) -> tuple[float, int, int
             total += 1
             if (cr, cg, cb) == (tr, tg, tb):
                 matched += 1
-
     pct = (matched / total * 100.0) if total else 0.0
     return pct, matched, total
 
-def _seconds_to_hms(total_seconds: int) -> tuple[int, int, int]:
+def _seconds_to_hms(total_seconds: int):
     total_seconds = max(0, int(total_seconds))
     h = total_seconds // 3600
     total_seconds -= h * 3600
@@ -341,7 +311,7 @@ def _seconds_to_hms(total_seconds: int) -> tuple[int, int, int]:
     s = total_seconds - m * 60
     return h, m, s
 
-def _eta_from_progress(matched: int, total: int, builders: int) -> tuple[int, int, int, int, int]:
+def _eta_from_progress(matched: int, total: int, builders: int):
     builders = max(1, int(builders))
     total = max(0, int(total))
     matched = max(0, min(int(matched), total))
@@ -376,7 +346,6 @@ def _progress_embed(
         title=title,
         description=f"**{_fmt_int(matched)}/{_fmt_int(total)}** pixels completed (**{_fmt_pct(pct)}**)",
     )
-
     if delta_matched is not None:
         sign = "+" if delta_matched > 0 else ""
         value = f"`{sign}{_fmt_int(delta_matched)}` pixels"
@@ -384,9 +353,7 @@ def _progress_embed(
             ps = "+" if delta_pct > 0 else ""
             value += f" (`{ps}{delta_pct:.2f}%`)"
         embed.add_field(name="Recent Progress", value=value, inline=False)
-
     embed.add_field(name="Region", value=f"`{box_w}×{box_h}`", inline=True)
-
     if eta_hms is not None and remaining_px is not None and builders is not None:
         h, m, s = eta_hms
         embed.add_field(
@@ -394,29 +361,37 @@ def _progress_embed(
             value=f"`{h}h {m}m {s}s`  ({_fmt_int(remaining_px)} px, builders={builders})",
             inline=True
         )
-
     embed.set_footer(text=f"{COOLDOWN_SECONDS_PER_PIXEL}s per pixel charge (per builder)")
     embed.set_image(url=f"attachment://{image_filename}")
     return embed
 
+# -------- core: run one comparison (now accepts optional canvas_bytes) --------
 async def run_markarea_once(
     *,
-    source_channel: discord.TextChannel,
+    source_channel: Optional[discord.TextChannel] = None,
+    canvas_bytes: Optional[bytes] = None,
     template_bytes: bytes,
     coords: str,
 ):
-    from PIL import Image  # lazy
+    """
+    Returns (png_bytes, box_w, box_h, matched, total, pct)
+    If canvas_bytes is None, pulls latest image from source_channel.
+    """
+    from PIL import Image
     import aiohttp
 
     pts = parse_coords_4pairs(coords)
     (x1, y1), (x2, y2), (x3, y3), (x4, y4) = pts
 
-    canvas_url = await _find_latest_image_url(source_channel)
-    if not canvas_url:
-        raise RuntimeError("No recent canvas image found in the source channel.")
-
-    async with aiohttp.ClientSession() as session:
-        canvas_bytes = await _download_bytes(session, canvas_url, timeout_s=30)
+    # Get canvas bytes
+    if canvas_bytes is None:
+        if source_channel is None:
+            raise RuntimeError("Provide a source_channel or upload a canvas image.")
+        canvas_url = await _find_latest_image_url(source_channel)
+        if not canvas_url:
+            raise RuntimeError("No recent canvas image found in the source channel.")
+        async with aiohttp.ClientSession() as session:
+            canvas_bytes = await _download_bytes(session, canvas_url, timeout_s=30)
 
     canvas = Image.open(BytesIO(canvas_bytes)).convert("RGBA")
     tmpl = Image.open(BytesIO(template_bytes)).convert("RGBA")
@@ -424,58 +399,42 @@ async def run_markarea_once(
     CW, CH = canvas.size
     TW, TH = tmpl.size
 
-    def to_canvas_img_pt(xu: int, yu: int) -> tuple[int, int]:
-        xi = _clamp_int(xu, 0, CW - 1)
-        yi = _clamp_int(_user_to_image_y(yu, CH), 0, CH - 1)
-        return (xi, yi)
+    def to_img_pt(xu: int, yu: int, H: int) -> tuple[int, int]:
+        xi = _clamp_int(xu, 0, 10**9)  # clamp later per-image
+        yi = _clamp_int((H - 1) - yu, -10**9, 10**9)
+        return xi, yi
 
-    p1 = to_canvas_img_pt(x1, y1)
-    p2 = to_canvas_img_pt(x2, y2)
-    p3 = to_canvas_img_pt(x3, y3)
-    p4 = to_canvas_img_pt(x4, y4)
-
-    xs = [p1[0], p2[0], p3[0], p4[0]]
-    ys = [p1[1], p2[1], p3[1], p4[1]]
-
-    left = max(0, min(xs))
-    right = min(CW, max(xs) + 1)
-    top = max(0, min(ys))
-    bottom = min(CH, max(ys) + 1)
-
-    box_w = right - left
-    box_h = bottom - top
+    # Convert corners for CANVAS
+    cx1, cy1 = to_img_pt(x1, y1, CH)
+    cx2, cy2 = to_img_pt(x2, y2, CH)
+    cx3, cy3 = to_img_pt(x3, y3, CH)
+    cx4, cy4 = to_img_pt(x4, y4, CH)
+    cxs = [max(0, min(CW - 1, v)) for v in (cx1, cx2, cx3, cx4)]
+    cys = [max(0, min(CH - 1, v)) for v in (cy1, cy2, cy3, cy4)]
+    left, right = max(0, min(cxs)), min(CW, max(cxs) + 1)
+    top, bottom = max(0, min(cys)), min(CH, max(cys) + 1)
+    box_w, box_h = right - left, bottom - top
     if box_w < 2 or box_h < 2:
         raise RuntimeError("Those coordinates create a region that’s too small.")
-
     canvas_crop = canvas.crop((left, top, right, bottom))
 
+    # TEMPLATE crop
     if (TW, TH) == (box_w, box_h):
         tmpl_crop = tmpl
     else:
-        def to_tmpl_img_pt(xu: int, yu: int) -> tuple[int, int]:
-            xi = _clamp_int(xu, 0, TW - 1)
-            yi = _clamp_int(_user_to_image_y(yu, TH), 0, TH - 1)
-            return (xi, yi)
-
-        tp1 = to_tmpl_img_pt(x1, y1)
-        tp2 = to_tmpl_img_pt(x2, y2)
-        tp3 = to_tmpl_img_pt(x3, y3)
-        tp4 = to_tmpl_img_pt(x4, y4)
-
-        txs = [tp1[0], tp2[0], tp3[0], tp4[0]]
-        tys = [tp1[1], tp2[1], tp3[1], tp4[1]]
-
-        t_left = max(0, min(txs))
-        t_right = min(TW, max(txs) + 1)
-        t_top = max(0, min(tys))
-        t_bottom = min(TH, max(tys) + 1)
-
+        tx1, ty1 = to_img_pt(x1, y1, TH)
+        tx2, ty2 = to_img_pt(x2, y2, TH)
+        tx3, ty3 = to_img_pt(x3, y3, TH)
+        tx4, ty4 = to_img_pt(x4, y4, TH)
+        txs = [max(0, min(TW - 1, v)) for v in (tx1, tx2, tx3, tx4)]
+        tys = [max(0, min(TH - 1, v)) for v in (ty1, ty2, ty3, ty4)]
+        t_left, t_right = max(0, min(txs)), min(TW, max(txs) + 1)
+        t_top, t_bottom = max(0, min(tys)), min(TH, max(tys) + 1)
         if (t_right - t_left) != box_w or (t_bottom - t_top) != box_h:
             raise RuntimeError(
                 "Template doesn’t cover that region. Upload a full-canvas template, "
                 "or a template exactly sized to the region."
             )
-
         tmpl_crop = tmpl.crop((t_left, t_top, t_right, t_bottom))
 
     pct, matched, total = _exact_progress_percent(canvas_crop, tmpl_crop)
@@ -484,7 +443,6 @@ async def run_markarea_once(
     out = BytesIO()
     preview.save(out, format="PNG")
     out.seek(0)
-
     return out.read(), box_w, box_h, matched, total, pct
 
 # -------------------- /ASK --------------------
@@ -502,7 +460,7 @@ async def ask(interaction: discord.Interaction, message: str):
 @bot.tree.command(name="stopmotion", description="Make a stop-motion GIF from images posted in this channel in the last N hours.")
 @app_commands.describe(hours="Hours back (default 24).", fps="FPS (default 4).", max_frames="Max frames (default 60).", max_side="Max side (default 512).")
 async def stopmotion(interaction: discord.Interaction, hours: int = 24, fps: int = 4, max_frames: int = 60, max_side: int = 512):
-    from PIL import Image  # lazy
+    from PIL import Image
     import aiohttp
 
     def _fit_resize(w: int, h: int, max_side: int) -> tuple[int, int]:
@@ -602,27 +560,53 @@ async def stopmotion(interaction: discord.Interaction, hours: int = 24, fps: int
         file=discord.File(fp=out, filename="stopmotion.gif")
     )
 
-# -------------------- /TEMPLATE --------------------
+# -------------------- /TEMPLATE (single run) --------------------
 @bot.tree.command(name="template", description="Template progresser.")
 @app_commands.describe(
-    source_channel="Channel with the latest canvas update image.",
+    source_channel="Channel with the latest canvas update image. (Optional if you upload 'canvas_image')",
+    canvas_image="Upload a canvas image directly (optional alternative to source_channel).",
     template="Template image attachment.",
     coords="(x1,y1)(x2,y2)(x3,y3)(x4,y4)",
     builders="How many people placing pixels in parallel (default 1)."
 )
-async def template_cmd(interaction: discord.Interaction, source_channel: discord.TextChannel, template: discord.Attachment, coords: str, builders: int = 1):
+async def template_cmd(
+    interaction: discord.Interaction,
+    source_channel: Optional[discord.TextChannel],
+    canvas_image: Optional[discord.Attachment],
+    template: discord.Attachment,
+    coords: str,
+    builders: int = 1
+):
+    # Validate attachments
     if not (template.content_type or "").startswith("image/"):
         await interaction.response.send_message("That template doesn’t look like an image.", ephemeral=True)
+        return
+    if canvas_image and not (canvas_image.content_type or "").startswith("image/"):
+        await interaction.response.send_message("The uploaded canvas image isn’t an image file.", ephemeral=True)
+        return
+    if not source_channel and not canvas_image:
+        await interaction.response.send_message(
+            "Provide a `source_channel` **or** upload a `canvas_image`.", ephemeral=True
+        )
         return
 
     await interaction.response.defer(thinking=True)
     try:
         template_bytes = await template.read()
-        png_bytes, box_w, box_h, matched, total, pct = await run_markarea_once(
-            source_channel=source_channel,
-            template_bytes=template_bytes,
-            coords=coords,
-        )
+        # If user uploaded a canvas image, use that; else pull from source channel
+        if canvas_image:
+            canvas_bytes = await canvas_image.read()
+            png_bytes, box_w, box_h, matched, total, pct = await run_markarea_once(
+                canvas_bytes=canvas_bytes,
+                template_bytes=template_bytes,
+                coords=coords,
+            )
+        else:
+            png_bytes, box_w, box_h, matched, total, pct = await run_markarea_once(
+                source_channel=source_channel,
+                template_bytes=template_bytes,
+                coords=coords,
+            )
 
         builders = max(1, int(builders))
         remaining, eta_seconds, h, m, s = _eta_from_progress(matched, total, builders)
@@ -639,14 +623,13 @@ async def template_cmd(interaction: discord.Interaction, source_channel: discord
             builders=builders,
             image_filename="template_progress.png",
         )
-
         file = discord.File(fp=BytesIO(png_bytes), filename="template_progress.png")
         await interaction.followup.send(embed=embed, file=file)
 
     except Exception as e:
         await interaction.followup.send(f"❌ /template failed: `{type(e).__name__}: {e}`")
 
-# -------------------- /CHECK (LIVE) --------------------
+# -------------------- /CHECK (LIVE, unchanged) --------------------
 _active_checks: dict[tuple[int, int], asyncio.Task] = {}
 
 @bot.tree.command(name="check", description="Live template progresser: posts on every source update.")
@@ -695,7 +678,6 @@ async def check(
             ephemeral=True
         )
         return
-
     if not (template.content_type or "").startswith("image/"):
         await interaction.response.send_message("That template doesn’t look like an image.", ephemeral=True)
         return
@@ -728,8 +710,7 @@ async def check(
 
     async def runner():
         end_ts = time.time() + duration_minutes * 60
-        last_marker: tuple[Optional[int], Optional[float], Optional[str]] = (None, None, None)
-
+        last_marker = (None, None, None)
         last_matched: Optional[int] = None
         last_total: Optional[int] = None
         last_pct: Optional[float] = None
@@ -737,8 +718,6 @@ async def check(
         while time.time() < end_ts:
             try:
                 marker = await _get_latest_canvas_marker(source_channel)
-
-                # Only act when the SOURCE updated (new message or edited message)
                 if marker != last_marker and marker[2] is not None:
                     png_bytes, box_w, box_h, matched, total, pct = await run_markarea_once(
                         source_channel=source_channel,
@@ -751,7 +730,6 @@ async def check(
                     if last_matched is not None and last_total == total and last_pct is not None:
                         delta_matched = matched - last_matched
                         delta_pct = pct - last_pct
-
                         if ping_role is not None and delta_matched < 0:
                             lost = -delta_matched
                             dec_pct = (-delta_pct) if (delta_pct is not None and delta_pct < 0) else None
@@ -783,7 +761,6 @@ async def check(
                     last_pct = pct
 
                 await asyncio.sleep(30)
-
             except asyncio.CancelledError:
                 raise
             except Exception as e:
