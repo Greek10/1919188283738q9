@@ -1,3 +1,20 @@
+# Discord Slash Bot (Pydroid-friendly)
+# - /ask -> OpenAI rule helper (Embed output)
+# - /stopmotion -> makes a stop-motion GIF from images in channel history
+# - /template -> template progresser (single run) + ETA estimate + fancy embed + image INSIDE embed
+# - /check -> LIVE template progresser (polls source channel every 30s for new/edited latest-image msg)
+#            posts EVERY time the source channel updates (new msg or edited msg), even if progress didn't change
+#            shows recent progress (+/- pixels + +/- percent) + ETA estimate
+#            OPTIONAL role ping if progress goes backwards
+#            image preview is attached + shown inside the embed
+#
+# Requirements:
+#   pip install -U discord.py pillow
+#
+# Env vars:
+#   DISCORD_TOKEN
+#   OPENAI_API_KEY
+
 import os
 import time
 import json
@@ -222,25 +239,11 @@ def _clamp_int(v: int, lo: int, hi: int) -> int:
     return v
 
 def _user_to_image_y(y_user: int, img_h: int) -> int:
-    # bottom-left user coords -> top-left image coords
     return (img_h - 1) - y_user
-
-async def _find_latest_image_url(channel: discord.TextChannel | discord.Thread) -> str | None:
-    async for msg in channel.history(limit=50, oldest_first=False):
-        for a in msg.attachments:
-            ct = (a.content_type or "")
-            if ct.startswith("image/") and a.url:
-                return a.url
-        for e in msg.embeds:
-            if e.image and e.image.url:
-                return e.image.url
-            if e.thumbnail and e.thumbnail.url:
-                return e.thumbnail.url
-    return None
 
 async def _get_latest_canvas_marker(channel: discord.TextChannel | discord.Thread) -> tuple[Optional[int], Optional[float], Optional[str]]:
     """
-    Marker to detect changes in the source channel without downloading images:
+    Marker to detect updates in the source channel:
     returns (message_id, edited_timestamp, image_url) for the latest image message found.
     """
     async for msg in channel.history(limit=50, oldest_first=False):
@@ -265,6 +268,10 @@ async def _get_latest_canvas_marker(channel: discord.TextChannel | discord.Threa
 
     return None, None, None
 
+async def _find_latest_image_url(channel: discord.TextChannel | discord.Thread) -> str | None:
+    mid, ets, url = await _get_latest_canvas_marker(channel)
+    return url
+
 def parse_coords_4pairs(coords: str):
     matches = re.findall(r"\(\s*(-?\d+)\s*,\s*(-?\d+)\s*\)", coords or "")
     if len(matches) != 4:
@@ -272,7 +279,6 @@ def parse_coords_4pairs(coords: str):
     return [(int(x), int(y)) for x, y in matches]
 
 def _make_template_progress_preview(canvas_crop, template_crop, red_alpha: int = 140):
-    # Template visible; mismatches get red "light" overlay; matches show clean template color.
     from PIL import Image  # lazy
 
     w, h = template_crop.size
@@ -345,7 +351,6 @@ def _eta_from_progress(matched: int, total: int, builders: int) -> tuple[int, in
     h, m, s = _seconds_to_hms(eta_seconds)
     return remaining, eta_seconds, h, m, s
 
-# ---- fancy embed formatting (like your screenshot) ----
 def _fmt_pct(p: float) -> str:
     return f"{p:.1f}%"
 
@@ -372,7 +377,6 @@ def _progress_embed(
         description=f"**{_fmt_int(matched)}/{_fmt_int(total)}** pixels completed (**{_fmt_pct(pct)}**)",
     )
 
-    # Recent progress
     if delta_matched is not None:
         sign = "+" if delta_matched > 0 else ""
         value = f"`{sign}{_fmt_int(delta_matched)}` pixels"
@@ -392,8 +396,6 @@ def _progress_embed(
         )
 
     embed.set_footer(text=f"{COOLDOWN_SECONDS_PER_PIXEL}s per pixel charge (per builder)")
-
-    # Put the attached image inside the embed
     embed.set_image(url=f"attachment://{image_filename}")
     return embed
 
@@ -403,9 +405,6 @@ async def run_markarea_once(
     template_bytes: bytes,
     coords: str,
 ):
-    """
-    Returns: (png_bytes, box_w, box_h, matched, total, pct)
-    """
     from PIL import Image  # lazy
     import aiohttp
 
@@ -450,7 +449,6 @@ async def run_markarea_once(
 
     canvas_crop = canvas.crop((left, top, right, bottom))
 
-    # Template crop rules:
     if (TW, TH) == (box_w, box_h):
         tmpl_crop = tmpl
     else:
@@ -501,22 +499,22 @@ async def ask(interaction: discord.Interaction, message: str):
     await interaction.followup.send(embed=build_embed(safe_parse(raw)))
 
 # -------------------- /STOPMOTION --------------------
-def _fit_resize(w: int, h: int, max_side: int) -> tuple[int, int]:
-    if max(w, h) <= max_side:
-        return w, h
-    if w >= h:
-        nw = max_side
-        nh = max(1, int(h * (max_side / w)))
-    else:
-        nh = max_side
-        nw = max(1, int(w * (max_side / h)))
-    return nw, nh
-
 @bot.tree.command(name="stopmotion", description="Make a stop-motion GIF from images posted in this channel in the last N hours.")
 @app_commands.describe(hours="Hours back (default 24).", fps="FPS (default 4).", max_frames="Max frames (default 60).", max_side="Max side (default 512).")
 async def stopmotion(interaction: discord.Interaction, hours: int = 24, fps: int = 4, max_frames: int = 60, max_side: int = 512):
     from PIL import Image  # lazy
     import aiohttp
+
+    def _fit_resize(w: int, h: int, max_side: int) -> tuple[int, int]:
+        if max(w, h) <= max_side:
+            return w, h
+        if w >= h:
+            nw = max_side
+            nh = max(1, int(h * (max_side / w)))
+        else:
+            nh = max_side
+            nw = max(1, int(w * (max_side / h)))
+        return nw, nh
 
     if hours < 1: hours = 1
     if hours > 168: hours = 168
@@ -604,7 +602,7 @@ async def stopmotion(interaction: discord.Interaction, hours: int = 24, fps: int
         file=discord.File(fp=out, filename="stopmotion.gif")
     )
 
-# -------------------- /TEMPLATE (single run) --------------------
+# -------------------- /TEMPLATE --------------------
 @bot.tree.command(name="template", description="Template progresser.")
 @app_commands.describe(
     source_channel="Channel with the latest canvas update image.",
@@ -649,10 +647,9 @@ async def template_cmd(interaction: discord.Interaction, source_channel: discord
         await interaction.followup.send(f"❌ /template failed: `{type(e).__name__}: {e}`")
 
 # -------------------- /CHECK (LIVE) --------------------
-# One active check per user per guild.
 _active_checks: dict[tuple[int, int], asyncio.Task] = {}
 
-@bot.tree.command(name="check", description="Live template progresser: watches source channel and posts only on changes.")
+@bot.tree.command(name="check", description="Live template progresser: posts on every source update.")
 @app_commands.describe(
     mode="start or stop",
     source_channel="Channel containing the latest canvas updates.",
@@ -683,7 +680,6 @@ async def check(
         await interaction.response.send_message("Mode must be `start` or `stop`.", ephemeral=True)
         return
 
-    # STOP
     if mode == "stop":
         task = _active_checks.pop(key, None)
         if task and not task.done():
@@ -693,7 +689,6 @@ async def check(
             await interaction.response.send_message("No active live check running.", ephemeral=True)
         return
 
-    # START validation
     if source_channel is None or template is None or coords is None:
         await interaction.response.send_message(
             "For `mode=start`, you must provide: `source_channel`, `template`, and `coords`.",
@@ -714,7 +709,6 @@ async def check(
         await interaction.response.send_message("Output channel must be a normal text channel.", ephemeral=True)
         return
 
-    # cancel old
     old = _active_checks.pop(key, None)
     if old and not old.done():
         old.cancel()
@@ -727,15 +721,15 @@ async def check(
         f"• Output: {out_ch.mention}\n"
         f"• Builders: **{builders}**\n"
         f"• Duration: **{duration_minutes} min**\n"
-        f"• Poll: **30s** (posts only when progress changes)\n"
+        f"• Poll: **30s** (posts on every source update)\n"
         f"• Ping role: {ping_role.mention if ping_role else 'None'}",
         ephemeral=True
     )
 
     async def runner():
         end_ts = time.time() + duration_minutes * 60
-
         last_marker: tuple[Optional[int], Optional[float], Optional[str]] = (None, None, None)
+
         last_matched: Optional[int] = None
         last_total: Optional[int] = None
         last_pct: Optional[float] = None
@@ -743,53 +737,45 @@ async def check(
         while time.time() < end_ts:
             try:
                 marker = await _get_latest_canvas_marker(source_channel)
-                changed_source = marker != last_marker and marker[2] is not None
 
-                if changed_source or last_matched is None:
+                # Only act when the SOURCE updated (new message or edited message)
+                if marker != last_marker and marker[2] is not None:
                     png_bytes, box_w, box_h, matched, total, pct = await run_markarea_once(
                         source_channel=source_channel,
                         template_bytes=template_bytes,
                         coords=coords,
                     )
 
-                    # deltas (only valid if same total)
                     delta_matched = None
                     delta_pct = None
                     if last_matched is not None and last_total == total and last_pct is not None:
                         delta_matched = matched - last_matched
                         delta_pct = pct - last_pct
 
-                        # ping if regression
                         if ping_role is not None and delta_matched < 0:
                             lost = -delta_matched
-                            # percentage decrease (positive number)
                             dec_pct = (-delta_pct) if (delta_pct is not None and delta_pct < 0) else None
                             extra = f" (**-{dec_pct:.2f}%**)" if dec_pct is not None else ""
                             await out_ch.send(f"{ping_role.mention} ⚠️ **Users may be attacking** — progress went backwards (**-{lost:,}** pixels){extra}.")
 
-                    # Only post when matched changed (after baseline)
-                    should_post = True
-                    if last_matched is not None and matched == last_matched:
-                        should_post = False
+                    remaining, eta_seconds, h, m, s = _eta_from_progress(matched, total, builders)
 
-                    if should_post:
-                        remaining, eta_seconds, h, m, s = _eta_from_progress(matched, total, builders)
-                        embed = _progress_embed(
-                            title="Progress",
-                            box_w=box_w,
-                            box_h=box_h,
-                            matched=matched,
-                            total=total,
-                            pct=pct,
-                            delta_matched=delta_matched,
-                            delta_pct=delta_pct,
-                            eta_hms=(h, m, s),
-                            remaining_px=remaining,
-                            builders=builders,
-                            image_filename="template_progress.png",
-                        )
-                        file = discord.File(fp=BytesIO(png_bytes), filename="template_progress.png")
-                        await out_ch.send(embed=embed, file=file)
+                    embed = _progress_embed(
+                        title="Progress",
+                        box_w=box_w,
+                        box_h=box_h,
+                        matched=matched,
+                        total=total,
+                        pct=pct,
+                        delta_matched=delta_matched,
+                        delta_pct=delta_pct,
+                        eta_hms=(h, m, s),
+                        remaining_px=remaining,
+                        builders=builders,
+                        image_filename="template_progress.png",
+                    )
+                    file = discord.File(fp=BytesIO(png_bytes), filename="template_progress.png")
+                    await out_ch.send(embed=embed, file=file)
 
                     last_marker = marker
                     last_matched = matched
