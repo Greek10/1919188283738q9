@@ -1,18 +1,3 @@
-# Discord Slash Bot (Pydroid-friendly)
-# - /ask -> OpenAI rule helper (Embed output)
-# - /stopmotion -> makes a stop-motion GIF from images in channel history
-# - /template -> template progresser (single run) + ETA estimate
-#                NOW supports EITHER a source channel OR a direct canvas image upload
-# - /check -> LIVE template progresser (polls source channel every 30s for new/edited latest-image msg)
-#            posts when the source updates; shows recent progress deltas; optional role ping on regression
-#
-# Requirements:
-#   pip install -U discord.py pillow
-#
-# Env vars:
-#   DISCORD_TOKEN
-#   OPENAI_API_KEY
-
 import os
 import time
 import json
@@ -446,7 +431,7 @@ async def run_markarea_once(
     return out.read(), box_w, box_h, matched, total, pct
 
 # -------------------- /ASK --------------------
-@bot.tree.command(name="ask", description="Check if something is bannable under the game rules (not official).")
+@bot.tree.command(name="ask", description="Check if something is bannable under the game rules.")
 @app_commands.describe(message="Describe what happened / what was drawn / what was said.")
 async def ask(interaction: discord.Interaction, message: str):
     if not cooldown_ok(interaction.user.id):
@@ -457,7 +442,7 @@ async def ask(interaction: discord.Interaction, message: str):
     await interaction.followup.send(embed=build_embed(safe_parse(raw)))
 
 # -------------------- /STOPMOTION --------------------
-@bot.tree.command(name="stopmotion", description="Make a stop-motion GIF from images posted in this channel in the last N hours.")
+@bot.tree.command(name="timelapse", description="Make a timelapse GIF")
 @app_commands.describe(hours="Hours back (default 24).", fps="FPS (default 4).", max_frames="Max frames (default 60).", max_side="Max side (default 512).")
 async def stopmotion(interaction: discord.Interaction, hours: int = 24, fps: int = 4, max_frames: int = 60, max_side: int = 512):
     from PIL import Image
@@ -561,7 +546,7 @@ async def stopmotion(interaction: discord.Interaction, hours: int = 24, fps: int
     )
 
 # -------------------- /TEMPLATE (single run) --------------------
-@bot.tree.command(name="template", description="Template progresser.")
+@bot.tree.command(name="progress", description="Template progresser.")
 @app_commands.describe(
     source_channel="Channel with the latest canvas update image. (Optional if you upload 'canvas_image')",
     canvas_image="Upload a canvas image directly (optional alternative to source_channel).",
@@ -632,7 +617,7 @@ async def template_cmd(
 # -------------------- /CHECK (LIVE, unchanged) --------------------
 _active_checks: dict[tuple[int, int], asyncio.Task] = {}
 
-@bot.tree.command(name="check", description="Live template progresser: posts on every source update.")
+@bot.tree.command(name="LiveProgress", description="Live template progresser: posts on every source update.")
 @app_commands.describe(
     mode="start or stop",
     source_channel="Channel containing the latest canvas updates.",
