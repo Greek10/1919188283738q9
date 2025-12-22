@@ -7,7 +7,7 @@ from io import BytesIO
 from datetime import timedelta
 import re
 import math
-from typing import Optional
+from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
 
 import discord
 from discord import app_commands
@@ -16,6 +16,7 @@ from discord.ext import commands
 # -------------------- CONFIG --------------------
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN", "").strip()
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
+DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 
 MODEL = "gpt-4.1-mini"
 MAX_OUTPUT_TOKENS = 450
@@ -23,10 +24,10 @@ MAX_OUTPUT_TOKENS = 450
 COOLDOWN_S = 6
 _last_used = {}
 
-# ETA rule
+# ETA rule (your confirmed rule)
 COOLDOWN_SECONDS_PER_PIXEL = 15
 
-# -------------------- MODERATION SYSTEM PROMPT --------------------
+# ✅ SYSTEM PROMPT (UNCHANGED)
 SYSTEM_PROMPT = r"""
 You are a moderation helper for a Roblox r/place-clone game.
 You must follow Roblox TOS and the rules below.
@@ -75,7 +76,8 @@ Warnings / Kicks / Under One-Day Ban:
 Other:
 - Framing users: same duration as what they tried to frame for
 - Lying on a ban appeal: double the original ban length
-- Coordinated account usage by one person: One-week ban per extra account used
+- Coordinated account usage by one person (saving pixels across multiple accounts then using them one by one):
+  One-week ban per extra account used
 - Abusing mechanics to gain unfair advantage: moderator decides duration
 - Conspiring to break rules: half or full duration of what they would have done
 
@@ -83,19 +85,27 @@ What is NOT bannable:
 - Chat (unless it bypasses chat filter)
 - Griefing
 
+remember you MAY look into the actual roblox rules and see if the thing being described is against the rules. you MAY tell the user that and see what they think about it.
+
 # Task
 Given the user's report, decide if it breaks the rules.
 
-If you are NOT completely sure it is bannable, recommend contacting a moderator.
+If you are NOT completely sure it is bannable, you MUST recommend contacting a moderator / opening a report ticket.
 If you ARE sure, do NOT include that recommendation.
 
-You MUST add onto the ban length if multiple bannable things are mentioned (assume 31-day months).
+you MUST add onto the ban length if multiple bannable things are being mentioned. assume 1 month is 31 days.
+an example of this would be: a user mentions that a penis and swastika is being drawn, you would say 34 days (3 for pp, 31 for swastika)
 
 # settings
-D: - Discord issue -> judge if it warrants in-game ban; if unsure on length, say moderators must define it
-MA: - Mod abuse checker
+if a user puts any of these at the start of the prompt then it means the following and you MUST abide by them:
 
-# Output format (STRICT JSON)
+D: - Discord issue, see if it will warrant an in-game ban by how extreme it is. if you think it's bannable but don't know the length then just say the moderators need to define it
+
+MA: - Mod abuse issue,the user can input a ban and see if it may be mod abuse or not
+
+# Output format (STRICT)
+Return ONLY valid JSON (no markdown, no extra text) in exactly this schema:
+
 {
   "ban_title": "string",
   "ban_length": "string",
@@ -119,6 +129,7 @@ def _extract_text_from_responses_api(json_obj: dict) -> str:
 def call_openai(system_prompt: str, user_prompt: str) -> str:
     if not OPENAI_API_KEY:
         return ""
+
     url = "https://api.openai.com/v1/responses"
     payload = {
         "model": MODEL,
@@ -128,6 +139,7 @@ def call_openai(system_prompt: str, user_prompt: str) -> str:
         ],
         "max_output_tokens": MAX_OUTPUT_TOKENS,
     }
+
     req = urllib.request.Request(
         url,
         data=json.dumps(payload).encode(),
@@ -137,6 +149,7 @@ def call_openai(system_prompt: str, user_prompt: str) -> str:
         },
         method="POST",
     )
+
     try:
         with urllib.request.urlopen(req, timeout=60) as r:
             data = json.loads(r.read().decode())
@@ -194,8 +207,123 @@ def build_embed(res: dict) -> discord.Embed:
 
 @bot.event
 async def on_ready():
+    # Ensure DB tables exist (does nothing if no DATABASE_URL)
+    try:
+        await asyncio.to_thread(db_init)
+    except Exception as e:
+        print("⚠️ DB init failed:", e)
+
     await bot.tree.sync()
     print(f"✅ Logged in as {bot.user}")
+
+# -------------------- DB (Postgres presets) --------------------
+def _db_url_with_sslmode(url: str) -> str:
+    """
+    Railway Postgres often requires SSL. If sslmode isn't present, add sslmode=require.
+    """
+    if not url:
+        return url
+    try:
+        p = urlparse(url)
+        q = parse_qs(p.query)
+        if "sslmode" not in q:
+            q["sslmode"] = ["require"]
+            new_query = urlencode(q, doseq=True)
+            p = p._replace(query=new_query)
+            return urlunparse(p)
+        return url
+    except Exception:
+        return url
+
+def db_connect():
+    if not DATABASE_URL:
+        raise RuntimeError("DATABASE_URL is not set (Railway Postgres not configured).")
+    import psycopg2
+    return psycopg2.connect(_db_url_with_sslmode(DATABASE_URL))
+
+def db_init():
+    if not DATABASE_URL:
+        return
+    conn = db_connect()
+    try:
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                CREATE TABLE IF NOT EXISTS bot_presets (
+                    guild_id BIGINT NOT NULL,
+                    user_id  BIGINT NOT NULL,
+                    name     TEXT   NOT NULL,
+                    data     JSONB  NOT NULL,
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    PRIMARY KEY (guild_id, user_id, name)
+                );
+                """)
+    finally:
+        conn.close()
+
+def db_upsert_preset(guild_id: int, user_id: int, name: str, data: dict):
+    conn = db_connect()
+    try:
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO bot_presets (guild_id, user_id, name, data)
+                    VALUES (%s, %s, %s, %s::jsonb)
+                    ON CONFLICT (guild_id, user_id, name)
+                    DO UPDATE SET data = EXCLUDED.data, updated_at = NOW();
+                    """,
+                    (guild_id, user_id, name, json.dumps(data)),
+                )
+    finally:
+        conn.close()
+
+def db_get_preset(guild_id: int, user_id: int, name: str) -> dict | None:
+    conn = db_connect()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT data FROM bot_presets WHERE guild_id=%s AND user_id=%s AND name=%s;",
+                (guild_id, user_id, name),
+            )
+            row = cur.fetchone()
+            if not row:
+                return None
+            return row[0]
+    finally:
+        conn.close()
+
+def db_list_presets(guild_id: int, user_id: int) -> list[tuple[str, str]]:
+    """
+    Returns [(name, updated_at_iso), ...]
+    """
+    conn = db_connect()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT name, updated_at FROM bot_presets WHERE guild_id=%s AND user_id=%s ORDER BY updated_at DESC;",
+                (guild_id, user_id),
+            )
+            rows = cur.fetchall() or []
+            out = []
+            for n, ts in rows:
+                out.append((str(n), ts.isoformat() if ts else ""))
+            return out
+    finally:
+        conn.close()
+
+def db_delete_preset(guild_id: int, user_id: int, name: str) -> bool:
+    conn = db_connect()
+    try:
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "DELETE FROM bot_presets WHERE guild_id=%s AND user_id=%s AND name=%s;",
+                    (guild_id, user_id, name),
+                )
+                return cur.rowcount > 0
+    finally:
+        conn.close()
 
 # -------------------- COMMON HELPERS --------------------
 async def _download_bytes(session, url: str, timeout_s: int = 30) -> bytes:
@@ -212,30 +340,18 @@ def _clamp_int(v: int, lo: int, hi: int) -> int:
 def _user_to_image_y(y_user: int, img_h: int) -> int:
     return (img_h - 1) - y_user
 
-async def _get_latest_canvas_marker(channel: discord.TextChannel | discord.Thread):
+async def _find_latest_image_url(channel: discord.TextChannel | discord.Thread) -> str | None:
     async for msg in channel.history(limit=50, oldest_first=False):
-        image_url = None
         for a in msg.attachments:
             ct = (a.content_type or "")
             if ct.startswith("image/") and a.url:
-                image_url = a.url
-                break
-        if not image_url:
-            for e in msg.embeds:
-                if e.image and e.image.url:
-                    image_url = e.image.url
-                    break
-                if e.thumbnail and e.thumbnail.url:
-                    image_url = e.thumbnail.url
-                    break
-        if image_url:
-            edited_ts = msg.edited_at.timestamp() if msg.edited_at else None
-            return msg.id, edited_ts, image_url
-    return None, None, None
-
-async def _find_latest_image_url(channel: discord.TextChannel | discord.Thread) -> str | None:
-    mid, ets, url = await _get_latest_canvas_marker(channel)
-    return url
+                return a.url
+        for e in msg.embeds:
+            if e.image and e.image.url:
+                return e.image.url
+            if e.thumbnail and e.thumbnail.url:
+                return e.thumbnail.url
+    return None
 
 def parse_coords_4pairs(coords: str):
     matches = re.findall(r"\(\s*(-?\d+)\s*,\s*(-?\d+)\s*\)", coords or "")
@@ -244,18 +360,21 @@ def parse_coords_4pairs(coords: str):
     return [(int(x), int(y)) for x, y in matches]
 
 def _make_template_progress_preview(canvas_crop, template_crop, red_alpha: int = 140):
-    from PIL import Image
     w, h = template_crop.size
     out = template_crop.copy().convert("RGBA")
+
     cpx = canvas_crop.load()
     tpx = template_crop.load()
     opx = out.load()
+
     red_alpha = _clamp_int(red_alpha, 0, 255)
+
     for y in range(h):
         for x in range(w):
             tr, tg, tb, ta = tpx[x, y]
-            if ta == 0:  # ignore transparent template pixels
+            if ta == 0:
                 continue
+
             cr, cg, cb, ca = cpx[x, y]
             if (cr, cg, cb) == (tr, tg, tb):
                 opx[x, y] = (tr, tg, tb, ta)
@@ -266,16 +385,20 @@ def _make_template_progress_preview(canvas_crop, template_crop, red_alpha: int =
                 rg = (tg * inv + 0 * a) // 255
                 rb = (tb * inv + 0 * a) // 255
                 opx[x, y] = (rr, rg, rb, ta)
+
     return out
 
-def _exact_progress_percent(canvas_rgba, template_rgba):
+def _exact_progress_percent(canvas_rgba, template_rgba) -> tuple[float, int, int]:
     if canvas_rgba.size != template_rgba.size:
         return 0.0, 0, 0
+
     cpx = canvas_rgba.load()
     tpx = template_rgba.load()
     w, h = template_rgba.size
+
     matched = 0
     total = 0
+
     for y in range(h):
         for x in range(w):
             tr, tg, tb, ta = tpx[x, y]
@@ -285,10 +408,11 @@ def _exact_progress_percent(canvas_rgba, template_rgba):
             total += 1
             if (cr, cg, cb) == (tr, tg, tb):
                 matched += 1
+
     pct = (matched / total * 100.0) if total else 0.0
     return pct, matched, total
 
-def _seconds_to_hms(total_seconds: int):
+def _seconds_to_hms(total_seconds: int) -> tuple[int, int, int]:
     total_seconds = max(0, int(total_seconds))
     h = total_seconds // 3600
     total_seconds -= h * 3600
@@ -296,7 +420,7 @@ def _seconds_to_hms(total_seconds: int):
     s = total_seconds - m * 60
     return h, m, s
 
-def _eta_from_progress(matched: int, total: int, builders: int):
+def _eta_from_progress(matched: int, total: int, builders: int) -> tuple[int, int, int, int, int]:
     builders = max(1, int(builders))
     total = max(0, int(total))
     matched = max(0, min(int(matched), total))
@@ -306,77 +430,24 @@ def _eta_from_progress(matched: int, total: int, builders: int):
     h, m, s = _seconds_to_hms(eta_seconds)
     return remaining, eta_seconds, h, m, s
 
-def _fmt_pct(p: float) -> str:
-    return f"{p:.1f}%"
-
-def _fmt_int(n: int) -> str:
-    return f"{n:,}"
-
-def _progress_embed(
-    *,
-    title: str,
-    box_w: int,
-    box_h: int,
-    matched: int,
-    total: int,
-    pct: float,
-    delta_matched: int | None = None,
-    delta_pct: float | None = None,
-    eta_hms: tuple[int, int, int] | None = None,
-    remaining_px: int | None = None,
-    builders: int | None = None,
-    image_filename: str = "template_progress.png",
-) -> discord.Embed:
-    embed = discord.Embed(
-        title=title,
-        description=f"**{_fmt_int(matched)}/{_fmt_int(total)}** pixels completed (**{_fmt_pct(pct)}**)",
-    )
-    if delta_matched is not None:
-        sign = "+" if delta_matched > 0 else ""
-        value = f"`{sign}{_fmt_int(delta_matched)}` pixels"
-        if delta_pct is not None:
-            ps = "+" if delta_pct > 0 else ""
-            value += f" (`{ps}{delta_pct:.2f}%`)"
-        embed.add_field(name="Recent Progress", value=value, inline=False)
-    embed.add_field(name="Region", value=f"`{box_w}×{box_h}`", inline=True)
-    if eta_hms is not None and remaining_px is not None and builders is not None:
-        h, m, s = eta_hms
-        embed.add_field(
-            name="ETA",
-            value=f"`{h}h {m}m {s}s`  ({_fmt_int(remaining_px)} px, builders={builders})",
-            inline=True
-        )
-    embed.set_footer(text=f"{COOLDOWN_SECONDS_PER_PIXEL}s per pixel charge (per builder)")
-    embed.set_image(url=f"attachment://{image_filename}")
-    return embed
-
-# -------- core: run one comparison (now accepts optional canvas_bytes) --------
 async def run_markarea_once(
     *,
-    source_channel: Optional[discord.TextChannel] = None,
-    canvas_bytes: Optional[bytes] = None,
+    source_channel: discord.TextChannel,
     template_bytes: bytes,
     coords: str,
 ):
-    """
-    Returns (png_bytes, box_w, box_h, matched, total, pct)
-    If canvas_bytes is None, pulls latest image from source_channel.
-    """
     from PIL import Image
     import aiohttp
 
     pts = parse_coords_4pairs(coords)
     (x1, y1), (x2, y2), (x3, y3), (x4, y4) = pts
 
-    # Get canvas bytes
-    if canvas_bytes is None:
-        if source_channel is None:
-            raise RuntimeError("Provide a source_channel or upload a canvas image.")
-        canvas_url = await _find_latest_image_url(source_channel)
-        if not canvas_url:
-            raise RuntimeError("No recent canvas image found in the source channel.")
-        async with aiohttp.ClientSession() as session:
-            canvas_bytes = await _download_bytes(session, canvas_url, timeout_s=30)
+    canvas_url = await _find_latest_image_url(source_channel)
+    if not canvas_url:
+        raise RuntimeError("No recent canvas image found in the source channel.")
+
+    async with aiohttp.ClientSession() as session:
+        canvas_bytes = await _download_bytes(session, canvas_url, timeout_s=30)
 
     canvas = Image.open(BytesIO(canvas_bytes)).convert("RGBA")
     tmpl = Image.open(BytesIO(template_bytes)).convert("RGBA")
@@ -384,42 +455,59 @@ async def run_markarea_once(
     CW, CH = canvas.size
     TW, TH = tmpl.size
 
-    def to_img_pt(xu: int, yu: int, H: int) -> tuple[int, int]:
-        xi = _clamp_int(xu, 0, 10**9)  # clamp later per-image
-        yi = _clamp_int((H - 1) - yu, -10**9, 10**9)
-        return xi, yi
+    def to_canvas_img_pt(xu: int, yu: int) -> tuple[int, int]:
+        xi = _clamp_int(xu, 0, CW - 1)
+        yi = _clamp_int(_user_to_image_y(yu, CH), 0, CH - 1)
+        return (xi, yi)
 
-    # Convert corners for CANVAS
-    cx1, cy1 = to_img_pt(x1, y1, CH)
-    cx2, cy2 = to_img_pt(x2, y2, CH)
-    cx3, cy3 = to_img_pt(x3, y3, CH)
-    cx4, cy4 = to_img_pt(x4, y4, CH)
-    cxs = [max(0, min(CW - 1, v)) for v in (cx1, cx2, cx3, cx4)]
-    cys = [max(0, min(CH - 1, v)) for v in (cy1, cy2, cy3, cy4)]
-    left, right = max(0, min(cxs)), min(CW, max(cxs) + 1)
-    top, bottom = max(0, min(cys)), min(CH, max(cys) + 1)
-    box_w, box_h = right - left, bottom - top
+    p1 = to_canvas_img_pt(x1, y1)
+    p2 = to_canvas_img_pt(x2, y2)
+    p3 = to_canvas_img_pt(x3, y3)
+    p4 = to_canvas_img_pt(x4, y4)
+
+    xs = [p1[0], p2[0], p3[0], p4[0]]
+    ys = [p1[1], p2[1], p3[1], p4[1]]
+
+    left = max(0, min(xs))
+    right = min(CW, max(xs) + 1)
+    top = max(0, min(ys))
+    bottom = min(CH, max(ys) + 1)
+
+    box_w = right - left
+    box_h = bottom - top
     if box_w < 2 or box_h < 2:
         raise RuntimeError("Those coordinates create a region that’s too small.")
+
     canvas_crop = canvas.crop((left, top, right, bottom))
 
-    # TEMPLATE crop
+    # Template crop rules unchanged:
     if (TW, TH) == (box_w, box_h):
         tmpl_crop = tmpl
     else:
-        tx1, ty1 = to_img_pt(x1, y1, TH)
-        tx2, ty2 = to_img_pt(x2, y2, TH)
-        tx3, ty3 = to_img_pt(x3, y3, TH)
-        tx4, ty4 = to_img_pt(x4, y4, TH)
-        txs = [max(0, min(TW - 1, v)) for v in (tx1, tx2, tx3, tx4)]
-        tys = [max(0, min(TH - 1, v)) for v in (ty1, ty2, ty3, ty4)]
-        t_left, t_right = max(0, min(txs)), min(TW, max(txs) + 1)
-        t_top, t_bottom = max(0, min(tys)), min(TH, max(tys) + 1)
+        def to_tmpl_img_pt(xu: int, yu: int) -> tuple[int, int]:
+            xi = _clamp_int(xu, 0, TW - 1)
+            yi = _clamp_int(_user_to_image_y(yu, TH), 0, TH - 1)
+            return (xi, yi)
+
+        tp1 = to_tmpl_img_pt(x1, y1)
+        tp2 = to_tmpl_img_pt(x2, y2)
+        tp3 = to_tmpl_img_pt(x3, y3)
+        tp4 = to_tmpl_img_pt(x4, y4)
+
+        txs = [tp1[0], tp2[0], tp3[0], tp4[0]]
+        tys = [tp1[1], tp2[1], tp3[1], tp4[1]]
+
+        t_left = max(0, min(txs))
+        t_right = min(TW, max(txs) + 1)
+        t_top = max(0, min(tys))
+        t_bottom = min(TH, max(tys) + 1)
+
         if (t_right - t_left) != box_w or (t_bottom - t_top) != box_h:
             raise RuntimeError(
                 "Template doesn’t cover that region. Upload a full-canvas template, "
                 "or a template exactly sized to the region."
             )
+
         tmpl_crop = tmpl.crop((t_left, t_top, t_right, t_bottom))
 
     pct, matched, total = _exact_progress_percent(canvas_crop, tmpl_crop)
@@ -428,10 +516,11 @@ async def run_markarea_once(
     out = BytesIO()
     preview.save(out, format="PNG")
     out.seek(0)
+
     return out.read(), box_w, box_h, matched, total, pct
 
 # -------------------- /ASK --------------------
-@bot.tree.command(name="ask", description="Check if something is bannable under the game rules.")
+@bot.tree.command(name="ask", description="Check if something is bannable under the game rules (not official).")
 @app_commands.describe(message="Describe what happened / what was drawn / what was said.")
 async def ask(interaction: discord.Interaction, message: str):
     if not cooldown_ok(interaction.user.id):
@@ -442,31 +531,27 @@ async def ask(interaction: discord.Interaction, message: str):
     await interaction.followup.send(embed=build_embed(safe_parse(raw)))
 
 # -------------------- /STOPMOTION --------------------
-@bot.tree.command(name="timelapse", description="Make a timelapse GIF")
+def _fit_resize(w: int, h: int, max_side: int) -> tuple[int, int]:
+    if max(w, h) <= max_side:
+        return w, h
+    if w >= h:
+        nw = max_side
+        nh = max(1, int(h * (max_side / w)))
+    else:
+        nh = max_side
+        nw = max(1, int(w * (max_side / h)))
+    return nw, nh
+
+@bot.tree.command(name="stopmotion", description="Make a stop-motion GIF from images posted in this channel in the last N hours.")
 @app_commands.describe(hours="Hours back (default 24).", fps="FPS (default 4).", max_frames="Max frames (default 60).", max_side="Max side (default 512).")
 async def stopmotion(interaction: discord.Interaction, hours: int = 24, fps: int = 4, max_frames: int = 60, max_side: int = 512):
     from PIL import Image
     import aiohttp
 
-    def _fit_resize(w: int, h: int, max_side: int) -> tuple[int, int]:
-        if max(w, h) <= max_side:
-            return w, h
-        if w >= h:
-            nw = max_side
-            nh = max(1, int(h * (max_side / w)))
-        else:
-            nh = max_side
-            nw = max(1, int(w * (max_side / h)))
-        return nw, nh
-
-    if hours < 1: hours = 1
-    if hours > 168: hours = 168
-    if fps < 1: fps = 1
-    if fps > 15: fps = 15
-    if max_frames < 1: max_frames = 1
-    if max_frames > 250: max_frames = 250
-    if max_side < 64: max_side = 64
-    if max_side > 1024: max_side = 1024
+    hours = max(1, min(168, int(hours)))
+    fps = max(1, min(15, int(fps)))
+    max_frames = max(1, min(250, int(max_frames)))
+    max_side = max(64, min(1024, int(max_side)))
 
     channel = interaction.channel
     if not isinstance(channel, (discord.TextChannel, discord.Thread)):
@@ -545,88 +630,277 @@ async def stopmotion(interaction: discord.Interaction, hours: int = 24, fps: int
         file=discord.File(fp=out, filename="stopmotion.gif")
     )
 
-# -------------------- /TEMPLATE (single run) --------------------
-@bot.tree.command(name="progress", description="Template progresser.")
+# -------------------- PRESETS COMMANDS --------------------
+def _require_db():
+    if not DATABASE_URL:
+        raise RuntimeError("DATABASE_URL is missing. Create Railway Postgres and ensure DATABASE_URL exists.")
+
+@bot.tree.command(name="preset_save", description="Save a preset (stored in Postgres so it persists).")
 @app_commands.describe(
-    source_channel="Channel with the latest canvas update image. (Optional if you upload 'canvas_image')",
-    canvas_image="Upload a canvas image directly (optional alternative to source_channel).",
-    template="Template image attachment.",
+    name="Preset name (e.g. main_template)",
+    source_channel="Channel containing latest canvas updates.",
+    template="Template image attachment to save (used later without reupload).",
     coords="(x1,y1)(x2,y2)(x3,y3)(x4,y4)",
-    builders="How many people placing pixels in parallel (default 1)."
+    builders="Default builders count for ETA (default 1).",
+    interval_minutes="Default check interval (default 12).",
+    duration_minutes="Default check duration (default 60).",
+    output_channel="Default output channel for /check (optional).",
+    ping_role="Default ping role for /check regression warning (optional)."
 )
-async def template_cmd(
+async def preset_save(
     interaction: discord.Interaction,
-    source_channel: Optional[discord.TextChannel],
-    canvas_image: Optional[discord.Attachment],
+    name: str,
+    source_channel: discord.TextChannel,
     template: discord.Attachment,
     coords: str,
-    builders: int = 1
+    builders: int = 1,
+    interval_minutes: int = 12,
+    duration_minutes: int = 60,
+    output_channel: discord.TextChannel | None = None,
+    ping_role: discord.Role | None = None,
 ):
-    # Validate attachments
+    try:
+        _require_db()
+    except Exception as e:
+        await interaction.response.send_message(f"❌ {e}", ephemeral=True)
+        return
+
+    if not name or len(name) > 32:
+        await interaction.response.send_message("Preset name must be 1–32 characters.", ephemeral=True)
+        return
+
     if not (template.content_type or "").startswith("image/"):
         await interaction.response.send_message("That template doesn’t look like an image.", ephemeral=True)
         return
-    if canvas_image and not (canvas_image.content_type or "").startswith("image/"):
-        await interaction.response.send_message("The uploaded canvas image isn’t an image file.", ephemeral=True)
-        return
-    if not source_channel and not canvas_image:
-        await interaction.response.send_message(
-            "Provide a `source_channel` **or** upload a `canvas_image`.", ephemeral=True
-        )
-        return
 
-    await interaction.response.defer(thinking=True)
+    # Validate coords format early
     try:
-        template_bytes = await template.read()
-        # If user uploaded a canvas image, use that; else pull from source channel
-        if canvas_image:
-            canvas_bytes = await canvas_image.read()
-            png_bytes, box_w, box_h, matched, total, pct = await run_markarea_once(
-                canvas_bytes=canvas_bytes,
-                template_bytes=template_bytes,
-                coords=coords,
-            )
-        else:
-            png_bytes, box_w, box_h, matched, total, pct = await run_markarea_once(
-                source_channel=source_channel,
-                template_bytes=template_bytes,
-                coords=coords,
-            )
+        parse_coords_4pairs(coords)
+    except Exception as e:
+        await interaction.response.send_message(f"❌ Invalid coords: {e}", ephemeral=True)
+        return
 
-        builders = max(1, int(builders))
-        remaining, eta_seconds, h, m, s = _eta_from_progress(matched, total, builders)
+    builders = max(1, int(builders))
+    interval_minutes = max(1, min(120, int(interval_minutes)))
+    duration_minutes = max(1, min(24 * 60, int(duration_minutes)))
 
-        embed = _progress_embed(
-            title="Progress",
-            box_w=box_w,
-            box_h=box_h,
-            matched=matched,
-            total=total,
-            pct=pct,
-            eta_hms=(h, m, s),
-            remaining_px=remaining,
-            builders=builders,
-            image_filename="template_progress.png",
+    data = {
+        "source_channel_id": int(source_channel.id),
+        "coords": coords,
+        "builders": builders,
+        "interval_minutes": interval_minutes,
+        "duration_minutes": duration_minutes,
+        "output_channel_id": int(output_channel.id) if output_channel else None,
+        "ping_role_id": int(ping_role.id) if ping_role else None,
+        "template_url": template.url,              # Discord CDN URL
+        "template_filename": template.filename,
+        "template_content_type": template.content_type or "image/*",
+    }
+
+    guild_id = interaction.guild_id or 0
+    user_id = interaction.user.id
+
+    await interaction.response.defer(thinking=True, ephemeral=True)
+    try:
+        await asyncio.to_thread(db_upsert_preset, guild_id, user_id, name, data)
+        await interaction.followup.send(
+            f"✅ Preset saved: **{name}**\n"
+            f"• Source: <#{source_channel.id}>\n"
+            f"• Builders: {builders}\n"
+            f"• Interval/Duration: {interval_minutes}m / {duration_minutes}m",
+            ephemeral=True
         )
-        file = discord.File(fp=BytesIO(png_bytes), filename="template_progress.png")
-        await interaction.followup.send(embed=embed, file=file)
+    except Exception as e:
+        await interaction.followup.send(f"❌ Failed to save preset: `{type(e).__name__}: {e}`", ephemeral=True)
 
+@bot.tree.command(name="preset_list", description="List your saved presets.")
+async def preset_list(interaction: discord.Interaction):
+    try:
+        _require_db()
+    except Exception as e:
+        await interaction.response.send_message(f"❌ {e}", ephemeral=True)
+        return
+
+    guild_id = interaction.guild_id or 0
+    user_id = interaction.user.id
+
+    await interaction.response.defer(thinking=True, ephemeral=True)
+    try:
+        rows = await asyncio.to_thread(db_list_presets, guild_id, user_id)
+        if not rows:
+            await interaction.followup.send("No presets saved yet.", ephemeral=True)
+            return
+        lines = [f"• **{n}**" for (n, _ts) in rows[:25]]
+        await interaction.followup.send("📦 **Your presets:**\n" + "\n".join(lines), ephemeral=True)
+    except Exception as e:
+        await interaction.followup.send(f"❌ Failed to list presets: `{type(e).__name__}: {e}`", ephemeral=True)
+
+@bot.tree.command(name="preset_show", description="Show what a preset contains.")
+@app_commands.describe(name="Preset name")
+async def preset_show(interaction: discord.Interaction, name: str):
+    try:
+        _require_db()
+    except Exception as e:
+        await interaction.response.send_message(f"❌ {e}", ephemeral=True)
+        return
+
+    guild_id = interaction.guild_id or 0
+    user_id = interaction.user.id
+    await interaction.response.defer(thinking=True, ephemeral=True)
+
+    try:
+        data = await asyncio.to_thread(db_get_preset, guild_id, user_id, name)
+        if not data:
+            await interaction.followup.send("Preset not found.", ephemeral=True)
+            return
+
+        msg = (
+            f"🧩 **Preset `{name}`**\n"
+            f"• Source: <#{data.get('source_channel_id')}>\n"
+            f"• Coords: `{data.get('coords')}`\n"
+            f"• Builders: `{data.get('builders')}`\n"
+            f"• Interval/Duration: `{data.get('interval_minutes')}m / {data.get('duration_minutes')}m`\n"
+            f"• Output: {f'<#{data.get('output_channel_id')}>' if data.get('output_channel_id') else '(not set)'}\n"
+            f"• Ping role: {f'<@&{data.get('ping_role_id')}>' if data.get('ping_role_id') else '(not set)'}\n"
+            f"• Template: `{data.get('template_filename')}`"
+        )
+        await interaction.followup.send(msg, ephemeral=True)
+    except Exception as e:
+        await interaction.followup.send(f"❌ Failed: `{type(e).__name__}: {e}`", ephemeral=True)
+
+@bot.tree.command(name="preset_delete", description="Delete a saved preset.")
+@app_commands.describe(name="Preset name")
+async def preset_delete(interaction: discord.Interaction, name: str):
+    try:
+        _require_db()
+    except Exception as e:
+        await interaction.response.send_message(f"❌ {e}", ephemeral=True)
+        return
+
+    guild_id = interaction.guild_id or 0
+    user_id = interaction.user.id
+
+    await interaction.response.defer(thinking=True, ephemeral=True)
+    try:
+        ok = await asyncio.to_thread(db_delete_preset, guild_id, user_id, name)
+        await interaction.followup.send("🗑️ Deleted." if ok else "Preset not found.", ephemeral=True)
+    except Exception as e:
+        await interaction.followup.send(f"❌ Failed: `{type(e).__name__}: {e}`", ephemeral=True)
+
+async def _download_template_from_url(url: str) -> bytes:
+    import aiohttp
+    async with aiohttp.ClientSession() as session:
+        return await _download_bytes(session, url, timeout_s=45)
+
+# -------------------- /TEMPLATE (single run) --------------------
+@bot.tree.command(name="progress", description="Template progresser.")
+@app_commands.describe(
+    source_channel="Channel with the latest canvas update image.",
+    template="Template image attachment.",
+    coords="(x1,y1)(x2,y2)(x3,y3)(x4,y4)",
+    builders="How many people placing pixels in parallel (default 1).",
+    preset="Optional: use a saved preset (can skip other fields)."
+)
+async def template_cmd(
+    interaction: discord.Interaction,
+    source_channel: discord.TextChannel | None = None,
+    template: discord.Attachment | None = None,
+    coords: str | None = None,
+    builders: int = 1,
+    preset: str | None = None,
+):
+    await interaction.response.defer(thinking=True)
+
+    # If preset provided, load it
+    if preset:
+        if not DATABASE_URL:
+            await interaction.followup.send("❌ Presets require DATABASE_URL (Railway Postgres).")
+            return
+        guild_id = interaction.guild_id or 0
+        user_id = interaction.user.id
+        pdata = await asyncio.to_thread(db_get_preset, guild_id, user_id, preset)
+        if not pdata:
+            await interaction.followup.send("❌ Preset not found.")
+            return
+
+        # Fill missing values from preset
+        if source_channel is None:
+            ch_id = pdata.get("source_channel_id")
+            if ch_id:
+                source_channel = interaction.guild.get_channel(int(ch_id))  # type: ignore
+        if coords is None:
+            coords = pdata.get("coords")
+        if builders == 1:
+            builders = int(pdata.get("builders") or 1)
+
+        # Template: prefer user upload, else preset template_url
+        template_bytes: bytes | None = None
+        if template and (template.content_type or "").startswith("image/"):
+            template_bytes = await template.read()
+        else:
+            turl = pdata.get("template_url")
+            if turl:
+                try:
+                    template_bytes = await _download_template_from_url(turl)
+                except Exception as e:
+                    await interaction.followup.send(f"❌ Failed to download preset template: {e}")
+                    return
+        if template_bytes is None:
+            await interaction.followup.send("❌ No template provided and preset has no template_url.")
+            return
+    else:
+        # No preset: require explicit args
+        if source_channel is None or template is None or coords is None:
+            await interaction.followup.send("❌ Provide `source_channel`, `template`, and `coords` (or use `preset`).")
+            return
+        if not (template.content_type or "").startswith("image/"):
+            await interaction.followup.send("❌ That template doesn’t look like an image.")
+            return
+        template_bytes = await template.read()
+
+    if source_channel is None or coords is None:
+        await interaction.followup.send("❌ Missing source_channel/coords after preset fill.")
+        return
+
+    try:
+        png_bytes, box_w, box_h, matched, total, pct = await run_markarea_once(
+            source_channel=source_channel,
+            template_bytes=template_bytes,  # type: ignore
+            coords=coords,
+        )
+
+        remaining, _eta_seconds, h, m, s = _eta_from_progress(matched, total, builders)
+
+        out = BytesIO(png_bytes)
+        await interaction.followup.send(
+            content=(
+                f" **Template Progress**\n"
+                f"━━━━━━━━━━━━━━━━━━\n"
+                f" **Region**: `{box_w}×{box_h}`\n"
+                f" **Pixels**: `{matched:,} / {total:,}`\n"
+                f" **Completion**: **{pct:.2f}%**\n"
+                f" **ETA**: **{h}h {m}m {s}s**  (`{remaining:,}` px, builders={max(1,int(builders))}, {COOLDOWN_SECONDS_PER_PIXEL}s/px)"
+            ),
+            file=discord.File(fp=out, filename="template_progress.png")
+        )
     except Exception as e:
         await interaction.followup.send(f"❌ /template failed: `{type(e).__name__}: {e}`")
 
-# -------------------- /CHECK (LIVE, unchanged) --------------------
+# -------------------- /CHECK (LIVE) --------------------
 _active_checks: dict[tuple[int, int], asyncio.Task] = {}
 
-@bot.tree.command(name="live_progress", description="Live template progresser: posts on every source update.")
+@bot.tree.command(name="live_progress", description="Live template progresser: repeats updates until duration ends.")
 @app_commands.describe(
     mode="start or stop",
     source_channel="Channel containing the latest canvas updates.",
     output_channel="Channel to send updates to (defaults to where you run the command).",
-    template="Template image attachment (required for start).",
-    coords="(x1,y1)(x2,y2)(x3,y3)(x4,y4) (required for start).",
+    template="Template image attachment (required for start unless using preset).",
+    coords="(x1,y1)(x2,y2)(x3,y3)(x4,y4) (required for start unless using preset).",
+    interval_minutes="How often to update (default 12).",
     duration_minutes="How long to run before auto-stopping (default 60).",
     builders="How many people placing pixels in parallel (default 1).",
-    ping_role="Role to ping if progress goes backwards (optional)."
+    ping_role="Role to ping if progress goes backwards (optional).",
+    preset="Optional: use a saved preset (can skip other fields)."
 )
 async def check(
     interaction: discord.Interaction,
@@ -635,9 +909,11 @@ async def check(
     output_channel: discord.TextChannel | None = None,
     template: discord.Attachment | None = None,
     coords: str | None = None,
+    interval_minutes: int = 12,
     duration_minutes: int = 60,
     builders: int = 1,
-    ping_role: discord.Role | None = None
+    ping_role: discord.Role | None = None,
+    preset: str | None = None,
 ):
     guild_id = interaction.guild_id or 0
     user_id = interaction.user.id
@@ -648,6 +924,7 @@ async def check(
         await interaction.response.send_message("Mode must be `start` or `stop`.", ephemeral=True)
         return
 
+    # STOP
     if mode == "stop":
         task = _active_checks.pop(key, None)
         if task and not task.done():
@@ -657,18 +934,78 @@ async def check(
             await interaction.response.send_message("No active live check running.", ephemeral=True)
         return
 
-    if source_channel is None or template is None or coords is None:
-        await interaction.response.send_message(
-            "For `mode=start`, you must provide: `source_channel`, `template`, and `coords`.",
-            ephemeral=True
-        )
-        return
-    if not (template.content_type or "").startswith("image/"):
-        await interaction.response.send_message("That template doesn’t look like an image.", ephemeral=True)
+    # START: allow preset
+    template_bytes: bytes | None = None
+
+    if preset:
+        if not DATABASE_URL:
+            await interaction.response.send_message("❌ Presets require DATABASE_URL (Railway Postgres).", ephemeral=True)
+            return
+        pdata = await asyncio.to_thread(db_get_preset, guild_id, user_id, preset)
+        if not pdata:
+            await interaction.response.send_message("❌ Preset not found.", ephemeral=True)
+            return
+
+        if source_channel is None:
+            ch_id = pdata.get("source_channel_id")
+            if ch_id:
+                source_channel = interaction.guild.get_channel(int(ch_id))  # type: ignore
+
+        if coords is None:
+            coords = pdata.get("coords")
+
+        if builders == 1:
+            builders = int(pdata.get("builders") or 1)
+
+        if output_channel is None:
+            ocid = pdata.get("output_channel_id")
+            if ocid:
+                output_channel = interaction.guild.get_channel(int(ocid))  # type: ignore
+
+        if ping_role is None:
+            prid = pdata.get("ping_role_id")
+            if prid:
+                ping_role = interaction.guild.get_role(int(prid))  # type: ignore
+
+        if interval_minutes == 12:
+            interval_minutes = int(pdata.get("interval_minutes") or 12)
+        if duration_minutes == 60:
+            duration_minutes = int(pdata.get("duration_minutes") or 60)
+
+        # Template: prefer uploaded, else preset template_url
+        if template and (template.content_type or "").startswith("image/"):
+            template_bytes = await template.read()
+        else:
+            turl = pdata.get("template_url")
+            if not turl:
+                await interaction.response.send_message("❌ Preset has no template_url. Re-save preset with a template.", ephemeral=True)
+                return
+            try:
+                template_bytes = await _download_template_from_url(turl)
+            except Exception as e:
+                await interaction.response.send_message(f"❌ Failed to download preset template: {e}", ephemeral=True)
+                return
+
+    else:
+        # No preset: require all
+        if source_channel is None or template is None or coords is None:
+            await interaction.response.send_message(
+                "For `mode=start`, provide `source_channel`, `template`, and `coords` (or use `preset`).",
+                ephemeral=True
+            )
+            return
+        if not (template.content_type or "").startswith("image/"):
+            await interaction.response.send_message("That template doesn’t look like an image.", ephemeral=True)
+            return
+        template_bytes = await template.read()
+
+    # Final validation
+    if source_channel is None or coords is None or template_bytes is None:
+        await interaction.response.send_message("❌ Missing required values (source/template/coords).", ephemeral=True)
         return
 
-    if duration_minutes < 1: duration_minutes = 1
-    if duration_minutes > 24 * 60: duration_minutes = 24 * 60
+    interval_minutes = max(1, min(120, int(interval_minutes)))
+    duration_minutes = max(1, min(24 * 60, int(duration_minutes)))
     builders = max(1, int(builders))
 
     out_ch = output_channel or interaction.channel
@@ -676,81 +1013,62 @@ async def check(
         await interaction.response.send_message("Output channel must be a normal text channel.", ephemeral=True)
         return
 
+    # cancel old
     old = _active_checks.pop(key, None)
     if old and not old.done():
         old.cancel()
 
-    template_bytes = await template.read()
-
     await interaction.response.send_message(
         f"✅ Live check started.\n"
-        f"• Watching: {source_channel.mention}\n"
+        f"• Updates: every **{interval_minutes} min**\n"
+        f"• Duration: **{duration_minutes} min**\n"
         f"• Output: {out_ch.mention}\n"
         f"• Builders: **{builders}**\n"
-        f"• Duration: **{duration_minutes} min**\n"
-        f"• Poll: **30s** (posts on every source update)\n"
-        f"• Ping role: {ping_role.mention if ping_role else 'None'}",
+        f"• Ping role: {ping_role.mention if ping_role else 'None'}"
+        + (f"\n• Preset: **{preset}**" if preset else ""),
         ephemeral=True
     )
 
     async def runner():
         end_ts = time.time() + duration_minutes * 60
-        last_marker = (None, None, None)
-        last_matched: Optional[int] = None
-        last_total: Optional[int] = None
-        last_pct: Optional[float] = None
+        last_matched: int | None = None
 
         while time.time() < end_ts:
             try:
-                marker = await _get_latest_canvas_marker(source_channel)
-                if marker != last_marker and marker[2] is not None:
-                    png_bytes, box_w, box_h, matched, total, pct = await run_markarea_once(
-                        source_channel=source_channel,
-                        template_bytes=template_bytes,
-                        coords=coords,
+                png_bytes, box_w, box_h, matched, total, pct = await run_markarea_once(
+                    source_channel=source_channel,
+                    template_bytes=template_bytes,
+                    coords=coords,
+                )
+
+                # Regression detection (pixels removed)
+                if last_matched is not None and matched < last_matched and ping_role is not None:
+                    lost = last_matched - matched
+                    await out_ch.send(
+                        f"{ping_role.mention} ⚠️ **Users may be attacking** — progress went backwards (**-{lost:,}** matched pixels)."
                     )
 
-                    delta_matched = None
-                    delta_pct = None
-                    if last_matched is not None and last_total == total and last_pct is not None:
-                        delta_matched = matched - last_matched
-                        delta_pct = pct - last_pct
-                        if ping_role is not None and delta_matched < 0:
-                            lost = -delta_matched
-                            dec_pct = (-delta_pct) if (delta_pct is not None and delta_pct < 0) else None
-                            extra = f" (**-{dec_pct:.2f}%**)" if dec_pct is not None else ""
-                            await out_ch.send(f"{ping_role.mention} ⚠️ **Users may be attacking** — progress went backwards (**-{lost:,}** pixels){extra}.")
+                last_matched = matched
 
-                    remaining, eta_seconds, h, m, s = _eta_from_progress(matched, total, builders)
+                remaining, _eta_seconds, h, m, s = _eta_from_progress(matched, total, builders)
 
-                    embed = _progress_embed(
-                        title="Progress",
-                        box_w=box_w,
-                        box_h=box_h,
-                        matched=matched,
-                        total=total,
-                        pct=pct,
-                        delta_matched=delta_matched,
-                        delta_pct=delta_pct,
-                        eta_hms=(h, m, s),
-                        remaining_px=remaining,
-                        builders=builders,
-                        image_filename="template_progress.png",
-                    )
-                    file = discord.File(fp=BytesIO(png_bytes), filename="template_progress.png")
-                    await out_ch.send(embed=embed, file=file)
+                out = BytesIO(png_bytes)
+                msg = (
+                    f" **Live Template Check**\n"
+                    f"━━━━━━━━━━━━━━━━━━\n"
+                    f" **Region**: `{box_w}×{box_h}`\n"
+                    f" **Pixels**: `{matched:,} / {total:,}`\n"
+                    f" **Completion**: **{pct:.2f}%**\n"
+                    f" **ETA**: **{h}h {m}m {s}s**  (`{remaining:,}` px, builders={builders}, {COOLDOWN_SECONDS_PER_PIXEL}s/px)"
+                )
+                await out_ch.send(content=msg, file=discord.File(fp=out, filename="template_progress.png"))
 
-                    last_marker = marker
-                    last_matched = matched
-                    last_total = total
-                    last_pct = pct
-
-                await asyncio.sleep(30)
             except asyncio.CancelledError:
                 raise
             except Exception as e:
                 await out_ch.send(f"⚠️ Live check error: `{type(e).__name__}: {e}`")
-                await asyncio.sleep(30)
+
+            await asyncio.sleep(interval_minutes * 60)
 
         await out_ch.send("✅ Live check finished (duration reached).")
 
