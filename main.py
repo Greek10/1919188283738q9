@@ -59,7 +59,7 @@ One-Month Ban:
 
 One-Week Ban:
 - Minor NSFW drawing
-- Using more than 1 account at a time
+- Using more than a 1 account at a time
 - Inappropriate display usernames (swears)
 - Large female genitalia depictions
 - Large male genitalia depictions or explicit ones (e.g. shown going into a character's mouth)
@@ -491,7 +491,6 @@ async def run_markarea_once(
 
     canvas_crop = canvas.crop((left, top, right, bottom))
 
-    # Template crop rules unchanged:
     if (TW, TH) == (box_w, box_h):
         tmpl_crop = tmpl
     else:
@@ -547,7 +546,6 @@ def _progress_embed(
     s: int,
     remaining: int,
 ) -> discord.Embed:
-    # Simple color hint
     color = discord.Color.blurple()
     if delta_matched is not None:
         if delta_matched > 0:
@@ -700,14 +698,12 @@ def _require_db():
     name="Preset name (e.g. logo1)",
     template="Template image attachment to save (used later without reupload).",
     coords="(x1,y1)(x2,y2)(x3,y3)(x4,y4)",
-    duration_minutes="Optional default duration for /live_progress (default 60)."
 )
 async def preset_save(
     interaction: discord.Interaction,
     name: str,
     template: discord.Attachment,
     coords: str,
-    duration_minutes: int = 60,
 ):
     try:
         _require_db()
@@ -729,11 +725,9 @@ async def preset_save(
         await interaction.response.send_message(f"❌ Invalid coords: {e}", ephemeral=True)
         return
 
-    duration_minutes = max(1, min(24 * 60, int(duration_minutes)))
-
+    # Only store what you want in presets
     data = {
         "coords": coords,
-        "duration_minutes": duration_minutes,
         "template_url": template.url,
         "template_filename": template.filename,
         "template_content_type": template.content_type or "image/*",
@@ -748,7 +742,6 @@ async def preset_save(
         await interaction.followup.send(
             f"✅ Preset saved: **{name}**\n"
             f"• Coords: `{coords}`\n"
-            f"• Duration default: `{duration_minutes}m`\n"
             f"• Template: `{template.filename}`",
             ephemeral=True
         )
@@ -799,7 +792,6 @@ async def preset_show(interaction: discord.Interaction, name: str):
         msg = (
             f"🧩 **Preset `{name}`**\n"
             f"• Coords: `{data.get('coords')}`\n"
-            f"• Duration default: `{data.get('duration_minutes', 60)}m`\n"
             f"• Template: `{data.get('template_filename', 'unknown')}`"
         )
         await interaction.followup.send(msg, ephemeral=True)
@@ -919,19 +911,18 @@ async def template_cmd(
     except Exception as e:
         await interaction.followup.send(f"❌ /progress failed: `{type(e).__name__}: {e}`")
 
-# -------------------- /CHECK (LIVE) — event-style polling + edits one message --------------------
+# -------------------- /LIVE_PROGRESS (infinite until stop) --------------------
 _active_checks: dict[tuple[int, int], asyncio.Task] = {}
 
-@bot.tree.command(name="live_progress", description="Live template progresser: updates ONLY when source channel posts/edits.")
+@bot.tree.command(name="live_progress", description="Live template progresser: updates ONLY when source channel posts/edits (runs until stop).")
 @app_commands.describe(
     mode="start or stop",
     source_channel="Channel containing the canvas updates (required).",
     template="Template image attachment (required unless using preset).",
     coords="(x1,y1)(x2,y2)(x3,y3)(x4,y4) (required unless using preset).",
-    duration_minutes="How long to run before auto-stopping (default 60).",
     builders="How many people placing pixels in parallel (default 1).",
     ping_role="Role to ping if progress goes backwards (optional).",
-    preset="Optional: use a saved preset (fills coords + template + optional duration)."
+    preset="Optional: use a saved preset (fills coords + template)."
 )
 async def live_progress(
     interaction: discord.Interaction,
@@ -939,7 +930,6 @@ async def live_progress(
     source_channel: discord.TextChannel | None = None,
     template: discord.Attachment | None = None,
     coords: str | None = None,
-    duration_minutes: int = 60,
     builders: int = 1,
     ping_role: discord.Role | None = None,
     preset: str | None = None,
@@ -967,8 +957,6 @@ async def live_progress(
         return
 
     builders = max(1, int(builders))
-    duration_minutes = max(1, min(24 * 60, int(duration_minutes)))
-
     template_bytes: bytes | None = None
 
     if preset:
@@ -982,10 +970,6 @@ async def live_progress(
 
         if coords is None:
             coords = pdata.get("coords")
-
-        # Only fill duration if user left it default
-        if duration_minutes == 60 and pdata.get("duration_minutes"):
-            duration_minutes = int(pdata.get("duration_minutes") or 60)
 
         if template and (template.content_type or "").startswith("image/"):
             template_bytes = await template.read()
@@ -1027,7 +1011,6 @@ async def live_progress(
     await interaction.response.send_message(
         f"✅ Live progress started.\n"
         f"• Polling source: every **{SOURCE_POLL_SECONDS}s**\n"
-        f"• Duration: **{duration_minutes} min**\n"
         f"• Builders: **{builders}**\n"
         f"• Ping role: {ping_role.mention if ping_role else 'None'}"
         + (f"\n• Preset: **{preset}**" if preset else ""),
@@ -1035,14 +1018,11 @@ async def live_progress(
     )
 
     async def runner():
-        end_ts = time.time() + duration_minutes * 60
-
         last_sig = (0, 0.0)
         last_matched: int | None = None
         last_pct: float | None = None
         status_msg: discord.Message | None = None
 
-        # initial signature (so we don't instantly “double fire”)
         try:
             last_sig = await _latest_message_signature(source_channel)
         except Exception:
@@ -1073,11 +1053,10 @@ async def live_progress(
         except Exception as e:
             await out_ch.send(f"⚠️ Live progress initial error: `{type(e).__name__}: {e}`")
 
-        while time.time() < end_ts:
+        while True:
             try:
                 sig = await _latest_message_signature(source_channel)
 
-                # Only update when newest message changed OR newest message edited
                 if sig != last_sig:
                     last_sig = sig
 
@@ -1091,7 +1070,6 @@ async def live_progress(
                     delta_pct = (pct - last_pct) if last_pct is not None else None
                     pct_decrease = (last_pct - pct) if (last_pct is not None and pct < last_pct) else None
 
-                    # Optional ping ONLY on regression
                     if delta_matched is not None and delta_matched < 0 and ping_role is not None:
                         await out_ch.send(
                             f"{ping_role.mention} ⚠️ **Users may be attacking** — progress went backwards (**{delta_matched:,}** matched pixels)."
@@ -1112,15 +1090,12 @@ async def live_progress(
                     out = BytesIO(png_bytes)
                     f = discord.File(fp=out, filename="template_progress.png")
 
-                    # Edit the existing message (fallback: send a new one if missing)
                     if status_msg is None:
                         status_msg = await out_ch.send(embed=emb, file=f)
                     else:
                         try:
-                            # Replace attachment + embed
                             await status_msg.edit(embed=emb, attachments=[], files=[f])
                         except Exception:
-                            # If edit fails (deleted/no perms), send a new message and keep going
                             status_msg = await out_ch.send(embed=emb, file=f)
 
                     last_matched = matched
@@ -1132,8 +1107,6 @@ async def live_progress(
                 await out_ch.send(f"⚠️ Live progress error: `{type(e).__name__}: {e}`")
 
             await asyncio.sleep(SOURCE_POLL_SECONDS)
-
-        await out_ch.send("✅ Live progress finished (duration reached).")
 
     task = asyncio.create_task(runner())
     _active_checks[key] = task
