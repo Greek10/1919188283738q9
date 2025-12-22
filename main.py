@@ -207,7 +207,6 @@ def build_embed(res: dict) -> discord.Embed:
 
 @bot.event
 async def on_ready():
-    # Ensure DB tables exist (does nothing if no DATABASE_URL)
     try:
         await asyncio.to_thread(db_init)
     except Exception as e:
@@ -218,9 +217,6 @@ async def on_ready():
 
 # -------------------- DB (Postgres presets) --------------------
 def _db_url_with_sslmode(url: str) -> str:
-    """
-    Railway Postgres often requires SSL. If sslmode isn't present, add sslmode=require.
-    """
     if not url:
         return url
     try:
@@ -294,9 +290,6 @@ def db_get_preset(guild_id: int, user_id: int, name: str) -> dict | None:
         conn.close()
 
 def db_list_presets(guild_id: int, user_id: int) -> list[tuple[str, str]]:
-    """
-    Returns [(name, updated_at_iso), ...]
-    """
     conn = db_connect()
     try:
         with conn.cursor() as cur:
@@ -630,34 +623,24 @@ async def stopmotion(interaction: discord.Interaction, hours: int = 24, fps: int
         file=discord.File(fp=out, filename="stopmotion.gif")
     )
 
-# -------------------- PRESETS COMMANDS --------------------
+# -------------------- PRESETS COMMANDS (SIMPLIFIED) --------------------
 def _require_db():
     if not DATABASE_URL:
         raise RuntimeError("DATABASE_URL is missing. Create Railway Postgres and ensure DATABASE_URL exists.")
 
-@bot.tree.command(name="preset_save", description="Save a preset (stored in Postgres so it persists).")
+@bot.tree.command(name="preset_save", description="Save a preset (coords + template only, stored in Postgres).")
 @app_commands.describe(
-    name="Preset name (e.g. main_template)",
-    source_channel="Channel containing latest canvas updates.",
+    name="Preset name (e.g. logo1)",
     template="Template image attachment to save (used later without reupload).",
     coords="(x1,y1)(x2,y2)(x3,y3)(x4,y4)",
-    builders="Default builders count for ETA (default 1).",
-    interval_minutes="Default check interval (default 12).",
-    duration_minutes="Default check duration (default 60).",
-    output_channel="Default output channel for /check (optional).",
-    ping_role="Default ping role for /check regression warning (optional)."
+    duration_minutes="Optional default duration for /live_progress (default 60)."
 )
 async def preset_save(
     interaction: discord.Interaction,
     name: str,
-    source_channel: discord.TextChannel,
     template: discord.Attachment,
     coords: str,
-    builders: int = 1,
-    interval_minutes: int = 12,
     duration_minutes: int = 60,
-    output_channel: discord.TextChannel | None = None,
-    ping_role: discord.Role | None = None,
 ):
     try:
         _require_db()
@@ -673,26 +656,19 @@ async def preset_save(
         await interaction.response.send_message("That template doesn’t look like an image.", ephemeral=True)
         return
 
-    # Validate coords format early
     try:
         parse_coords_4pairs(coords)
     except Exception as e:
         await interaction.response.send_message(f"❌ Invalid coords: {e}", ephemeral=True)
         return
 
-    builders = max(1, int(builders))
-    interval_minutes = max(1, min(120, int(interval_minutes)))
     duration_minutes = max(1, min(24 * 60, int(duration_minutes)))
 
+    # Only store what you want in presets
     data = {
-        "source_channel_id": int(source_channel.id),
         "coords": coords,
-        "builders": builders,
-        "interval_minutes": interval_minutes,
         "duration_minutes": duration_minutes,
-        "output_channel_id": int(output_channel.id) if output_channel else None,
-        "ping_role_id": int(ping_role.id) if ping_role else None,
-        "template_url": template.url,              # Discord CDN URL
+        "template_url": template.url,
         "template_filename": template.filename,
         "template_content_type": template.content_type or "image/*",
     }
@@ -705,9 +681,9 @@ async def preset_save(
         await asyncio.to_thread(db_upsert_preset, guild_id, user_id, name, data)
         await interaction.followup.send(
             f"✅ Preset saved: **{name}**\n"
-            f"• Source: <#{source_channel.id}>\n"
-            f"• Builders: {builders}\n"
-            f"• Interval/Duration: {interval_minutes}m / {duration_minutes}m",
+            f"• Coords: `{coords}`\n"
+            f"• Duration default: `{duration_minutes}m`\n"
+            f"• Template: `{template.filename}`",
             ephemeral=True
         )
     except Exception as e:
@@ -756,13 +732,9 @@ async def preset_show(interaction: discord.Interaction, name: str):
 
         msg = (
             f"🧩 **Preset `{name}`**\n"
-            f"• Source: <#{data.get('source_channel_id')}>\n"
             f"• Coords: `{data.get('coords')}`\n"
-            f"• Builders: `{data.get('builders')}`\n"
-            f"• Interval/Duration: `{data.get('interval_minutes')}m / {data.get('duration_minutes')}m`\n"
-            f"• Output: {f'<#{data.get('output_channel_id')}>' if data.get('output_channel_id') else '(not set)'}\n"
-            f"• Ping role: {f'<@&{data.get('ping_role_id')}>' if data.get('ping_role_id') else '(not set)'}\n"
-            f"• Template: `{data.get('template_filename')}`"
+            f"• Duration default: `{data.get('duration_minutes', 60)}m`\n"
+            f"• Template: `{data.get('template_filename', 'unknown')}`"
         )
         await interaction.followup.send(msg, ephemeral=True)
     except Exception as e:
@@ -799,7 +771,7 @@ async def _download_template_from_url(url: str) -> bytes:
     template="Template image attachment.",
     coords="(x1,y1)(x2,y2)(x3,y3)(x4,y4)",
     builders="How many people placing pixels in parallel (default 1).",
-    preset="Optional: use a saved preset (can skip other fields)."
+    preset="Optional: use a saved preset (fills coords + template)."
 )
 async def template_cmd(
     interaction: discord.Interaction,
@@ -811,7 +783,8 @@ async def template_cmd(
 ):
     await interaction.response.defer(thinking=True)
 
-    # If preset provided, load it
+    template_bytes: bytes | None = None
+
     if preset:
         if not DATABASE_URL:
             await interaction.followup.send("❌ Presets require DATABASE_URL (Railway Postgres).")
@@ -823,18 +796,10 @@ async def template_cmd(
             await interaction.followup.send("❌ Preset not found.")
             return
 
-        # Fill missing values from preset
-        if source_channel is None:
-            ch_id = pdata.get("source_channel_id")
-            if ch_id:
-                source_channel = interaction.guild.get_channel(int(ch_id))  # type: ignore
         if coords is None:
             coords = pdata.get("coords")
-        if builders == 1:
-            builders = int(pdata.get("builders") or 1)
 
-        # Template: prefer user upload, else preset template_url
-        template_bytes: bytes | None = None
+        # Template: prefer upload, else preset template_url
         if template and (template.content_type or "").startswith("image/"):
             template_bytes = await template.read()
         else:
@@ -845,27 +810,30 @@ async def template_cmd(
                 except Exception as e:
                     await interaction.followup.send(f"❌ Failed to download preset template: {e}")
                     return
+
         if template_bytes is None:
             await interaction.followup.send("❌ No template provided and preset has no template_url.")
             return
     else:
-        # No preset: require explicit args
-        if source_channel is None or template is None or coords is None:
-            await interaction.followup.send("❌ Provide `source_channel`, `template`, and `coords` (or use `preset`).")
+        if template is None or coords is None:
+            await interaction.followup.send("❌ Provide `template` and `coords` (or use `preset`).")
             return
         if not (template.content_type or "").startswith("image/"):
             await interaction.followup.send("❌ That template doesn’t look like an image.")
             return
         template_bytes = await template.read()
 
-    if source_channel is None or coords is None:
-        await interaction.followup.send("❌ Missing source_channel/coords after preset fill.")
+    if source_channel is None:
+        await interaction.followup.send("❌ You must provide `source_channel` (presets no longer store it).")
+        return
+    if coords is None:
+        await interaction.followup.send("❌ Missing coords.")
         return
 
     try:
         png_bytes, box_w, box_h, matched, total, pct = await run_markarea_once(
             source_channel=source_channel,
-            template_bytes=template_bytes,  # type: ignore
+            template_bytes=template_bytes,
             coords=coords,
         )
 
@@ -884,7 +852,7 @@ async def template_cmd(
             file=discord.File(fp=out, filename="template_progress.png")
         )
     except Exception as e:
-        await interaction.followup.send(f"❌ /template failed: `{type(e).__name__}: {e}`")
+        await interaction.followup.send(f"❌ /progress failed: `{type(e).__name__}: {e}`")
 
 # -------------------- /CHECK (LIVE) --------------------
 _active_checks: dict[tuple[int, int], asyncio.Task] = {}
@@ -892,21 +860,19 @@ _active_checks: dict[tuple[int, int], asyncio.Task] = {}
 @bot.tree.command(name="live_progress", description="Live template progresser: repeats updates until duration ends.")
 @app_commands.describe(
     mode="start or stop",
-    source_channel="Channel containing the latest canvas updates.",
-    output_channel="Channel to send updates to (defaults to where you run the command).",
-    template="Template image attachment (required for start unless using preset).",
-    coords="(x1,y1)(x2,y2)(x3,y3)(x4,y4) (required for start unless using preset).",
+    source_channel="Channel containing the latest canvas updates. (required)",
+    template="Template image attachment (required unless using preset).",
+    coords="(x1,y1)(x2,y2)(x3,y3)(x4,y4) (required unless using preset).",
     interval_minutes="How often to update (default 12).",
     duration_minutes="How long to run before auto-stopping (default 60).",
     builders="How many people placing pixels in parallel (default 1).",
     ping_role="Role to ping if progress goes backwards (optional).",
-    preset="Optional: use a saved preset (can skip other fields)."
+    preset="Optional: use a saved preset (fills coords + template + optional duration)."
 )
 async def check(
     interaction: discord.Interaction,
     mode: str,
     source_channel: discord.TextChannel | None = None,
-    output_channel: discord.TextChannel | None = None,
     template: discord.Attachment | None = None,
     coords: str | None = None,
     interval_minutes: int = 12,
@@ -924,7 +890,6 @@ async def check(
         await interaction.response.send_message("Mode must be `start` or `stop`.", ephemeral=True)
         return
 
-    # STOP
     if mode == "stop":
         task = _active_checks.pop(key, None)
         if task and not task.done():
@@ -934,7 +899,10 @@ async def check(
             await interaction.response.send_message("No active live check running.", ephemeral=True)
         return
 
-    # START: allow preset
+    if source_channel is None:
+        await interaction.response.send_message("❌ You must provide `source_channel` (presets no longer store it).", ephemeral=True)
+        return
+
     template_bytes: bytes | None = None
 
     if preset:
@@ -946,30 +914,11 @@ async def check(
             await interaction.response.send_message("❌ Preset not found.", ephemeral=True)
             return
 
-        if source_channel is None:
-            ch_id = pdata.get("source_channel_id")
-            if ch_id:
-                source_channel = interaction.guild.get_channel(int(ch_id))  # type: ignore
-
         if coords is None:
             coords = pdata.get("coords")
 
-        if builders == 1:
-            builders = int(pdata.get("builders") or 1)
-
-        if output_channel is None:
-            ocid = pdata.get("output_channel_id")
-            if ocid:
-                output_channel = interaction.guild.get_channel(int(ocid))  # type: ignore
-
-        if ping_role is None:
-            prid = pdata.get("ping_role_id")
-            if prid:
-                ping_role = interaction.guild.get_role(int(prid))  # type: ignore
-
-        if interval_minutes == 12:
-            interval_minutes = int(pdata.get("interval_minutes") or 12)
-        if duration_minutes == 60:
+        # Only fill duration if user left it default
+        if duration_minutes == 60 and pdata.get("duration_minutes"):
             duration_minutes = int(pdata.get("duration_minutes") or 60)
 
         # Template: prefer uploaded, else preset template_url
@@ -985,12 +934,10 @@ async def check(
             except Exception as e:
                 await interaction.response.send_message(f"❌ Failed to download preset template: {e}", ephemeral=True)
                 return
-
     else:
-        # No preset: require all
-        if source_channel is None or template is None or coords is None:
+        if template is None or coords is None:
             await interaction.response.send_message(
-                "For `mode=start`, provide `source_channel`, `template`, and `coords` (or use `preset`).",
+                "For `mode=start`, provide `template` and `coords` (or use `preset`).",
                 ephemeral=True
             )
             return
@@ -999,21 +946,19 @@ async def check(
             return
         template_bytes = await template.read()
 
-    # Final validation
-    if source_channel is None or coords is None or template_bytes is None:
-        await interaction.response.send_message("❌ Missing required values (source/template/coords).", ephemeral=True)
+    if coords is None or template_bytes is None:
+        await interaction.response.send_message("❌ Missing template/coords.", ephemeral=True)
         return
 
     interval_minutes = max(1, min(120, int(interval_minutes)))
     duration_minutes = max(1, min(24 * 60, int(duration_minutes)))
     builders = max(1, int(builders))
 
-    out_ch = output_channel or interaction.channel
+    out_ch = interaction.channel
     if not isinstance(out_ch, discord.TextChannel):
-        await interaction.response.send_message("Output channel must be a normal text channel.", ephemeral=True)
+        await interaction.response.send_message("This command must be used in a normal text channel.", ephemeral=True)
         return
 
-    # cancel old
     old = _active_checks.pop(key, None)
     if old and not old.done():
         old.cancel()
@@ -1022,7 +967,6 @@ async def check(
         f"✅ Live check started.\n"
         f"• Updates: every **{interval_minutes} min**\n"
         f"• Duration: **{duration_minutes} min**\n"
-        f"• Output: {out_ch.mention}\n"
         f"• Builders: **{builders}**\n"
         f"• Ping role: {ping_role.mention if ping_role else 'None'}"
         + (f"\n• Preset: **{preset}**" if preset else ""),
@@ -1041,7 +985,6 @@ async def check(
                     coords=coords,
                 )
 
-                # Regression detection (pixels removed)
                 if last_matched is not None and matched < last_matched and ping_role is not None:
                     lost = last_matched - matched
                     await out_ch.send(
