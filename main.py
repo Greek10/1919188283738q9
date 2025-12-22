@@ -628,7 +628,7 @@ def _require_db():
     if not DATABASE_URL:
         raise RuntimeError("DATABASE_URL is missing. Create Railway Postgres and ensure DATABASE_URL exists.")
 
-@bot.tree.command(name="preset_save", description="Save a preset (coords + template only, stored in Postgres).")
+@bot.tree.command(name="preset_save", description="Save a preset.")
 @app_commands.describe(
     name="Preset name (e.g. logo1)",
     template="Template image attachment to save (used later without reupload).",
