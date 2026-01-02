@@ -901,7 +901,7 @@ async def progress_cmd(
 # -------------------- /LIVE_PROGRESS (polls every 30s, posts on NEW/EDITED latest image message) --------------------
 _active_checks: dict[tuple[int, int], asyncio.Task] = {}
 
-@bot.tree.command(name="live_progress", description="Live template progresser: watches a channel and posts when the latest image message changes (checks every 30s).")
+@bot.tree.command(name="live_progress", description="Live version of progress.")
 @app_commands.describe(
     mode="start or stop",
     source_channel="Channel containing the latest canvas updates. (required)",
@@ -1076,7 +1076,7 @@ async def live_progress(
 # -------------------- /ARCHIEVED (LIVE IMAGE ARCHIVER) --------------------
 _active_archives: dict[tuple[int, int], asyncio.Task] = {}
 
-@bot.tree.command(name="archieved", description="Continuously repost the latest image from a source channel when it changes (checks every 30s).")
+@bot.tree.command(name="archieved", description="Continuously repost the latest image from a source channel.")
 @app_commands.describe(
     mode="start or stop",
     source_channel="Channel to watch for the latest image.",
