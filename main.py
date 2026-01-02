@@ -1,3 +1,24 @@
+# Discord Slash Bot (Pydroid-friendly)
+# - /ask -> OpenAI rule helper (Embed output)
+# - /stopmotion -> makes a stop-motion GIF from images in channel history
+# - /progress -> template progresser (single run) + ETA estimate
+# - /live_progress -> LIVE template progresser (event-ish polling)
+#       • polls source_channel every 30s
+#       • posts ONLY when the latest image message is NEW or EDITED
+#       • runs forever until user stops it
+#       • optional ping_role if progress goes backwards
+# - /archieved -> LIVE image archiver (same 30s polling + repost on change)
+#       • reposts the latest image from source_channel when NEW/EDITED
+#       • runs forever until user stops it
+#
+# Requirements:
+#   pip install -U discord.py pillow psycopg2-binary aiohttp
+#
+# Env vars:
+#   DISCORD_TOKEN
+#   OPENAI_API_KEY
+#   DATABASE_URL  (optional, for presets)
+
 import os
 import time
 import json
@@ -27,10 +48,8 @@ _last_used = {}
 # ETA rule (your confirmed rule)
 COOLDOWN_SECONDS_PER_PIXEL = 15
 
-# How often /live_progress polls the source channel for "new message or edited message"
-# 30 seconds = 30
-# 30 minutes = 1800
-SOURCE_POLL_SECONDS = 30
+# Poll interval for "event-ish" checks (seconds)
+POLL_SECONDS = 30
 
 # ✅ SYSTEM PROMPT (UNCHANGED)
 SYSTEM_PROMPT = r"""
@@ -59,7 +78,7 @@ One-Month Ban:
 
 One-Week Ban:
 - Minor NSFW drawing
-- Using more than a 1 account at a time
+- Using more than 1 account at a time
 - Inappropriate display usernames (swears)
 - Large female genitalia depictions
 - Large male genitalia depictions or explicit ones (e.g. shown going into a character's mouth)
@@ -165,7 +184,7 @@ def call_openai(system_prompt: str, user_prompt: str) -> str:
 async def call_openai_async(system_prompt: str, user_prompt: str) -> str:
     return await asyncio.to_thread(call_openai, system_prompt, user_prompt)
 
-# -------------------- DC BOT --------------------
+# -------------------- DISCORD BOT --------------------
 intents = discord.Intents.default()
 bot = commands.Bot(command_prefix="!", intents=intents)
 
@@ -351,18 +370,34 @@ async def _find_latest_image_url(channel: discord.TextChannel | discord.Thread) 
                 return e.thumbnail.url
     return None
 
-async def _latest_message_signature(channel: discord.TextChannel | discord.Thread) -> tuple[int, float]:
+async def _find_latest_image_with_sig(channel: discord.TextChannel | discord.Thread):
     """
-    Returns (latest_message_id, latest_message_edit_or_create_ts)
-    Used to detect: new message OR edited latest message.
+    Returns (signature, url) for the latest image in channel history.
+    Signature changes if:
+      - message id changes (new message)
+      - edited_timestamp changes (edit)
+      - image url differs
     """
-    latest = None
-    async for msg in channel.history(limit=1, oldest_first=False):
-        latest = msg
-    if not latest:
-        return (0, 0.0)
-    ts = latest.edited_at.timestamp() if latest.edited_at else latest.created_at.timestamp()
-    return (int(latest.id), float(ts))
+    async for msg in channel.history(limit=30, oldest_first=False):
+        edited = msg.edited_at.timestamp() if msg.edited_at else 0.0
+
+        # Attachments first
+        for a in msg.attachments:
+            ct = (a.content_type or "")
+            if ct.startswith("image/") and a.url:
+                sig = f"{msg.id}:{edited}:{a.url}"
+                return sig, a.url
+
+        # Then embeds
+        for e in msg.embeds:
+            if e.image and e.image.url:
+                sig = f"{msg.id}:{edited}:{e.image.url}"
+                return sig, e.image.url
+            if e.thumbnail and e.thumbnail.url:
+                sig = f"{msg.id}:{edited}:{e.thumbnail.url}"
+                return sig, e.thumbnail.url
+
+    return None, None
 
 def parse_coords_4pairs(coords: str):
     matches = re.findall(r"\(\s*(-?\d+)\s*,\s*(-?\d+)\s*\)", coords or "")
@@ -491,6 +526,7 @@ async def run_markarea_once(
 
     canvas_crop = canvas.crop((left, top, right, bottom))
 
+    # Template crop rules unchanged:
     if (TW, TH) == (box_w, box_h):
         tmpl_crop = tmpl
     else:
@@ -528,54 +564,6 @@ async def run_markarea_once(
     out.seek(0)
 
     return out.read(), box_w, box_h, matched, total, pct
-
-def _progress_embed(
-    *,
-    title: str,
-    box_w: int,
-    box_h: int,
-    matched: int,
-    total: int,
-    pct: float,
-    builders: int,
-    delta_matched: int | None,
-    delta_pct: float | None,
-    pct_decrease: float | None,
-    h: int,
-    m: int,
-    s: int,
-    remaining: int,
-) -> discord.Embed:
-    color = discord.Color.blurple()
-    if delta_matched is not None:
-        if delta_matched > 0:
-            color = discord.Color.green()
-        elif delta_matched < 0:
-            color = discord.Color.red()
-
-    e = discord.Embed(title=title, color=color)
-    e.add_field(name="Region", value=f"`{box_w}×{box_h}`", inline=True)
-    e.add_field(name="Pixels", value=f"`{matched:,} / {total:,}`", inline=True)
-    e.add_field(name="Completion", value=f"**{pct:.2f}%**", inline=True)
-
-    if delta_matched is not None and delta_pct is not None:
-        sign = "+" if delta_matched >= 0 else ""
-        signp = "+" if delta_pct >= 0 else ""
-        extra = f"{sign}{delta_matched:,} px ({signp}{delta_pct:.2f}%)"
-        e.add_field(name="Change since last update", value=extra, inline=False)
-
-    if pct_decrease is not None and pct_decrease > 0:
-        e.add_field(name="Percentage decrease", value=f"**-{pct_decrease:.2f}%**", inline=False)
-
-    e.add_field(
-        name="ETA",
-        value=f"**{h}h {m}m {s}s** (`{remaining:,}` px, builders={max(1,int(builders))}, {COOLDOWN_SECONDS_PER_PIXEL}s/px)",
-        inline=False
-    )
-
-    e.set_image(url="attachment://template_progress.png")
-    e.set_footer(text=f"Auto-updates when source channel changes • Poll: {SOURCE_POLL_SECONDS}s")
-    return e
 
 # -------------------- /ASK --------------------
 @bot.tree.command(name="ask", description="Check if something is bannable under the game rules (not official).")
@@ -697,7 +685,7 @@ def _require_db():
 @app_commands.describe(
     name="Preset name (e.g. logo1)",
     template="Template image attachment to save (used later without reupload).",
-    coords="(x1,y1)(x2,y2)(x3,y3)(x4,y4)",
+    coords="(x1,y1)(x2,y2)(x3,y3)(x4,y4)"
 )
 async def preset_save(
     interaction: discord.Interaction,
@@ -725,7 +713,6 @@ async def preset_save(
         await interaction.response.send_message(f"❌ Invalid coords: {e}", ephemeral=True)
         return
 
-    # Only store what you want in presets
     data = {
         "coords": coords,
         "template_url": template.url,
@@ -822,7 +809,7 @@ async def _download_template_from_url(url: str) -> bytes:
     async with aiohttp.ClientSession() as session:
         return await _download_bytes(session, url, timeout_s=45)
 
-# -------------------- /TEMPLATE (single run) --------------------
+# -------------------- /PROGRESS (single run) --------------------
 @bot.tree.command(name="progress", description="Template progresser.")
 @app_commands.describe(
     source_channel="Channel with the latest canvas update image.",
@@ -831,7 +818,7 @@ async def _download_template_from_url(url: str) -> bytes:
     builders="How many people placing pixels in parallel (default 1).",
     preset="Optional: use a saved preset (fills coords + template)."
 )
-async def template_cmd(
+async def progress_cmd(
     interaction: discord.Interaction,
     source_channel: discord.TextChannel | None = None,
     template: discord.Attachment | None = None,
@@ -872,8 +859,8 @@ async def template_cmd(
             await interaction.followup.send("❌ No template provided and preset has no template_url.")
             return
     else:
-        if template is None or coords is None:
-            await interaction.followup.send("❌ Provide `template` and `coords` (or use `preset`).")
+        if source_channel is None or template is None or coords is None:
+            await interaction.followup.send("❌ Provide `source_channel`, `template`, and `coords` (or use `preset`).")
             return
         if not (template.content_type or "").startswith("image/"):
             await interaction.followup.send("❌ That template doesn’t look like an image.")
@@ -881,7 +868,7 @@ async def template_cmd(
         template_bytes = await template.read()
 
     if source_channel is None:
-        await interaction.followup.send("❌ You must provide `source_channel` (presets no longer store it).")
+        await interaction.followup.send("❌ You must provide `source_channel` (presets do not store it).")
         return
     if coords is None:
         await interaction.followup.send("❌ Missing coords.")
@@ -911,13 +898,13 @@ async def template_cmd(
     except Exception as e:
         await interaction.followup.send(f"❌ /progress failed: `{type(e).__name__}: {e}`")
 
-# -------------------- /LIVE_PROGRESS (infinite until stop) --------------------
+# -------------------- /LIVE_PROGRESS (polls every 30s, posts on NEW/EDITED latest image message) --------------------
 _active_checks: dict[tuple[int, int], asyncio.Task] = {}
 
-@bot.tree.command(name="live_progress", description="Live template progresser: updates ONLY when source channel posts/edits (runs until stop).")
+@bot.tree.command(name="live_progress", description="Live template progresser: watches a channel and posts when the latest image message changes (checks every 30s).")
 @app_commands.describe(
     mode="start or stop",
-    source_channel="Channel containing the canvas updates (required).",
+    source_channel="Channel containing the latest canvas updates. (required)",
     template="Template image attachment (required unless using preset).",
     coords="(x1,y1)(x2,y2)(x3,y3)(x4,y4) (required unless using preset).",
     builders="How many people placing pixels in parallel (default 1).",
@@ -947,16 +934,15 @@ async def live_progress(
         task = _active_checks.pop(key, None)
         if task and not task.done():
             task.cancel()
-            await interaction.response.send_message("🛑 Live progress stopped.", ephemeral=True)
+            await interaction.response.send_message("🛑 /live_progress stopped.", ephemeral=True)
         else:
-            await interaction.response.send_message("No active live progress running.", ephemeral=True)
+            await interaction.response.send_message("No active /live_progress running.", ephemeral=True)
         return
 
     if source_channel is None:
-        await interaction.response.send_message("❌ You must provide `source_channel`.", ephemeral=True)
+        await interaction.response.send_message("❌ You must provide `source_channel` (presets do not store it).", ephemeral=True)
         return
 
-    builders = max(1, int(builders))
     template_bytes: bytes | None = None
 
     if preset:
@@ -999,6 +985,8 @@ async def live_progress(
         await interaction.response.send_message("❌ Missing template/coords.", ephemeral=True)
         return
 
+    builders = max(1, int(builders))
+
     out_ch = interaction.channel
     if not isinstance(out_ch, discord.TextChannel):
         await interaction.response.send_message("This command must be used in a normal text channel.", ephemeral=True)
@@ -1009,54 +997,28 @@ async def live_progress(
         old.cancel()
 
     await interaction.response.send_message(
-        f"✅ Live progress started.\n"
-        f"• Polling source: every **{SOURCE_POLL_SECONDS}s**\n"
+        f"✅ /live_progress started.\n"
+        f"• Watching: {source_channel.mention}\n"
+        f"• Poll: every **{POLL_SECONDS}s**\n"
         f"• Builders: **{builders}**\n"
         f"• Ping role: {ping_role.mention if ping_role else 'None'}"
-        + (f"\n• Preset: **{preset}**" if preset else ""),
+        + (f"\n• Preset: **{preset}**" if preset else "")
+        + "\nStop with: `/live_progress mode:stop`",
         ephemeral=True
     )
 
     async def runner():
-        last_sig = (0, 0.0)
+        last_sig: str | None = None
         last_matched: int | None = None
-        last_pct: float | None = None
-        status_msg: discord.Message | None = None
-
-        try:
-            last_sig = await _latest_message_signature(source_channel)
-        except Exception:
-            last_sig = (0, 0.0)
-
-        # First post immediately
-        try:
-            png_bytes, box_w, box_h, matched, total, pct = await run_markarea_once(
-                source_channel=source_channel,
-                template_bytes=template_bytes,
-                coords=coords,
-            )
-            remaining, _eta_seconds, h, m, s = _eta_from_progress(matched, total, builders)
-            emb = _progress_embed(
-                title="Live Template Progress",
-                box_w=box_w, box_h=box_h,
-                matched=matched, total=total, pct=pct,
-                builders=builders,
-                delta_matched=None, delta_pct=None, pct_decrease=None,
-                h=h, m=m, s=s, remaining=remaining
-            )
-            out = BytesIO(png_bytes)
-            f = discord.File(fp=out, filename="template_progress.png")
-            status_msg = await out_ch.send(embed=emb, file=f)
-
-            last_matched = matched
-            last_pct = pct
-        except Exception as e:
-            await out_ch.send(f"⚠️ Live progress initial error: `{type(e).__name__}: {e}`")
 
         while True:
             try:
-                sig = await _latest_message_signature(source_channel)
+                sig, _url = await _find_latest_image_with_sig(source_channel)
+                if not sig:
+                    await asyncio.sleep(POLL_SECONDS)
+                    continue
 
+                # Only run/post when the latest image message changed (new msg or edit)
                 if sig != last_sig:
                     last_sig = sig
 
@@ -1066,50 +1028,141 @@ async def live_progress(
                         coords=coords,
                     )
 
-                    delta_matched = (matched - last_matched) if last_matched is not None else None
-                    delta_pct = (pct - last_pct) if last_pct is not None else None
-                    pct_decrease = (last_pct - pct) if (last_pct is not None and pct < last_pct) else None
-
-                    if delta_matched is not None and delta_matched < 0 and ping_role is not None:
+                    # Regression detection (pixels removed)
+                    if last_matched is not None and matched < last_matched and ping_role is not None:
+                        lost = last_matched - matched
+                        # % decrease relative to previous matched
+                        dec_pct = (lost / last_matched * 100.0) if last_matched > 0 else 0.0
                         await out_ch.send(
-                            f"{ping_role.mention} ⚠️ **Users may be attacking** — progress went backwards (**{delta_matched:,}** matched pixels)."
+                            f"{ping_role.mention} ⚠️ **Users may be attacking** — progress went backwards "
+                            f"(**-{lost:,} px**, **-{dec_pct:.2f}%**)."
                         )
 
-                    remaining, _eta_seconds, h, m, s = _eta_from_progress(matched, total, builders)
-                    emb = _progress_embed(
-                        title="Live Template Progress",
-                        box_w=box_w, box_h=box_h,
-                        matched=matched, total=total, pct=pct,
-                        builders=builders,
-                        delta_matched=delta_matched,
-                        delta_pct=delta_pct,
-                        pct_decrease=pct_decrease,
-                        h=h, m=m, s=s, remaining=remaining
-                    )
-
-                    out = BytesIO(png_bytes)
-                    f = discord.File(fp=out, filename="template_progress.png")
-
-                    if status_msg is None:
-                        status_msg = await out_ch.send(embed=emb, file=f)
-                    else:
-                        try:
-                            await status_msg.edit(embed=emb, attachments=[], files=[f])
-                        except Exception:
-                            status_msg = await out_ch.send(embed=emb, file=f)
+                    # Progress increase info (no ping)
+                    if last_matched is not None and matched > last_matched:
+                        gained = matched - last_matched
+                        inc_pct = (gained / total * 100.0) if total > 0 else 0.0
+                        await out_ch.send(f"✅ **Progress made**: **+{gained:,} px** (**+{inc_pct:.2f}%** of template).")
 
                     last_matched = matched
-                    last_pct = pct
+
+                    remaining, _eta_seconds, h, m, s = _eta_from_progress(matched, total, builders)
+
+                    out = BytesIO(png_bytes)
+                    msg = (
+                        f" **Live Template Progress**\n"
+                        f"━━━━━━━━━━━━━━━━━━\n"
+                        f" **Region**: `{box_w}×{box_h}`\n"
+                        f" **Pixels**: `{matched:,} / {total:,}`\n"
+                        f" **Completion**: **{pct:.2f}%**\n"
+                        f" **ETA**: **{h}h {m}m {s}s**  (`{remaining:,}` px, builders={builders}, {COOLDOWN_SECONDS_PER_PIXEL}s/px)\n"
+                        f" **Source update detected** (new/edited image message)."
+                    )
+                    await out_ch.send(content=msg, file=discord.File(fp=out, filename="template_progress.png"))
 
             except asyncio.CancelledError:
                 raise
             except Exception as e:
-                await out_ch.send(f"⚠️ Live progress error: `{type(e).__name__}: {e}`")
+                try:
+                    await out_ch.send(f"⚠️ /live_progress error: `{type(e).__name__}: {e}`")
+                except Exception:
+                    pass
 
-            await asyncio.sleep(SOURCE_POLL_SECONDS)
+            await asyncio.sleep(POLL_SECONDS)
 
     task = asyncio.create_task(runner())
     _active_checks[key] = task
+
+# -------------------- /ARCHIEVED (LIVE IMAGE ARCHIVER) --------------------
+_active_archives: dict[tuple[int, int], asyncio.Task] = {}
+
+@bot.tree.command(name="archieved", description="Continuously repost the latest image from a source channel when it changes (checks every 30s).")
+@app_commands.describe(
+    mode="start or stop",
+    source_channel="Channel to watch for the latest image.",
+    output_channel="Where to post copies (defaults to where you run the command)."
+)
+async def archieved(
+    interaction: discord.Interaction,
+    mode: str,
+    source_channel: discord.TextChannel | None = None,
+    output_channel: discord.TextChannel | None = None
+):
+    guild_id = interaction.guild_id or 0
+    user_id = interaction.user.id
+    key = (guild_id, user_id)
+
+    mode = (mode or "").lower().strip()
+    if mode not in ("start", "stop"):
+        await interaction.response.send_message("Mode must be `start` or `stop`.", ephemeral=True)
+        return
+
+    # STOP
+    if mode == "stop":
+        task = _active_archives.pop(key, None)
+        if task and not task.done():
+            task.cancel()
+            await interaction.response.send_message("🛑 /archieved stopped.", ephemeral=True)
+        else:
+            await interaction.response.send_message("No active /archieved running.", ephemeral=True)
+        return
+
+    # START validation
+    if source_channel is None:
+        await interaction.response.send_message("❌ You must provide `source_channel`.", ephemeral=True)
+        return
+
+    out_ch = output_channel or interaction.channel
+    if not isinstance(out_ch, discord.TextChannel):
+        await interaction.response.send_message("Output channel must be a normal text channel.", ephemeral=True)
+        return
+
+    # cancel old if exists
+    old = _active_archives.pop(key, None)
+    if old and not old.done():
+        old.cancel()
+
+    await interaction.response.send_message(
+        f"✅ /archieved started.\n"
+        f"• Watching: {source_channel.mention}\n"
+        f"• Posting to: {out_ch.mention}\n"
+        f"• Poll: every **{POLL_SECONDS} seconds**\n"
+        f"Stop with: `/archieved mode:stop`",
+        ephemeral=True
+    )
+
+    async def runner():
+        import aiohttp
+
+        last_sig: str | None = None
+
+        while True:
+            try:
+                sig, url = await _find_latest_image_with_sig(source_channel)
+                if sig and url and sig != last_sig:
+                    last_sig = sig
+
+                    async with aiohttp.ClientSession() as session:
+                        img_bytes = await _download_bytes(session, url, timeout_s=45)
+
+                    fp = BytesIO(img_bytes)
+                    await out_ch.send(
+                        content=f"🗂️ **Archived canvas image update** (source: {source_channel.mention})",
+                        file=discord.File(fp=fp, filename="archived.png")
+                    )
+
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                try:
+                    await out_ch.send(f"⚠️ /archieved error: `{type(e).__name__}: {e}`")
+                except Exception:
+                    pass
+
+            await asyncio.sleep(POLL_SECONDS)
+
+    task = asyncio.create_task(runner())
+    _active_archives[key] = task
 
 # -------------------- START --------------------
 if __name__ == "__main__":
