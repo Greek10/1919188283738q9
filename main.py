@@ -165,7 +165,7 @@ def call_openai(system_prompt: str, user_prompt: str) -> str:
 async def call_openai_async(system_prompt: str, user_prompt: str) -> str:
     return await asyncio.to_thread(call_openai, system_prompt, user_prompt)
 
-# -------------------- DISCORD BOT --------------------
+# -------------------- DC BOT --------------------
 intents = discord.Intents.default()
 bot = commands.Bot(command_prefix="!", intents=intents)
 
