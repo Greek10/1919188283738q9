@@ -1164,6 +1164,347 @@ async def archieved(
     task = asyncio.create_task(runner())
     _active_archives[key] = task
 
+# ===================== LIVE TEXT ARCHIVER + BARCHART GIF =====================
+# Paste this near the bottom of your script (above the START section).
+# Requires: pillow (already used), no extra deps.
+
+from typing import Optional
+
+# One active text-archiver per user per guild (same pattern as live_progress)
+_active_text_archivers: dict[tuple[int, int], asyncio.Task] = {}
+
+def _msg_fingerprint(m: discord.Message) -> str:
+    # Detect edits + content changes + embed text changes
+    edited = m.edited_at.isoformat() if m.edited_at else ""
+    parts = [str(m.id), edited, (m.content or "").strip()]
+    # include embed title/desc/fields as text too (some bots edit embeds)
+    if m.embeds:
+        e = m.embeds[0]
+        parts.append((e.title or "").strip())
+        parts.append((e.description or "").strip())
+        try:
+            for f in (e.fields or []):
+                parts.append((f.name or "").strip())
+                parts.append((f.value or "").strip())
+        except Exception:
+            pass
+    return "\n".join(parts)
+
+def _extract_text_from_message(m: discord.Message) -> str:
+    """
+    Turn message content + first embed into a single text blob to parse/store.
+    """
+    chunks = []
+    if m.content and m.content.strip():
+        chunks.append(m.content.strip())
+
+    if m.embeds:
+        e = m.embeds[0]
+        if e.title:
+            chunks.append(str(e.title).strip())
+        if e.description:
+            chunks.append(str(e.description).strip())
+        try:
+            for f in (e.fields or []):
+                # "Name: Value"
+                if f.name and f.value:
+                    chunks.append(f"{str(f.name).strip()}: {str(f.value).strip()}")
+        except Exception:
+            pass
+
+    return "\n".join(chunks).strip()
+
+def parse_leaderboard(text: str) -> dict[str, int]:
+    """
+    Best-effort parser for leaderboard text.
+    Supports lines like:
+      PlayerA: 123
+      PlayerB - 456
+      PlayerC = 789
+      1) PlayerD 999
+      PlayerE 1,234
+    Returns dict{name -> value}
+    """
+    out: dict[str, int] = {}
+    if not text:
+        return out
+
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+    for ln in lines:
+        # remove common bullet/number prefixes
+        ln2 = re.sub(r"^\s*(?:[#>*\-•]+|\d+[\).:-])\s*", "", ln)
+
+        # Try "name : value" / "name - value" / "name = value"
+        m = re.match(r"^(.{1,64}?)\s*[:=\-]\s*([0-9][0-9,\.]*)\s*$", ln2)
+        if not m:
+            # Try "name value"
+            m = re.match(r"^(.{1,64}?)\s+([0-9][0-9,\.]*)\s*$", ln2)
+        if not m:
+            continue
+
+        name = m.group(1).strip()
+        val_raw = m.group(2).strip().replace(",", "")
+        # ignore decimals; treat as int
+        try:
+            val = int(float(val_raw))
+        except Exception:
+            continue
+
+        # skip very short/garbage names
+        if len(name) < 1:
+            continue
+
+        out[name] = val
+
+    return out
+
+def _pick_top(values: dict[str, int], top_n: int) -> list[tuple[str, int]]:
+    items = sorted(values.items(), key=lambda kv: kv[1], reverse=True)
+    return items[:max(1, int(top_n))]
+
+def _render_barchart_frame(
+    *,
+    title: str,
+    items: list[tuple[str, int]],
+    size: tuple[int, int] = (720, 420),
+):
+    """
+    Returns a PIL Image (RGBA). Uses default colors (keeps it simple).
+    """
+    from PIL import Image, ImageDraw, ImageFont
+
+    W, H = size
+    img = Image.new("RGBA", (W, H), (15, 16, 20, 255))
+    draw = ImageDraw.Draw(img)
+
+    # Try a default font; Pillow will fallback if missing
+    try:
+        font_title = ImageFont.truetype("DejaVuSans.ttf", 26)
+        font_label = ImageFont.truetype("DejaVuSans.ttf", 18)
+        font_small = ImageFont.truetype("DejaVuSans.ttf", 14)
+    except Exception:
+        font_title = ImageFont.load_default()
+        font_label = ImageFont.load_default()
+        font_small = ImageFont.load_default()
+
+    pad = 18
+    draw.text((pad, pad), title, font=font_title, fill=(235, 235, 245, 255))
+
+    chart_top = pad + 44
+    chart_left = pad + 160
+    chart_right = W - pad
+    chart_bottom = H - pad - 18
+
+    # Chart box
+    draw.rectangle([pad, chart_top, W - pad, chart_bottom], outline=(60, 65, 80, 255), width=2)
+
+    if not items:
+        draw.text((pad, chart_top + 20), "No parsable data in this snapshot.", font=font_label, fill=(200, 200, 210, 255))
+        return img
+
+    max_val = max(v for _, v in items) or 1
+
+    rows = len(items)
+    row_h = max(22, (chart_bottom - chart_top) // rows)
+    bar_h = max(10, row_h - 10)
+
+    for i, (name, val) in enumerate(items):
+        y = chart_top + i * row_h + 8
+        # left labels
+        draw.text((pad + 10, y - 4), name[:18], font=font_label, fill=(220, 220, 235, 255))
+
+        # bar
+        frac = val / max_val if max_val else 0
+        bw = int((chart_right - chart_left - 10) * frac)
+        x1 = chart_left
+        y1 = y
+        x2 = chart_left + bw
+        y2 = y + bar_h
+        draw.rectangle([x1, y1, x2, y2], fill=(120, 170, 255, 255))
+        draw.rectangle([x1, y1, chart_right - 10, y2], outline=(60, 65, 80, 255), width=1)
+
+        # value on right
+        draw.text((chart_right - 10 - 80, y - 4), f"{val:,}", font=font_small, fill=(235, 235, 245, 255))
+
+    return img
+
+
+@bot.tree.command(name="archived_text", description="Mirror edits as messages.")
+@app_commands.describe(
+    mode="start or stop",
+    source_channel="Channel to watch (edited leaderboard message lives here).",
+    output_channel="Where to post mirrored updates (defaults to current channel).",
+    poll_seconds="How often to check (default 30)."
+)
+async def archived_text(
+    interaction: discord.Interaction,
+    mode: str,
+    source_channel: discord.TextChannel | None = None,
+    output_channel: discord.TextChannel | None = None,
+    poll_seconds: int = 30,
+):
+    guild_id = interaction.guild_id or 0
+    user_id = interaction.user.id
+    key = (guild_id, user_id)
+
+    mode = (mode or "").lower().strip()
+    if mode not in ("start", "stop"):
+        await interaction.response.send_message("Mode must be `start` or `stop`.", ephemeral=True)
+        return
+
+    if mode == "stop":
+        task = _active_text_archivers.pop(key, None)
+        if task and not task.done():
+            task.cancel()
+            await interaction.response.send_message("🛑 archived_text stopped.", ephemeral=True)
+        else:
+            await interaction.response.send_message("No active archived_text running.", ephemeral=True)
+        return
+
+    # start
+    if source_channel is None:
+        await interaction.response.send_message("❌ Provide `source_channel`.", ephemeral=True)
+        return
+
+    out_ch = output_channel or interaction.channel
+    if not isinstance(out_ch, discord.TextChannel):
+        await interaction.response.send_message("❌ Output must be a normal text channel.", ephemeral=True)
+        return
+
+    poll_seconds = max(5, min(300, int(poll_seconds)))
+
+    # cancel old
+    old = _active_text_archivers.pop(key, None)
+    if old and not old.done():
+        old.cancel()
+
+    await interaction.response.send_message(
+        f"✅ archived_text started.\n• Watching: {source_channel.mention}\n• Posting to: {out_ch.mention}\n• Poll: {poll_seconds}s",
+        ephemeral=True
+    )
+
+    async def runner():
+        last_fp: str | None = None
+        while True:
+            try:
+                # Fetch most recent message in source
+                msgs = [m async for m in source_channel.history(limit=1, oldest_first=False)]
+                if not msgs:
+                    await asyncio.sleep(poll_seconds)
+                    continue
+
+                m = msgs[0]
+                fp = _msg_fingerprint(m)
+                if fp != last_fp:
+                    last_fp = fp
+                    txt = _extract_text_from_message(m)
+
+                    # Fancy-ish embed like your screenshot style
+                    embed = discord.Embed(
+                        title="Leaderboard Update",
+                        description=(txt[:3900] if txt else "*No text content*"),
+                    )
+                    embed.set_footer(text=f"Source: #{source_channel.name} • msg_id={m.id}" + (" • edited" if m.edited_at else ""))
+                    await out_ch.send(embed=embed)
+
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                try:
+                    await out_ch.send(f"⚠️ archived_text error: `{type(e).__name__}: {e}`")
+                except Exception:
+                    pass
+
+            await asyncio.sleep(poll_seconds)
+
+    task = asyncio.create_task(runner())
+    _active_text_archivers[key] = task
+
+
+@bot.tree.command(name="barchart", description="Make leaderboard GIF.")
+@app_commands.describe(
+    channel="Channel that contains archived leaderboard updates.",
+    hours="How far back to read (default 24).",
+    top="How many entries to show (default 10).",
+    fps="GIF FPS (default 8).",
+    max_frames="Limit frames (default 120)."
+)
+async def barchart(
+    interaction: discord.Interaction,
+    channel: discord.TextChannel,
+    hours: int = 24,
+    top: int = 10,
+    fps: int = 8,
+    max_frames: int = 120,
+):
+    from PIL import Image
+
+    hours = max(1, min(168, int(hours)))
+    top = max(3, min(25, int(top)))
+    fps = max(2, min(20, int(fps)))
+    max_frames = max(10, min(300, int(max_frames)))
+
+    await interaction.response.defer(thinking=True)
+
+    cutoff = discord.utils.utcnow() - timedelta(hours=hours)
+
+    # Pull messages (newest last)
+    snapshots: list[tuple[discord.datetime.datetime, dict[str, int]]] = []
+
+    try:
+        async for msg in channel.history(limit=2000, after=cutoff, oldest_first=True):
+            text = _extract_text_from_message(msg)
+            data = parse_leaderboard(text)
+            if data:
+                snapshots.append((msg.created_at, data))
+    except discord.Forbidden:
+        await interaction.followup.send("❌ I can’t read message history in that channel.")
+        return
+
+    if len(snapshots) < 2:
+        await interaction.followup.send("❌ Not enough parsable snapshots found (need at least 2).")
+        return
+
+    # If too many snapshots, downsample evenly
+    if len(snapshots) > max_frames:
+        step = len(snapshots) / max_frames
+        kept = []
+        idx = 0.0
+        while int(idx) < len(snapshots) and len(kept) < max_frames:
+            kept.append(snapshots[int(idx)])
+            idx += step
+        snapshots = kept
+
+    # Create frames
+    frames: list[Image.Image] = []
+    for i, (ts, data) in enumerate(snapshots):
+        items = _pick_top(data, top)
+        title = f"Leaderboard • {ts.strftime('%Y-%m-%d %H:%M:%S')}"
+        frame = _render_barchart_frame(title=title, items=items, size=(720, 420))
+        # Convert to palette for smaller GIFs
+        frames.append(frame.convert("P", palette=Image.Palette.ADAPTIVE, colors=256))
+
+    # Save GIF
+    out = BytesIO()
+    duration_ms = int(1000 / fps)
+    frames[0].save(
+        out,
+        format="GIF",
+        save_all=True,
+        append_images=frames[1:],
+        duration=duration_ms,
+        loop=0,
+        optimize=True,
+        disposal=2,
+    )
+    out.seek(0)
+
+    await interaction.followup.send(
+        content=f"🎞️ Bar chart timelapse ({len(frames)} frames, {fps} fps, last {hours}h, top {top})",
+        file=discord.File(fp=out, filename="leaderboard_timelapse.gif")
+    )
+# ===================== END LIVE TEXT ARCHIVER + BARCHART GIF =====================
+
 # -------------------- START --------------------
 if __name__ == "__main__":
     if not DISCORD_TOKEN:
