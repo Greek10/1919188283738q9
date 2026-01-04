@@ -1143,7 +1143,7 @@ async def archieved(
     task = asyncio.create_task(runner())
     _active_archives[key] = task
 
-# ===================== LIVE TEXT ARCHIVER + BARCHART GIF =====================
+# ===================== LIVE TEXT ARCHIVER + BARCHART GIF (ROBUST PARSER) =====================
 # Paste this near the bottom of your script (above the START section).
 # Requires: pillow (already used), no extra deps.
 
@@ -1156,9 +1156,9 @@ def _msg_fingerprint(m: discord.Message) -> str:
     # Detect edits + content changes + embed text changes
     edited = m.edited_at.isoformat() if m.edited_at else ""
     parts = [str(m.id), edited, (m.content or "").strip()]
-    # include embed title/desc/fields as text too (some bots edit embeds)
-    if m.embeds:
-        e = m.embeds[0]
+
+    # include ALL embed text (bots often edit embeds)
+    for e in (m.embeds or []):
         parts.append((e.title or "").strip())
         parts.append((e.description or "").strip())
         try:
@@ -1167,74 +1167,105 @@ def _msg_fingerprint(m: discord.Message) -> str:
                 parts.append((f.value or "").strip())
         except Exception:
             pass
+
     return "\n".join(parts)
 
 def _extract_text_from_message(m: discord.Message) -> str:
     """
-    Turn message content + first embed into a single text blob to parse/store.
+    Turn message content + ALL embeds into a single text blob to parse/store.
     """
     chunks = []
     if m.content and m.content.strip():
         chunks.append(m.content.strip())
 
-    if m.embeds:
-        e = m.embeds[0]
+    for e in (m.embeds or []):
         if e.title:
             chunks.append(str(e.title).strip())
         if e.description:
             chunks.append(str(e.description).strip())
         try:
             for f in (e.fields or []):
-                # "Name: Value"
-                if f.name and f.value:
-                    chunks.append(f"{str(f.name).strip()}: {str(f.value).strip()}")
+                # Keep field lines parseable
+                nm = (str(f.name).strip() if f.name else "").strip()
+                vv = (str(f.value).strip() if f.value else "").strip()
+                if nm and vv:
+                    chunks.append(f"{nm}: {vv}")
+                elif vv:
+                    chunks.append(vv)
         except Exception:
             pass
 
     return "\n".join(chunks).strip()
 
+_SPLIT_RE = re.compile(r"\s*(?:[:=]|[-–—])\s*")
+_NUM_RE = re.compile(r"-?\d[\d,]*")  # supports commas
+
+def _clean_label(s: str) -> str:
+    s = s.strip()
+    # remove list prefixes like "1." "1)" "•" "-" etc
+    s = re.sub(r"^\s*(?:\d+\s*[\.\)]\s*|[-•·]\s*)", "", s)
+    # remove common markdown / formatting
+    s = re.sub(r"[*_`~>|]", "", s).strip()
+    return s
+
+def parse_leaderboard_pairs_from_text(text: str) -> list[tuple[str, int]]:
+    """
+    Returns list of (label, value) pairs parsed from text.
+    Accepts formats like:
+      "1. User1 - 842"
+      "User2: 2,829"
+      "• User3 — `161`"
+      "**User4 - 68**"
+    """
+    if not text:
+        return []
+
+    pairs: list[tuple[str, int]] = []
+
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+
+        # remove leading numbering first
+        line_no = re.sub(r"^\s*\d+\s*[\.\)]\s*", "", line)
+
+        # split into label/value around separators
+        parts = _SPLIT_RE.split(line_no, maxsplit=1)
+        if len(parts) != 2:
+            continue
+
+        label_raw, value_raw = parts[0], parts[1]
+        label = _clean_label(label_raw)
+        if not label:
+            continue
+
+        # strip markdown from value area too
+        value_raw = re.sub(r"[*_`~>|]", "", value_raw)
+
+        m = _NUM_RE.search(value_raw)
+        if not m:
+            continue
+
+        num_str = m.group(0).replace(",", "")
+        try:
+            value = int(num_str)
+        except ValueError:
+            continue
+
+        pairs.append((label, value))
+
+    return pairs
+
 def parse_leaderboard(text: str) -> dict[str, int]:
     """
-    Best-effort parser for leaderboard text.
-    Supports lines like:
-      PlayerA: 123
-      PlayerB - 456
-      PlayerC = 789
-      1) PlayerD 999
-      PlayerE 1,234
-    Returns dict{name -> value}
+    Returns dict{name -> value} using the robust parser above.
+    If the same name appears multiple times, the LAST one wins.
     """
+    pairs = parse_leaderboard_pairs_from_text(text)
     out: dict[str, int] = {}
-    if not text:
-        return out
-
-    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
-    for ln in lines:
-        # remove common bullet/number prefixes
-        ln2 = re.sub(r"^\s*(?:[#>*\-•]+|\d+[\).:-])\s*", "", ln)
-
-        # Try "name : value" / "name - value" / "name = value"
-        m = re.match(r"^(.{1,64}?)\s*[:=\-]\s*([0-9][0-9,\.]*)\s*$", ln2)
-        if not m:
-            # Try "name value"
-            m = re.match(r"^(.{1,64}?)\s+([0-9][0-9,\.]*)\s*$", ln2)
-        if not m:
-            continue
-
-        name = m.group(1).strip()
-        val_raw = m.group(2).strip().replace(",", "")
-        # ignore decimals; treat as int
-        try:
-            val = int(float(val_raw))
-        except Exception:
-            continue
-
-        # skip very short/garbage names
-        if len(name) < 1:
-            continue
-
+    for name, val in pairs:
         out[name] = val
-
     return out
 
 def _pick_top(values: dict[str, int], top_n: int) -> list[tuple[str, int]]:
@@ -1248,7 +1279,7 @@ def _render_barchart_frame(
     size: tuple[int, int] = (720, 420),
 ):
     """
-    Returns a PIL Image (RGBA). Uses default colors (keeps it simple).
+    Returns a PIL Image (RGBA). Simple style.
     """
     from PIL import Image, ImageDraw, ImageFont
 
@@ -1256,7 +1287,6 @@ def _render_barchart_frame(
     img = Image.new("RGBA", (W, H), (15, 16, 20, 255))
     draw = ImageDraw.Draw(img)
 
-    # Try a default font; Pillow will fallback if missing
     try:
         font_title = ImageFont.truetype("DejaVuSans.ttf", 26)
         font_label = ImageFont.truetype("DejaVuSans.ttf", 18)
@@ -1274,7 +1304,6 @@ def _render_barchart_frame(
     chart_right = W - pad
     chart_bottom = H - pad - 18
 
-    # Chart box
     draw.rectangle([pad, chart_top, W - pad, chart_bottom], outline=(60, 65, 80, 255), width=2)
 
     if not items:
@@ -1289,20 +1318,19 @@ def _render_barchart_frame(
 
     for i, (name, val) in enumerate(items):
         y = chart_top + i * row_h + 8
-        # left labels
         draw.text((pad + 10, y - 4), name[:18], font=font_label, fill=(220, 220, 235, 255))
 
-        # bar
         frac = val / max_val if max_val else 0
         bw = int((chart_right - chart_left - 10) * frac)
+
         x1 = chart_left
         y1 = y
         x2 = chart_left + bw
         y2 = y + bar_h
+
         draw.rectangle([x1, y1, x2, y2], fill=(120, 170, 255, 255))
         draw.rectangle([x1, y1, chart_right - 10, y2], outline=(60, 65, 80, 255), width=1)
 
-        # value on right
         draw.text((chart_right - 10 - 80, y - 4), f"{val:,}", font=font_small, fill=(235, 235, 245, 255))
 
     return img
@@ -1340,7 +1368,6 @@ async def archived_text(
             await interaction.response.send_message("No active archived_text running.", ephemeral=True)
         return
 
-    # start
     if source_channel is None:
         await interaction.response.send_message("❌ Provide `source_channel`.", ephemeral=True)
         return
@@ -1352,7 +1379,6 @@ async def archived_text(
 
     poll_seconds = max(5, min(300, int(poll_seconds)))
 
-    # cancel old
     old = _active_text_archivers.pop(key, None)
     if old and not old.done():
         old.cancel()
@@ -1366,7 +1392,6 @@ async def archived_text(
         last_fp: str | None = None
         while True:
             try:
-                # Fetch most recent message in source
                 msgs = [m async for m in source_channel.history(limit=1, oldest_first=False)]
                 if not msgs:
                     await asyncio.sleep(poll_seconds)
@@ -1378,7 +1403,6 @@ async def archived_text(
                     last_fp = fp
                     txt = _extract_text_from_message(m)
 
-                    # Fancy-ish embed like your screenshot style
                     embed = discord.Embed(
                         title="Leaderboard Update",
                         description=(txt[:3900] if txt else "*No text content*"),
@@ -1427,11 +1451,10 @@ async def barchart(
 
     cutoff = discord.utils.utcnow() - timedelta(hours=hours)
 
-    # Pull messages (newest last)
     snapshots: list[tuple[discord.datetime.datetime, dict[str, int]]] = []
 
     try:
-        async for msg in channel.history(limit=2000, after=cutoff, oldest_first=True):
+        async for msg in channel.history(limit=3000, after=cutoff, oldest_first=True):
             text = _extract_text_from_message(msg)
             data = parse_leaderboard(text)
             if data:
@@ -1441,10 +1464,25 @@ async def barchart(
         return
 
     if len(snapshots) < 2:
-        await interaction.followup.send("❌ Not enough parsable snapshots found (need at least 2).")
+        # Helpful debug: show what it saw in the most recent message
+        last_msg = None
+        try:
+            last_msg = [m async for m in channel.history(limit=1, oldest_first=False)]
+            last_msg = last_msg[0] if last_msg else None
+        except Exception:
+            last_msg = None
+
+        if last_msg:
+            dbg_text = _extract_text_from_message(last_msg)
+            pairs = parse_leaderboard_pairs_from_text(dbg_text)
+            await interaction.followup.send(
+                "❌ Not enough parsable snapshots found (need at least 2).\n"
+                f"Debug (latest message): parsed **{len(pairs)}** pairs."
+            )
+        else:
+            await interaction.followup.send("❌ Not enough parsable snapshots found (need at least 2).")
         return
 
-    # If too many snapshots, downsample evenly
     if len(snapshots) > max_frames:
         step = len(snapshots) / max_frames
         kept = []
@@ -1454,16 +1492,13 @@ async def barchart(
             idx += step
         snapshots = kept
 
-    # Create frames
     frames: list[Image.Image] = []
-    for i, (ts, data) in enumerate(snapshots):
+    for ts, data in snapshots:
         items = _pick_top(data, top)
         title = f"Leaderboard • {ts.strftime('%Y-%m-%d %H:%M:%S')}"
         frame = _render_barchart_frame(title=title, items=items, size=(720, 420))
-        # Convert to palette for smaller GIFs
         frames.append(frame.convert("P", palette=Image.Palette.ADAPTIVE, colors=256))
 
-    # Save GIF
     out = BytesIO()
     duration_ms = int(1000 / fps)
     frames[0].save(
@@ -1482,6 +1517,7 @@ async def barchart(
         content=f"🎞️ Bar chart timelapse ({len(frames)} frames, {fps} fps, last {hours}h, top {top})",
         file=discord.File(fp=out, filename="leaderboard_timelapse.gif")
     )
+
 # ===================== END LIVE TEXT ARCHIVER + BARCHART GIF =====================
 
 # -------------------- START --------------------
