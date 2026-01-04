@@ -596,7 +596,7 @@ async def stopmotion(interaction: discord.Interaction, hours: int = 24, fps: int
 
     hours = max(1, min(168, int(hours)))
     fps = max(1, min(15, int(fps)))
-    max_frames = max(1, min(250, int(max_frames)))
+    max_frames = max(1, min(1000, int(max_frames)))
     max_side = max(64, min(1024, int(max_side)))
 
     channel = interaction.channel
