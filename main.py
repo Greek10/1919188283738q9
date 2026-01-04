@@ -1,13 +1,10 @@
 import os
 import time
-import json
 import asyncio
-import urllib.request
 from io import BytesIO
 from datetime import timedelta
 import re
 import math
-from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
 
 import discord
 from discord import app_commands
@@ -15,14 +12,6 @@ from discord.ext import commands
 
 # -------------------- CONFIG --------------------
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN", "").strip()
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
-DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
-
-MODEL = "gpt-4.1-mini"
-MAX_OUTPUT_TOKENS = 450
-
-COOLDOWN_S = 6
-_last_used = {}
 
 # ETA rule (your confirmed rule)
 COOLDOWN_SECONDS_PER_PIXEL = 15
@@ -30,296 +19,14 @@ COOLDOWN_SECONDS_PER_PIXEL = 15
 # Poll interval for "event-ish" checks (seconds)
 POLL_SECONDS = 30
 
-# ✅ SYSTEM PROMPT (UNCHANGED)
-SYSTEM_PROMPT = r"""
-You are a moderation helper for a Roblox r/place-clone game.
-You must follow Roblox TOS and the rules below.
-
-# In-game Rules (summary)
-Permanent Ban:
-- Leaking personally identifiable information ("doxxing")
-- Deploying bot accounts
-- Detailed/major NSFW drawings
-- Harassment occurring for more than a month
-- Repeated offences
-- Extremism (e.g. supporting groups like Al-Qaeda, KKK, Nazism or encouraging violence)
-- Ban evasion
-- Pedophilia/Zoophilia
-
-One-Month Ban:
-- Slurs (canvas or chat)
-- Swastikas and other offensive symbols
-- Using a macro
-- Sexual in-game talk
-- Very inappropriate display usernames (slurs)
-- Links or QR codes
-- Heavy/realistic gore
-
-One-Week Ban:
-- Minor NSFW drawing
-- Using more than 1 account at a time
-- Inappropriate display usernames (swears)
-- Large female genitalia depictions
-- Large male genitalia depictions or explicit ones (e.g. shown going into a character's mouth)
-- Breaking Roblox maturity rating (romantic themes, gambling, alcohol, drugs)
-- Impersonating other players
-
-Three-Day Ban:
-- Male genitalia depictions (upside down "T")
-- Female genitalia depictions
-- Exploits (if not caught by anti-cheat)
-
-One-Day Ban:
-- Bypassing swear words
-
-Warnings / Kicks / Under One-Day Ban:
-- "W/Sing" or giving "backshots" (chronologically warning, kick, under 1 hour ban)
-- Avatars impacting other player experiences (large avatars)
-
-Other:
-- Framing users: same duration as what they tried to frame for
-- Lying on a ban appeal: double the original ban length
-- Coordinated account usage by one person (saving pixels across multiple accounts then using them one by one):
-  One-week ban per extra account used
-- Abusing mechanics to gain unfair advantage: moderator decides duration
-- Conspiring to break rules: half or full duration of what they would have done
-
-What is NOT bannable:
-- Chat (unless it bypasses chat filter)
-- Griefing
-
-remember you MAY look into the actual roblox rules and see if the thing being described is against the rules. you MAY tell the user that and see what they think about it.
-
-# Task
-Given the user's report, decide if it breaks the rules.
-
-If you are NOT completely sure it is bannable, you MUST recommend contacting a moderator / opening a report ticket.
-If you ARE sure, do NOT include that recommendation.
-
-you MUST add onto the ban length if multiple bannable things are being mentioned. assume 1 month is 31 days.
-an example of this would be: a user mentions that a penis and swastika is being drawn, you would say 34 days (3 for pp, 31 for swastika)
-
-# settings
-if a user puts any of these at the start of the prompt then it means the following and you MUST abide by them:
-
-D: - Discord issue, see if it will warrant an in-game ban by how extreme it is. if you think it's bannable but don't know the length then just say the moderators need to define it
-
-MA: - Mod abuse issue,the user can input a ban and see if it may be mod abuse or not
-
-# Output format (STRICT)
-Return ONLY valid JSON (no markdown, no extra text) in exactly this schema:
-
-{
-  "ban_title": "string",
-  "ban_length": "string",
-  "description": "string",
-  "is_bannable": true/false,
-  "unsure": true/false,
-  "suggestion": "string",
-  "rule": "string"
-}
-""".strip()
-
-# -------------------- OPENAI --------------------
-def _extract_text_from_responses_api(json_obj: dict) -> str:
-    out = []
-    for item in json_obj.get("output", []):
-        for c in item.get("content", []):
-            if c.get("type") == "output_text":
-                out.append(c.get("text", ""))
-    return "\n".join(out).strip()
-
-def call_openai(system_prompt: str, user_prompt: str) -> str:
-    if not OPENAI_API_KEY:
-        return ""
-
-    url = "https://api.openai.com/v1/responses"
-    payload = {
-        "model": MODEL,
-        "input": [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt},
-        ],
-        "max_output_tokens": MAX_OUTPUT_TOKENS,
-    }
-
-    req = urllib.request.Request(
-        url,
-        data=json.dumps(payload).encode(),
-        headers={
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {OPENAI_API_KEY}",
-        },
-        method="POST",
-    )
-
-    try:
-        with urllib.request.urlopen(req, timeout=60) as r:
-            data = json.loads(r.read().decode())
-        return _extract_text_from_responses_api(data)
-    except Exception:
-        return ""
-
-async def call_openai_async(system_prompt: str, user_prompt: str) -> str:
-    return await asyncio.to_thread(call_openai, system_prompt, user_prompt)
-
 # -------------------- DISCORD BOT --------------------
 intents = discord.Intents.default()
 bot = commands.Bot(command_prefix="!", intents=intents)
 
-def cooldown_ok(uid: int) -> bool:
-    now = time.time()
-    if now - _last_used.get(uid, 0) < COOLDOWN_S:
-        return False
-    _last_used[uid] = now
-    return True
-
-def safe_parse(text: str) -> dict:
-    try:
-        obj = json.loads(text)
-        return {
-            "ban_title": obj.get("ban_title", "Unknown"),
-            "ban_length": obj.get("ban_length", "Unknown"),
-            "description": obj.get("description", ""),
-            "is_bannable": bool(obj.get("is_bannable", False)),
-            "unsure": bool(obj.get("unsure", False)),
-            "suggestion": obj.get("suggestion", ""),
-            "rule": obj.get("rule", ""),
-        }
-    except Exception:
-        return {
-            "ban_title": "Uncertain",
-            "ban_length": "Unknown",
-            "description": "Could not parse model output.",
-            "is_bannable": False,
-            "unsure": True,
-            "suggestion": "Please contact a moderator.",
-            "rule": "",
-        }
-
-def build_embed(res: dict) -> discord.Embed:
-    embed = discord.Embed(
-        title=f"{res['ban_title']} — {res['ban_length']}",
-        description=res["description"] or "No description provided.",
-    )
-    rule = res["rule"] or "No exact rule provided."
-    embed.add_field(name="Rule", value=rule[:900], inline=False)
-    if res["unsure"] and res["suggestion"]:
-        embed.set_footer(text=res["suggestion"][:2048])
-    return embed
-
 @bot.event
 async def on_ready():
-    try:
-        await asyncio.to_thread(db_init)
-    except Exception as e:
-        print("⚠️ DB init failed:", e)
-
     await bot.tree.sync()
     print(f"✅ Logged in as {bot.user}")
-
-# -------------------- DB (Postgres presets) --------------------
-def _db_url_with_sslmode(url: str) -> str:
-    if not url:
-        return url
-    try:
-        p = urlparse(url)
-        q = parse_qs(p.query)
-        if "sslmode" not in q:
-            q["sslmode"] = ["require"]
-            new_query = urlencode(q, doseq=True)
-            p = p._replace(query=new_query)
-            return urlunparse(p)
-        return url
-    except Exception:
-        return url
-
-def db_connect():
-    if not DATABASE_URL:
-        raise RuntimeError("DATABASE_URL is not set (Railway Postgres not configured).")
-    import psycopg2
-    return psycopg2.connect(_db_url_with_sslmode(DATABASE_URL))
-
-def db_init():
-    if not DATABASE_URL:
-        return
-    conn = db_connect()
-    try:
-        with conn:
-            with conn.cursor() as cur:
-                cur.execute("""
-                CREATE TABLE IF NOT EXISTS bot_presets (
-                    guild_id BIGINT NOT NULL,
-                    user_id  BIGINT NOT NULL,
-                    name     TEXT   NOT NULL,
-                    data     JSONB  NOT NULL,
-                    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                    PRIMARY KEY (guild_id, user_id, name)
-                );
-                """)
-    finally:
-        conn.close()
-
-def db_upsert_preset(guild_id: int, user_id: int, name: str, data: dict):
-    conn = db_connect()
-    try:
-        with conn:
-            with conn.cursor() as cur:
-                cur.execute(
-                    """
-                    INSERT INTO bot_presets (guild_id, user_id, name, data)
-                    VALUES (%s, %s, %s, %s::jsonb)
-                    ON CONFLICT (guild_id, user_id, name)
-                    DO UPDATE SET data = EXCLUDED.data, updated_at = NOW();
-                    """,
-                    (guild_id, user_id, name, json.dumps(data)),
-                )
-    finally:
-        conn.close()
-
-def db_get_preset(guild_id: int, user_id: int, name: str) -> dict | None:
-    conn = db_connect()
-    try:
-        with conn.cursor() as cur:
-            cur.execute(
-                "SELECT data FROM bot_presets WHERE guild_id=%s AND user_id=%s AND name=%s;",
-                (guild_id, user_id, name),
-            )
-            row = cur.fetchone()
-            if not row:
-                return None
-            return row[0]
-    finally:
-        conn.close()
-
-def db_list_presets(guild_id: int, user_id: int) -> list[tuple[str, str]]:
-    conn = db_connect()
-    try:
-        with conn.cursor() as cur:
-            cur.execute(
-                "SELECT name, updated_at FROM bot_presets WHERE guild_id=%s AND user_id=%s ORDER BY updated_at DESC;",
-                (guild_id, user_id),
-            )
-            rows = cur.fetchall() or []
-            out = []
-            for n, ts in rows:
-                out.append((str(n), ts.isoformat() if ts else ""))
-            return out
-    finally:
-        conn.close()
-
-def db_delete_preset(guild_id: int, user_id: int, name: str) -> bool:
-    conn = db_connect()
-    try:
-        with conn:
-            with conn.cursor() as cur:
-                cur.execute(
-                    "DELETE FROM bot_presets WHERE guild_id=%s AND user_id=%s AND name=%s;",
-                    (guild_id, user_id, name),
-                )
-                return cur.rowcount > 0
-    finally:
-        conn.close()
 
 # -------------------- COMMON HELPERS --------------------
 async def _download_bytes(session, url: str, timeout_s: int = 30) -> bytes:
@@ -360,14 +67,12 @@ async def _find_latest_image_with_sig(channel: discord.TextChannel | discord.Thr
     async for msg in channel.history(limit=30, oldest_first=False):
         edited = msg.edited_at.timestamp() if msg.edited_at else 0.0
 
-        # Attachments first
         for a in msg.attachments:
             ct = (a.content_type or "")
             if ct.startswith("image/") and a.url:
                 sig = f"{msg.id}:{edited}:{a.url}"
                 return sig, a.url
 
-        # Then embeds
         for e in msg.embeds:
             if e.image and e.image.url:
                 sig = f"{msg.id}:{edited}:{e.image.url}"
@@ -486,6 +191,7 @@ async def run_markarea_once(
         return (xi, yi)
 
     p1 = to_canvas_img_pt(x1, y1)
+    p2 = to_canvas_img_pt(x2, y1)  # note: coords are arbitrary; using pairs below
     p2 = to_canvas_img_pt(x2, y2)
     p3 = to_canvas_img_pt(x3, y3)
     p4 = to_canvas_img_pt(x4, y4)
@@ -505,7 +211,7 @@ async def run_markarea_once(
 
     canvas_crop = canvas.crop((left, top, right, bottom))
 
-    # Template crop rules unchanged:
+    # Template crop rules:
     if (TW, TH) == (box_w, box_h):
         tmpl_crop = tmpl
     else:
@@ -543,17 +249,6 @@ async def run_markarea_once(
     out.seek(0)
 
     return out.read(), box_w, box_h, matched, total, pct
-
-# -------------------- /ASK --------------------
-@bot.tree.command(name="ask", description="Check if something is bannable under the game rules (not official).")
-@app_commands.describe(message="Describe what happened / what was drawn / what was said.")
-async def ask(interaction: discord.Interaction, message: str):
-    if not cooldown_ok(interaction.user.id):
-        await interaction.response.send_message("⏳ Cooldown active.", ephemeral=True)
-        return
-    await interaction.response.defer(thinking=True)
-    raw = await call_openai_async(SYSTEM_PROMPT, message)
-    await interaction.followup.send(embed=build_embed(safe_parse(raw)))
 
 # -------------------- /STOPMOTION --------------------
 def _fit_resize(w: int, h: int, max_side: int) -> tuple[int, int]:
@@ -655,203 +350,34 @@ async def stopmotion(interaction: discord.Interaction, hours: int = 24, fps: int
         file=discord.File(fp=out, filename="stopmotion.gif")
     )
 
-# -------------------- PRESETS COMMANDS (SIMPLIFIED) --------------------
-def _require_db():
-    if not DATABASE_URL:
-        raise RuntimeError("DATABASE_URL is missing. Create Railway Postgres and ensure DATABASE_URL exists.")
-
-@bot.tree.command(name="preset_save", description="Save a preset.")
-@app_commands.describe(
-    name="Preset name (e.g. logo1)",
-    template="Template image attachment to save (used later without reupload).",
-    coords="(x1,y1)(x2,y2)(x3,y3)(x4,y4)"
-)
-async def preset_save(
-    interaction: discord.Interaction,
-    name: str,
-    template: discord.Attachment,
-    coords: str,
-):
-    try:
-        _require_db()
-    except Exception as e:
-        await interaction.response.send_message(f"❌ {e}", ephemeral=True)
-        return
-
-    if not name or len(name) > 32:
-        await interaction.response.send_message("Preset name must be 1–32 characters.", ephemeral=True)
-        return
-
-    if not (template.content_type or "").startswith("image/"):
-        await interaction.response.send_message("That template doesn’t look like an image.", ephemeral=True)
-        return
-
-    try:
-        parse_coords_4pairs(coords)
-    except Exception as e:
-        await interaction.response.send_message(f"❌ Invalid coords: {e}", ephemeral=True)
-        return
-
-    data = {
-        "coords": coords,
-        "template_url": template.url,
-        "template_filename": template.filename,
-        "template_content_type": template.content_type or "image/*",
-    }
-
-    guild_id = interaction.guild_id or 0
-    user_id = interaction.user.id
-
-    await interaction.response.defer(thinking=True, ephemeral=True)
-    try:
-        await asyncio.to_thread(db_upsert_preset, guild_id, user_id, name, data)
-        await interaction.followup.send(
-            f"✅ Preset saved: **{name}**\n"
-            f"• Coords: `{coords}`\n"
-            f"• Template: `{template.filename}`",
-            ephemeral=True
-        )
-    except Exception as e:
-        await interaction.followup.send(f"❌ Failed to save preset: `{type(e).__name__}: {e}`", ephemeral=True)
-
-@bot.tree.command(name="preset_list", description="List your saved presets.")
-async def preset_list(interaction: discord.Interaction):
-    try:
-        _require_db()
-    except Exception as e:
-        await interaction.response.send_message(f"❌ {e}", ephemeral=True)
-        return
-
-    guild_id = interaction.guild_id or 0
-    user_id = interaction.user.id
-
-    await interaction.response.defer(thinking=True, ephemeral=True)
-    try:
-        rows = await asyncio.to_thread(db_list_presets, guild_id, user_id)
-        if not rows:
-            await interaction.followup.send("No presets saved yet.", ephemeral=True)
-            return
-        lines = [f"• **{n}**" for (n, _ts) in rows[:25]]
-        await interaction.followup.send("📦 **Your presets:**\n" + "\n".join(lines), ephemeral=True)
-    except Exception as e:
-        await interaction.followup.send(f"❌ Failed to list presets: `{type(e).__name__}: {e}`", ephemeral=True)
-
-@bot.tree.command(name="preset_show", description="Show what a preset contains.")
-@app_commands.describe(name="Preset name")
-async def preset_show(interaction: discord.Interaction, name: str):
-    try:
-        _require_db()
-    except Exception as e:
-        await interaction.response.send_message(f"❌ {e}", ephemeral=True)
-        return
-
-    guild_id = interaction.guild_id or 0
-    user_id = interaction.user.id
-    await interaction.response.defer(thinking=True, ephemeral=True)
-
-    try:
-        data = await asyncio.to_thread(db_get_preset, guild_id, user_id, name)
-        if not data:
-            await interaction.followup.send("Preset not found.", ephemeral=True)
-            return
-
-        msg = (
-            f"🧩 **Preset `{name}`**\n"
-            f"• Coords: `{data.get('coords')}`\n"
-            f"• Template: `{data.get('template_filename', 'unknown')}`"
-        )
-        await interaction.followup.send(msg, ephemeral=True)
-    except Exception as e:
-        await interaction.followup.send(f"❌ Failed: `{type(e).__name__}: {e}`", ephemeral=True)
-
-@bot.tree.command(name="preset_delete", description="Delete a saved preset.")
-@app_commands.describe(name="Preset name")
-async def preset_delete(interaction: discord.Interaction, name: str):
-    try:
-        _require_db()
-    except Exception as e:
-        await interaction.response.send_message(f"❌ {e}", ephemeral=True)
-        return
-
-    guild_id = interaction.guild_id or 0
-    user_id = interaction.user.id
-
-    await interaction.response.defer(thinking=True, ephemeral=True)
-    try:
-        ok = await asyncio.to_thread(db_delete_preset, guild_id, user_id, name)
-        await interaction.followup.send("🗑️ Deleted." if ok else "Preset not found.", ephemeral=True)
-    except Exception as e:
-        await interaction.followup.send(f"❌ Failed: `{type(e).__name__}: {e}`", ephemeral=True)
-
-async def _download_template_from_url(url: str) -> bytes:
-    import aiohttp
-    async with aiohttp.ClientSession() as session:
-        return await _download_bytes(session, url, timeout_s=45)
-
 # -------------------- /PROGRESS (single run) --------------------
 @bot.tree.command(name="progress", description="Template progresser.")
 @app_commands.describe(
     source_channel="Channel with the latest canvas update image.",
     template="Template image attachment.",
     coords="(x1,y1)(x2,y2)(x3,y3)(x4,y4)",
-    builders="How many people placing pixels in parallel (default 1).",
-    preset="Optional: use a saved preset (fills coords + template)."
+    builders="How many people placing pixels in parallel (default 1)."
 )
 async def progress_cmd(
     interaction: discord.Interaction,
-    source_channel: discord.TextChannel | None = None,
-    template: discord.Attachment | None = None,
-    coords: str | None = None,
+    source_channel: discord.TextChannel,
+    template: discord.Attachment,
+    coords: str,
     builders: int = 1,
-    preset: str | None = None,
 ):
     await interaction.response.defer(thinking=True)
 
-    template_bytes: bytes | None = None
-
-    if preset:
-        if not DATABASE_URL:
-            await interaction.followup.send("❌ Presets require DATABASE_URL (Railway Postgres).")
-            return
-        guild_id = interaction.guild_id or 0
-        user_id = interaction.user.id
-        pdata = await asyncio.to_thread(db_get_preset, guild_id, user_id, preset)
-        if not pdata:
-            await interaction.followup.send("❌ Preset not found.")
-            return
-
-        if coords is None:
-            coords = pdata.get("coords")
-
-        if template and (template.content_type or "").startswith("image/"):
-            template_bytes = await template.read()
-        else:
-            turl = pdata.get("template_url")
-            if turl:
-                try:
-                    template_bytes = await _download_template_from_url(turl)
-                except Exception as e:
-                    await interaction.followup.send(f"❌ Failed to download preset template: {e}")
-                    return
-
-        if template_bytes is None:
-            await interaction.followup.send("❌ No template provided and preset has no template_url.")
-            return
-    else:
-        if source_channel is None or template is None or coords is None:
-            await interaction.followup.send("❌ Provide `source_channel`, `template`, and `coords` (or use `preset`).")
-            return
-        if not (template.content_type or "").startswith("image/"):
-            await interaction.followup.send("❌ That template doesn’t look like an image.")
-            return
-        template_bytes = await template.read()
-
-    if source_channel is None:
-        await interaction.followup.send("❌ You must provide `source_channel` (presets do not store it).")
+    if not (template.content_type or "").startswith("image/"):
+        await interaction.followup.send("❌ That template doesn’t look like an image.")
         return
-    if coords is None:
-        await interaction.followup.send("❌ Missing coords.")
+
+    try:
+        parse_coords_4pairs(coords)
+    except Exception as e:
+        await interaction.followup.send(f"❌ Invalid coords: {e}")
         return
+
+    template_bytes = await template.read()
 
     try:
         png_bytes, box_w, box_h, matched, total, pct = await run_markarea_once(
@@ -884,11 +410,10 @@ _active_checks: dict[tuple[int, int], asyncio.Task] = {}
 @app_commands.describe(
     mode="start or stop",
     source_channel="Channel containing the latest canvas updates. (required)",
-    template="Template image attachment (required unless using preset).",
-    coords="(x1,y1)(x2,y2)(x3,y3)(x4,y4) (required unless using preset).",
+    template="Template image attachment (required).",
+    coords="(x1,y1)(x2,y2)(x3,y3)(x4,y4) (required).",
     builders="How many people placing pixels in parallel (default 1).",
-    ping_role="Role to ping if progress goes backwards (optional).",
-    preset="Optional: use a saved preset (fills coords + template)."
+    ping_role="Role to ping if progress goes backwards (optional)."
 )
 async def live_progress(
     interaction: discord.Interaction,
@@ -898,7 +423,6 @@ async def live_progress(
     coords: str | None = None,
     builders: int = 1,
     ping_role: discord.Role | None = None,
-    preset: str | None = None,
 ):
     guild_id = interaction.guild_id or 0
     user_id = interaction.user.id
@@ -918,52 +442,21 @@ async def live_progress(
             await interaction.response.send_message("No active /live_progress running.", ephemeral=True)
         return
 
-    if source_channel is None:
-        await interaction.response.send_message("❌ You must provide `source_channel` (presets do not store it).", ephemeral=True)
+    if source_channel is None or template is None or coords is None:
+        await interaction.response.send_message("❌ Provide `source_channel`, `template`, and `coords`.", ephemeral=True)
         return
 
-    template_bytes: bytes | None = None
-
-    if preset:
-        if not DATABASE_URL:
-            await interaction.response.send_message("❌ Presets require DATABASE_URL (Railway Postgres).", ephemeral=True)
-            return
-        pdata = await asyncio.to_thread(db_get_preset, guild_id, user_id, preset)
-        if not pdata:
-            await interaction.response.send_message("❌ Preset not found.", ephemeral=True)
-            return
-
-        if coords is None:
-            coords = pdata.get("coords")
-
-        if template and (template.content_type or "").startswith("image/"):
-            template_bytes = await template.read()
-        else:
-            turl = pdata.get("template_url")
-            if not turl:
-                await interaction.response.send_message("❌ Preset has no template_url. Re-save preset with a template.", ephemeral=True)
-                return
-            try:
-                template_bytes = await _download_template_from_url(turl)
-            except Exception as e:
-                await interaction.response.send_message(f"❌ Failed to download preset template: {e}", ephemeral=True)
-                return
-    else:
-        if template is None or coords is None:
-            await interaction.response.send_message(
-                "For `mode=start`, provide `template` and `coords` (or use `preset`).",
-                ephemeral=True
-            )
-            return
-        if not (template.content_type or "").startswith("image/"):
-            await interaction.response.send_message("That template doesn’t look like an image.", ephemeral=True)
-            return
-        template_bytes = await template.read()
-
-    if coords is None or template_bytes is None:
-        await interaction.response.send_message("❌ Missing template/coords.", ephemeral=True)
+    if not (template.content_type or "").startswith("image/"):
+        await interaction.response.send_message("❌ That template doesn’t look like an image.", ephemeral=True)
         return
 
+    try:
+        parse_coords_4pairs(coords)
+    except Exception as e:
+        await interaction.response.send_message(f"❌ Invalid coords: {e}", ephemeral=True)
+        return
+
+    template_bytes = await template.read()
     builders = max(1, int(builders))
 
     out_ch = interaction.channel
@@ -980,9 +473,8 @@ async def live_progress(
         f"• Watching: {source_channel.mention}\n"
         f"• Poll: every **{POLL_SECONDS}s**\n"
         f"• Builders: **{builders}**\n"
-        f"• Ping role: {ping_role.mention if ping_role else 'None'}"
-        + (f"\n• Preset: **{preset}**" if preset else "")
-        + "\nStop with: `/live_progress mode:stop`",
+        f"• Ping role: {ping_role.mention if ping_role else 'None'}\n"
+        f"Stop with: `/live_progress mode:stop`",
         ephemeral=True
     )
 
@@ -997,7 +489,6 @@ async def live_progress(
                     await asyncio.sleep(POLL_SECONDS)
                     continue
 
-                # Only run/post when the latest image message changed (new msg or edit)
                 if sig != last_sig:
                     last_sig = sig
 
@@ -1007,17 +498,14 @@ async def live_progress(
                         coords=coords,
                     )
 
-                    # Regression detection (pixels removed)
                     if last_matched is not None and matched < last_matched and ping_role is not None:
                         lost = last_matched - matched
-                        # % decrease relative to previous matched
                         dec_pct = (lost / last_matched * 100.0) if last_matched > 0 else 0.0
                         await out_ch.send(
                             f"{ping_role.mention} ⚠️ **Users may be attacking** — progress went backwards "
                             f"(**-{lost:,} px**, **-{dec_pct:.2f}%**)."
                         )
 
-                    # Progress increase info (no ping)
                     if last_matched is not None and matched > last_matched:
                         gained = matched - last_matched
                         inc_pct = (gained / total * 100.0) if total > 0 else 0.0
@@ -1076,7 +564,6 @@ async def archieved(
         await interaction.response.send_message("Mode must be `start` or `stop`.", ephemeral=True)
         return
 
-    # STOP
     if mode == "stop":
         task = _active_archives.pop(key, None)
         if task and not task.done():
@@ -1086,7 +573,6 @@ async def archieved(
             await interaction.response.send_message("No active /archieved running.", ephemeral=True)
         return
 
-    # START validation
     if source_channel is None:
         await interaction.response.send_message("❌ You must provide `source_channel`.", ephemeral=True)
         return
@@ -1096,7 +582,6 @@ async def archieved(
         await interaction.response.send_message("Output channel must be a normal text channel.", ephemeral=True)
         return
 
-    # cancel old if exists
     old = _active_archives.pop(key, None)
     if old and not old.done():
         old.cancel()
@@ -1143,22 +628,14 @@ async def archieved(
     task = asyncio.create_task(runner())
     _active_archives[key] = task
 
-# ===================== LIVE TEXT ARCHIVER + BARCHART GIF (ROBUST PARSER) =====================
-# Paste this near the bottom of your script (above the START section).
-# Requires: pillow (already used), no extra deps.
-
-from typing import Optional
-
-# One active text-archiver per user per guild (same pattern as live_progress)
+# ===================== LIVE TEXT ARCHIVER + BARCHART GIF =====================
 _active_text_archivers: dict[tuple[int, int], asyncio.Task] = {}
 
 def _msg_fingerprint(m: discord.Message) -> str:
-    # Detect edits + content changes + embed text changes
     edited = m.edited_at.isoformat() if m.edited_at else ""
     parts = [str(m.id), edited, (m.content or "").strip()]
-
-    # include ALL embed text (bots often edit embeds)
-    for e in (m.embeds or []):
+    if m.embeds:
+        e = m.embeds[0]
         parts.append((e.title or "").strip())
         parts.append((e.description or "").strip())
         try:
@@ -1167,105 +644,55 @@ def _msg_fingerprint(m: discord.Message) -> str:
                 parts.append((f.value or "").strip())
         except Exception:
             pass
-
     return "\n".join(parts)
 
 def _extract_text_from_message(m: discord.Message) -> str:
-    """
-    Turn message content + ALL embeds into a single text blob to parse/store.
-    """
     chunks = []
     if m.content and m.content.strip():
         chunks.append(m.content.strip())
 
-    for e in (m.embeds or []):
+    if m.embeds:
+        e = m.embeds[0]
         if e.title:
             chunks.append(str(e.title).strip())
         if e.description:
             chunks.append(str(e.description).strip())
         try:
             for f in (e.fields or []):
-                # Keep field lines parseable
-                nm = (str(f.name).strip() if f.name else "").strip()
-                vv = (str(f.value).strip() if f.value else "").strip()
-                if nm and vv:
-                    chunks.append(f"{nm}: {vv}")
-                elif vv:
-                    chunks.append(vv)
+                if f.name and f.value:
+                    chunks.append(f"{str(f.name).strip()}: {str(f.value).strip()}")
         except Exception:
             pass
 
     return "\n".join(chunks).strip()
 
-_SPLIT_RE = re.compile(r"\s*(?:[:=]|[-–—])\s*")
-_NUM_RE = re.compile(r"-?\d[\d,]*")  # supports commas
-
-def _clean_label(s: str) -> str:
-    s = s.strip()
-    # remove list prefixes like "1." "1)" "•" "-" etc
-    s = re.sub(r"^\s*(?:\d+\s*[\.\)]\s*|[-•·]\s*)", "", s)
-    # remove common markdown / formatting
-    s = re.sub(r"[*_`~>|]", "", s).strip()
-    return s
-
-def parse_leaderboard_pairs_from_text(text: str) -> list[tuple[str, int]]:
-    """
-    Returns list of (label, value) pairs parsed from text.
-    Accepts formats like:
-      "1. User1 - 842"
-      "User2: 2,829"
-      "• User3 — `161`"
-      "**User4 - 68**"
-    """
+def parse_leaderboard(text: str) -> dict[str, int]:
+    out: dict[str, int] = {}
     if not text:
-        return []
+        return out
 
-    pairs: list[tuple[str, int]] = []
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+    for ln in lines:
+        ln2 = re.sub(r"^\s*(?:[#>*\-•]+|\d+[\).:-])\s*", "", ln)
 
-    for raw_line in text.splitlines():
-        line = raw_line.strip()
-        if not line:
-            continue
-
-        # remove leading numbering first
-        line_no = re.sub(r"^\s*\d+\s*[\.\)]\s*", "", line)
-
-        # split into label/value around separators
-        parts = _SPLIT_RE.split(line_no, maxsplit=1)
-        if len(parts) != 2:
-            continue
-
-        label_raw, value_raw = parts[0], parts[1]
-        label = _clean_label(label_raw)
-        if not label:
-            continue
-
-        # strip markdown from value area too
-        value_raw = re.sub(r"[*_`~>|]", "", value_raw)
-
-        m = _NUM_RE.search(value_raw)
+        m = re.match(r"^(.{1,64}?)\s*[:=\-]\s*([0-9][0-9,\.]*)\s*$", ln2)
+        if not m:
+            m = re.match(r"^(.{1,64}?)\s+([0-9][0-9,\.]*)\s*$", ln2)
         if not m:
             continue
 
-        num_str = m.group(0).replace(",", "")
+        name = m.group(1).strip()
+        val_raw = m.group(2).strip().replace(",", "")
         try:
-            value = int(num_str)
-        except ValueError:
+            val = int(float(val_raw))
+        except Exception:
             continue
 
-        pairs.append((label, value))
+        if len(name) < 1:
+            continue
 
-    return pairs
-
-def parse_leaderboard(text: str) -> dict[str, int]:
-    """
-    Returns dict{name -> value} using the robust parser above.
-    If the same name appears multiple times, the LAST one wins.
-    """
-    pairs = parse_leaderboard_pairs_from_text(text)
-    out: dict[str, int] = {}
-    for name, val in pairs:
         out[name] = val
+
     return out
 
 def _pick_top(values: dict[str, int], top_n: int) -> list[tuple[str, int]]:
@@ -1278,9 +705,6 @@ def _render_barchart_frame(
     items: list[tuple[str, int]],
     size: tuple[int, int] = (720, 420),
 ):
-    """
-    Returns a PIL Image (RGBA). Simple style.
-    """
     from PIL import Image, ImageDraw, ImageFont
 
     W, H = size
@@ -1311,18 +735,17 @@ def _render_barchart_frame(
         return img
 
     max_val = max(v for _, v in items) or 1
-
     rows = len(items)
     row_h = max(22, (chart_bottom - chart_top) // rows)
     bar_h = max(10, row_h - 10)
 
     for i, (name, val) in enumerate(items):
         y = chart_top + i * row_h + 8
+
         draw.text((pad + 10, y - 4), name[:18], font=font_label, fill=(220, 220, 235, 255))
 
         frac = val / max_val if max_val else 0
         bw = int((chart_right - chart_left - 10) * frac)
-
         x1 = chart_left
         y1 = y
         x2 = chart_left + bw
@@ -1334,7 +757,6 @@ def _render_barchart_frame(
         draw.text((chart_right - 10 - 80, y - 4), f"{val:,}", font=font_small, fill=(235, 235, 245, 255))
 
     return img
-
 
 @bot.tree.command(name="archived_text", description="Mirror edits as messages.")
 @app_commands.describe(
@@ -1423,7 +845,6 @@ async def archived_text(
     task = asyncio.create_task(runner())
     _active_text_archivers[key] = task
 
-
 @bot.tree.command(name="barchart", description="Make leaderboard GIF.")
 @app_commands.describe(
     channel="Channel that contains archived leaderboard updates.",
@@ -1454,7 +875,7 @@ async def barchart(
     snapshots: list[tuple[discord.datetime.datetime, dict[str, int]]] = []
 
     try:
-        async for msg in channel.history(limit=3000, after=cutoff, oldest_first=True):
+        async for msg in channel.history(limit=2000, after=cutoff, oldest_first=True):
             text = _extract_text_from_message(msg)
             data = parse_leaderboard(text)
             if data:
@@ -1464,23 +885,7 @@ async def barchart(
         return
 
     if len(snapshots) < 2:
-        # Helpful debug: show what it saw in the most recent message
-        last_msg = None
-        try:
-            last_msg = [m async for m in channel.history(limit=1, oldest_first=False)]
-            last_msg = last_msg[0] if last_msg else None
-        except Exception:
-            last_msg = None
-
-        if last_msg:
-            dbg_text = _extract_text_from_message(last_msg)
-            pairs = parse_leaderboard_pairs_from_text(dbg_text)
-            await interaction.followup.send(
-                "❌ Not enough parsable snapshots found (need at least 2).\n"
-                f"Debug (latest message): parsed **{len(pairs)}** pairs."
-            )
-        else:
-            await interaction.followup.send("❌ Not enough parsable snapshots found (need at least 2).")
+        await interaction.followup.send("❌ Not enough parsable snapshots found (need at least 2).")
         return
 
     if len(snapshots) > max_frames:
@@ -1517,8 +922,6 @@ async def barchart(
         content=f"🎞️ Bar chart timelapse ({len(frames)} frames, {fps} fps, last {hours}h, top {top})",
         file=discord.File(fp=out, filename="leaderboard_timelapse.gif")
     )
-
-# ===================== END LIVE TEXT ARCHIVER + BARCHART GIF =====================
 
 # -------------------- START --------------------
 if __name__ == "__main__":
