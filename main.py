@@ -1,24 +1,3 @@
-# Discord Slash Bot (Pydroid-friendly)
-# - /ask -> OpenAI rule helper (Embed output)
-# - /stopmotion -> makes a stop-motion GIF from images in channel history
-# - /progress -> template progresser (single run) + ETA estimate
-# - /live_progress -> LIVE template progresser (event-ish polling)
-#       • polls source_channel every 30s
-#       • posts ONLY when the latest image message is NEW or EDITED
-#       • runs forever until user stops it
-#       • optional ping_role if progress goes backwards
-# - /archieved -> LIVE image archiver (same 30s polling + repost on change)
-#       • reposts the latest image from source_channel when NEW/EDITED
-#       • runs forever until user stops it
-#
-# Requirements:
-#   pip install -U discord.py pillow psycopg2-binary aiohttp
-#
-# Env vars:
-#   DISCORD_TOKEN
-#   OPENAI_API_KEY
-#   DATABASE_URL  (optional, for presets)
-
 import os
 import time
 import json
