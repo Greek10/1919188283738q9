@@ -628,116 +628,142 @@ async def archieved(
     task = asyncio.create_task(runner())
     _active_archives[key] = task
 
-# ===================== LIVE TEXT ARCHIVER + BARCHART GIF (UPDATED: USE 2ND EMBED/BLOCK) =====================
-# Drop-in replacement for your existing "LIVE TEXT ARCHIVER + BARCHART GIF" section.
+# ===================== LIVE TEXT ARCHIVER + BARCHART GIF (FIXED) =====================
+# Detects lines like:
+# 1. User1 - 192
+# 2. User2 - 282
+# - Handles unicode dashes (– — −) + commas in numbers
+# - archived_text mirrors ONLY the "Top Active Places" embed block if present,
+#   otherwise falls back to 2nd embed, otherwise last embed
+# - barchart uses the SAME extraction logic
 
 from typing import Optional
+import re
+from io import BytesIO
+from datetime import timedelta
 
-# One active text-archiver per user per guild (same pattern as live_progress)
+# One active text-archiver per user per guild
 _active_text_archivers: dict[tuple[int, int], asyncio.Task] = {}
 
-def _msg_fingerprint(m: discord.Message, embed_index: int = 1) -> str:
-    """
-    Detect edits + changes for a specific embed "block" (default = 2nd embed).
-    We include:
-      - msg id
-      - edited timestamp
-      - content
-      - chosen embed's title/desc/fields
-    """
+def _msg_fingerprint(m: discord.Message) -> str:
     edited = m.edited_at.isoformat() if m.edited_at else ""
     parts = [str(m.id), edited, (m.content or "").strip()]
 
-    # pick embed block (1 = second embed, 0 = first embed)
-    e = None
+    # include ALL embeds (so edits in embed #2 are detected)
     if m.embeds:
-        if 0 <= embed_index < len(m.embeds):
-            e = m.embeds[embed_index]
-        else:
-            # fallback to last embed if user requested beyond range
-            e = m.embeds[-1]
-
-    if e:
-        parts.append((e.title or "").strip())
-        parts.append((e.description or "").strip())
-        try:
-            for f in (e.fields or []):
-                parts.append((f.name or "").strip())
-                parts.append((f.value or "").strip())
-        except Exception:
-            pass
+        for e in m.embeds:
+            parts.append((e.title or "").strip())
+            parts.append((e.description or "").strip())
+            try:
+                for f in (e.fields or []):
+                    parts.append((f.name or "").strip())
+                    parts.append((f.value or "").strip())
+            except Exception:
+                pass
 
     return "\n".join(parts)
 
-def _extract_text_from_message(m: discord.Message, embed_index: int = 1) -> str:
+def _normalize_dashes(text: str) -> str:
+    return (
+        (text or "")
+        .replace("—", "-")
+        .replace("–", "-")
+        .replace("−", "-")
+        .replace("―", "-")
+    )
+
+def _extract_embed_text(e: discord.Embed) -> str:
+    chunks = []
+    if e.title:
+        chunks.append(str(e.title).strip())
+    if e.description:
+        chunks.append(str(e.description).strip())
+    try:
+        for f in (e.fields or []):
+            if f.name and f.value:
+                chunks.append(f"{str(f.name).strip()}: {str(f.value).strip()}")
+    except Exception:
+        pass
+    return "\n".join(chunks).strip()
+
+def _pick_preferred_embed(msg: discord.Message) -> Optional[discord.Embed]:
     """
-    Turn message content + a selected embed (default = 2nd embed) into a single text blob.
-    This fixes your case where ONE Discord message contains TWO leaderboard "blocks"
-    and you want the second one (Top Active Places).
+    Prefer the embed that contains 'Top Active Places' (title/description),
+    else prefer 2nd embed, else last embed.
+    """
+    embeds = msg.embeds or []
+    if not embeds:
+        return None
+
+    for e in embeds:
+        blob = ((e.title or "") + "\n" + (e.description or "")).lower()
+        if "top active places" in blob:
+            return e
+
+    if len(embeds) >= 2:
+        return embeds[1]
+
+    return embeds[-1]
+
+def _extract_preferred_block_text(msg: discord.Message) -> str:
+    """
+    Extracts ONLY the preferred embed block text (plus content if needed),
+    normalized for parsing.
     """
     chunks = []
 
-    # (Optional) include raw content if present
-    if m.content and m.content.strip():
-        chunks.append(m.content.strip())
+    # Sometimes the bot puts the list in content instead of embed (rare),
+    # but we keep it as fallback.
+    if msg.content and msg.content.strip():
+        chunks.append(msg.content.strip())
 
-    e = None
-    if m.embeds:
-        if 0 <= embed_index < len(m.embeds):
-            e = m.embeds[embed_index]
-        else:
-            e = m.embeds[-1]
-
+    e = _pick_preferred_embed(msg)
     if e:
-        if e.title:
-            chunks.append(str(e.title).strip())
-        if e.description:
-            chunks.append(str(e.description).strip())
-        try:
-            for f in (e.fields or []):
-                if f.name and f.value:
-                    chunks.append(f"{str(f.name).strip()}: {str(f.value).strip()}")
-        except Exception:
-            pass
+        chunks.append(_extract_embed_text(e))
 
-    return "\n".join(chunks).strip()
+    text = "\n".join([c for c in chunks if c]).strip()
+    text = _normalize_dashes(text)
+    text = text.replace("\u200b", "")  # zero width
+    return text.strip()
 
 def parse_leaderboard(text: str) -> dict[str, int]:
     """
-    Best-effort parser for leaderboard text.
-    Supports lines like:
-      PlayerA: 123
-      PlayerB - 456
-      PlayerC = 789
-      1) PlayerD 999
-      PlayerE 1,234
-    Returns dict{name -> value}
+    STRICT-ish for the format you want:
+      1. User1 - 192
+      2. User2 - 282
+
+    Still tolerant of:
+      1) User1 - 192
+      1. User1: 192
+      User1 - 192
+      User1 192
     """
     out: dict[str, int] = {}
     if not text:
         return out
 
+    text = _normalize_dashes(text)
+
     lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
     for ln in lines:
-        # remove common bullet/number prefixes
-        ln2 = re.sub(r"^\s*(?:[#>*\-•]+|\d+[\).:-])\s*", "", ln)
+        # Remove leading numbering/bullets like "1.", "2)", "•", "-"
+        ln2 = re.sub(r"^\s*(?:[#>*•\-]+|\d+\s*[\).:-])\s*", "", ln).strip()
 
-        # Try "name : value" / "name - value" / "name = value"
-        m = re.match(r"^(.{1,64}?)\s*[:=\-]\s*([0-9][0-9,\.]*)\s*$", ln2)
+        # Match "Name - 123" (or ":" or "=")
+        m = re.match(r"^(.{1,80}?)\s*[:=\-]\s*([0-9][0-9,]*)\s*$", ln2)
         if not m:
-            # Try "name value"
-            m = re.match(r"^(.{1,64}?)\s+([0-9][0-9,\.]*)\s*$", ln2)
+            # Match "Name 123"
+            m = re.match(r"^(.{1,80}?)\s+([0-9][0-9,]*)\s*$", ln2)
         if not m:
             continue
 
         name = m.group(1).strip()
-        val_raw = m.group(2).strip().replace(",", "")
-        try:
-            val = int(float(val_raw))
-        except Exception:
+        val_raw = m.group(2).replace(",", "").strip()
+        if not name:
             continue
-
-        if len(name) < 1:
+        try:
+            val = int(val_raw)
+        except Exception:
             continue
 
         out[name] = val
@@ -754,9 +780,6 @@ def _render_barchart_frame(
     items: list[tuple[str, int]],
     size: tuple[int, int] = (720, 420),
 ):
-    """
-    Returns a PIL Image (RGBA).
-    """
     from PIL import Image, ImageDraw, ImageFont
 
     W, H = size
@@ -787,6 +810,7 @@ def _render_barchart_frame(
         return img
 
     max_val = max(v for _, v in items) or 1
+
     rows = len(items)
     row_h = max(22, (chart_bottom - chart_top) // rows)
     bar_h = max(10, row_h - 10)
@@ -797,25 +821,26 @@ def _render_barchart_frame(
 
         frac = val / max_val if max_val else 0
         bw = int((chart_right - chart_left - 10) * frac)
+
         x1 = chart_left
         y1 = y
         x2 = chart_left + bw
         y2 = y + bar_h
+
         draw.rectangle([x1, y1, x2, y2], fill=(120, 170, 255, 255))
         draw.rectangle([x1, y1, chart_right - 10, y2], outline=(60, 65, 80, 255), width=1)
 
-        draw.text((chart_right - 10 - 80, y - 4), f"{val:,}", font=font_small, fill=(235, 235, 245, 255))
+        draw.text((chart_right - 10 - 90, y - 4), f"{val:,}", font=font_small, fill=(235, 235, 245, 255))
 
     return img
 
 
-@bot.tree.command(name="archived_text", description="Mirror edits as messages (choose embed block).")
+@bot.tree.command(name="archived_text", description="Mirror edits as messages (prefers Top Active Places block).")
 @app_commands.describe(
     mode="start or stop",
     source_channel="Channel to watch (edited leaderboard message lives here).",
     output_channel="Where to post mirrored updates (defaults to current channel).",
-    poll_seconds="How often to check (default 30).",
-    block="Which embed block to mirror: 1=first, 2=second (default 2)."
+    poll_seconds="How often to check (default 30)."
 )
 async def archived_text(
     interaction: discord.Interaction,
@@ -823,7 +848,6 @@ async def archived_text(
     source_channel: discord.TextChannel | None = None,
     output_channel: discord.TextChannel | None = None,
     poll_seconds: int = 30,
-    block: int = 2,
 ):
     guild_id = interaction.guild_id or 0
     user_id = interaction.user.id
@@ -838,9 +862,9 @@ async def archived_text(
         task = _active_text_archivers.pop(key, None)
         if task and not task.done():
             task.cancel()
-            await interaction.response.send_message("🛑 archived_text stopped.", ephemeral=True)
+            await interaction.response.send_message("🛑 /archived_text stopped.", ephemeral=True)
         else:
-            await interaction.response.send_message("No active archived_text running.", ephemeral=True)
+            await interaction.response.send_message("No active /archived_text running.", ephemeral=True)
         return
 
     if source_channel is None:
@@ -853,15 +877,13 @@ async def archived_text(
         return
 
     poll_seconds = max(5, min(300, int(poll_seconds)))
-    # block: 1->embed_index 0, 2->embed_index 1, etc.
-    embed_index = max(1, int(block)) - 1
 
     old = _active_text_archivers.pop(key, None)
     if old and not old.done():
         old.cancel()
 
     await interaction.response.send_message(
-        f"✅ archived_text started.\n• Watching: {source_channel.mention}\n• Posting to: {out_ch.mention}\n• Poll: {poll_seconds}s\n• Block: {block}",
+        f"✅ /archived_text started.\n• Watching: {source_channel.mention}\n• Posting to: {out_ch.mention}\n• Poll: {poll_seconds}s",
         ephemeral=True
     )
 
@@ -875,14 +897,17 @@ async def archived_text(
                     continue
 
                 m = msgs[0]
-                fp = _msg_fingerprint(m, embed_index=embed_index)
+                fp = _msg_fingerprint(m)
                 if fp != last_fp:
                     last_fp = fp
-                    txt = _extract_text_from_message(m, embed_index=embed_index)
+
+                    txt = _extract_preferred_block_text(m)
+                    e = _pick_preferred_embed(m)
+                    title = (e.title if e and e.title else "Leaderboard Update")
 
                     embed = discord.Embed(
-                        title=f"Leaderboard Update (Block {block})",
-                        description=(txt[:3900] if txt else "*No text content in that block*"),
+                        title=title,
+                        description=(txt[:3900] if txt else "*No text content found in the preferred block*"),
                     )
                     embed.set_footer(text=f"Source: #{source_channel.name} • msg_id={m.id}" + (" • edited" if m.edited_at else ""))
                     await out_ch.send(embed=embed)
@@ -891,7 +916,7 @@ async def archived_text(
                 raise
             except Exception as e:
                 try:
-                    await out_ch.send(f"⚠️ archived_text error: `{type(e).__name__}: {e}`")
+                    await out_ch.send(f"⚠️ /archived_text error: `{type(e).__name__}: {e}`")
                 except Exception:
                     pass
 
@@ -901,14 +926,13 @@ async def archived_text(
     _active_text_archivers[key] = task
 
 
-@bot.tree.command(name="barchart", description="Make leaderboard GIF (choose embed block).")
+@bot.tree.command(name="barchart", description="Make leaderboard GIF (prefers Top Active Places block).")
 @app_commands.describe(
     channel="Channel that contains archived leaderboard updates.",
     hours="How far back to read (default 24).",
     top="How many entries to show (default 10).",
     fps="GIF FPS (default 8).",
-    max_frames="Limit frames (default 120).",
-    block="Which embed block to read: 1=first, 2=second (default 2)."
+    max_frames="Limit frames (default 120)."
 )
 async def barchart(
     interaction: discord.Interaction,
@@ -917,7 +941,6 @@ async def barchart(
     top: int = 10,
     fps: int = 8,
     max_frames: int = 120,
-    block: int = 2,
 ):
     from PIL import Image
 
@@ -925,18 +948,15 @@ async def barchart(
     top = max(3, min(25, int(top)))
     fps = max(2, min(20, int(fps)))
     max_frames = max(10, min(300, int(max_frames)))
-    embed_index = max(1, int(block)) - 1
 
     await interaction.response.defer(thinking=True)
-
     cutoff = discord.utils.utcnow() - timedelta(hours=hours)
 
     snapshots: list[tuple[discord.datetime.datetime, dict[str, int]]] = []
 
     try:
-        async for msg in channel.history(limit=2000, after=cutoff, oldest_first=True):
-            # IMPORTANT: read the selected embed block, not the first one
-            text = _extract_text_from_message(msg, embed_index=embed_index)
+        async for msg in channel.history(limit=4000, after=cutoff, oldest_first=True):
+            text = _extract_preferred_block_text(msg)
             data = parse_leaderboard(text)
             if data:
                 snapshots.append((msg.created_at, data))
@@ -945,9 +965,13 @@ async def barchart(
         return
 
     if len(snapshots) < 2:
-        await interaction.followup.send("❌ Not enough parsable snapshots found (need at least 2).")
+        await interaction.followup.send(
+            "❌ Not enough parsable snapshots found (need at least 2).\n"
+            "Make sure the archived messages contain text lines like `1. User1 - 192` in the embed description."
+        )
         return
 
+    # Downsample if too many snapshots
     if len(snapshots) > max_frames:
         step = len(snapshots) / max_frames
         kept = []
@@ -960,7 +984,7 @@ async def barchart(
     frames: list[Image.Image] = []
     for ts, data in snapshots:
         items = _pick_top(data, top)
-        title = f"Leaderboard (Block {block}) • {ts.strftime('%Y-%m-%d %H:%M:%S')}"
+        title = f"Top Active Places • {ts.strftime('%Y-%m-%d %H:%M:%S')}"
         frame = _render_barchart_frame(title=title, items=items, size=(720, 420))
         frames.append(frame.convert("P", palette=Image.Palette.ADAPTIVE, colors=256))
 
@@ -979,11 +1003,11 @@ async def barchart(
     out.seek(0)
 
     await interaction.followup.send(
-        content=f"🎞️ Bar chart timelapse (block {block}) — {len(frames)} frames, {fps} fps, last {hours}h, top {top}",
+        content=f"🎞️ Bar chart timelapse — {len(frames)} frames, {fps} fps, last {hours}h, top {top}",
         file=discord.File(fp=out, filename="leaderboard_timelapse.gif")
     )
 
-# ===================== END LIVE TEXT ARCHIVER + BARCHART GIF (UPDATED) =====================
+# ===================== END LIVE TEXT ARCHIVER + BARCHART GIF (FIXED) =====================
 
 # -------------------- START --------------------
 if __name__ == "__main__":
