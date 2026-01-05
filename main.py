@@ -629,7 +629,10 @@ async def archieved(
     _active_archives[key] = task
 
 # ===================== LIVE TEXT ARCHIVER + BARCHART GIF =====================
+
 _active_text_archivers: dict[tuple[int, int], asyncio.Task] = {}
+
+_CODEBLOCK_RE = re.compile(r"```(?:[a-zA-Z0-9_+\-]*)\n(.*?)```", re.DOTALL)
 
 def _msg_fingerprint(m: discord.Message) -> str:
     edited = m.edited_at.isoformat() if m.edited_at else ""
@@ -647,6 +650,9 @@ def _msg_fingerprint(m: discord.Message) -> str:
     return "\n".join(parts)
 
 def _extract_text_from_message(m: discord.Message) -> str:
+    """
+    Turn message content + first embed into a single text blob to parse/store.
+    """
     chunks = []
     if m.content and m.content.strip():
         chunks.append(m.content.strip())
@@ -666,7 +672,66 @@ def _extract_text_from_message(m: discord.Message) -> str:
 
     return "\n".join(chunks).strip()
 
+def _all_text_blobs_from_message(m: discord.Message) -> list[str]:
+    blobs: list[str] = []
+    if m.content and m.content.strip():
+        blobs.append(m.content)
+
+    if m.embeds:
+        e = m.embeds[0]
+        if e.title:
+            blobs.append(str(e.title))
+        if e.description:
+            blobs.append(str(e.description))
+        try:
+            for f in (e.fields or []):
+                if f.name:
+                    blobs.append(str(f.name))
+                if f.value:
+                    blobs.append(str(f.value))
+        except Exception:
+            pass
+
+    return [b for b in (x.strip() for x in blobs) if b]
+
+def _extract_nth_codeblock_from_message(m: discord.Message, n: int = 2) -> str:
+    """
+    Returns the Nth codeblock (1-indexed) from the message (content + embed bits).
+    If not enough codeblocks exist, returns "".
+    """
+    blocks: list[str] = []
+    for blob in _all_text_blobs_from_message(m):
+        for inner in _CODEBLOCK_RE.findall(blob):
+            inner = (inner or "").strip()
+            if inner:
+                blocks.append(inner)
+
+    idx = int(n) - 1
+    if 0 <= idx < len(blocks):
+        return blocks[idx]
+    return ""
+
+def _extract_text_for_leaderboard(m: discord.Message, prefer_codeblock_n: int = 2) -> str:
+    """
+    Prefer the Nth codeblock (default: 2nd).
+    Fallback to the old extraction if not found.
+    """
+    cb = _extract_nth_codeblock_from_message(m, prefer_codeblock_n)
+    if cb:
+        return cb
+    return _extract_text_from_message(m)
+
 def parse_leaderboard(text: str) -> dict[str, int]:
+    """
+    Best-effort parser for leaderboard text.
+    Supports lines like:
+      PlayerA: 123
+      PlayerB - 456
+      PlayerC = 789
+      1) PlayerD 999
+      PlayerE 1,234
+    Returns dict{name -> value}
+    """
     out: dict[str, int] = {}
     if not text:
         return out
@@ -735,6 +800,7 @@ def _render_barchart_frame(
         return img
 
     max_val = max(v for _, v in items) or 1
+
     rows = len(items)
     row_h = max(22, (chart_bottom - chart_top) // rows)
     bar_h = max(10, row_h - 10)
@@ -750,7 +816,6 @@ def _render_barchart_frame(
         y1 = y
         x2 = chart_left + bw
         y2 = y + bar_h
-
         draw.rectangle([x1, y1, x2, y2], fill=(120, 170, 255, 255))
         draw.rectangle([x1, y1, chart_right - 10, y2], outline=(60, 65, 80, 255), width=1)
 
@@ -845,13 +910,14 @@ async def archived_text(
     task = asyncio.create_task(runner())
     _active_text_archivers[key] = task
 
-@bot.tree.command(name="barchart", description="Make leaderboard GIF.")
+@bot.tree.command(name="barchart", description="Make leaderboard GIF from archived messages.")
 @app_commands.describe(
     channel="Channel that contains archived leaderboard updates.",
     hours="How far back to read (default 24).",
     top="How many entries to show (default 10).",
     fps="GIF FPS (default 8).",
-    max_frames="Limit frames (default 120)."
+    max_frames="Limit frames (default 120).",
+    codeblock="Which code block to parse (default 2)."
 )
 async def barchart(
     interaction: discord.Interaction,
@@ -860,6 +926,7 @@ async def barchart(
     top: int = 10,
     fps: int = 8,
     max_frames: int = 120,
+    codeblock: int = 2,
 ):
     from PIL import Image
 
@@ -867,16 +934,18 @@ async def barchart(
     top = max(3, min(25, int(top)))
     fps = max(2, min(20, int(fps)))
     max_frames = max(10, min(300, int(max_frames)))
+    codeblock = max(1, min(10, int(codeblock)))
 
     await interaction.response.defer(thinking=True)
 
     cutoff = discord.utils.utcnow() - timedelta(hours=hours)
 
-    snapshots: list[tuple[discord.datetime.datetime, dict[str, int]]] = []
+    snapshots: list[tuple[discord.utils.utcnow().__class__, dict[str, int]]] = []
 
     try:
         async for msg in channel.history(limit=2000, after=cutoff, oldest_first=True):
-            text = _extract_text_from_message(msg)
+            # IMPORTANT: parse the Nth codeblock (default 2nd) from the message/embed
+            text = _extract_text_for_leaderboard(msg, prefer_codeblock_n=codeblock)
             data = parse_leaderboard(text)
             if data:
                 snapshots.append((msg.created_at, data))
@@ -919,7 +988,7 @@ async def barchart(
     out.seek(0)
 
     await interaction.followup.send(
-        content=f"🎞️ Bar chart timelapse ({len(frames)} frames, {fps} fps, last {hours}h, top {top})",
+        content=f"🎞️ Bar chart timelapse ({len(frames)} frames, {fps} fps, last {hours}h, top {top}, codeblock {codeblock})",
         file=discord.File(fp=out, filename="leaderboard_timelapse.gif")
     )
 
