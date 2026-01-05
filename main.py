@@ -628,17 +628,36 @@ async def archieved(
     task = asyncio.create_task(runner())
     _active_archives[key] = task
 
-# ===================== LIVE TEXT ARCHIVER + BARCHART GIF =====================
+# ===================== LIVE TEXT ARCHIVER + BARCHART GIF (UPDATED: USE 2ND EMBED/BLOCK) =====================
+# Drop-in replacement for your existing "LIVE TEXT ARCHIVER + BARCHART GIF" section.
 
+from typing import Optional
+
+# One active text-archiver per user per guild (same pattern as live_progress)
 _active_text_archivers: dict[tuple[int, int], asyncio.Task] = {}
 
-_CODEBLOCK_RE = re.compile(r"```(?:[a-zA-Z0-9_+\-]*)\n(.*?)```", re.DOTALL)
-
-def _msg_fingerprint(m: discord.Message) -> str:
+def _msg_fingerprint(m: discord.Message, embed_index: int = 1) -> str:
+    """
+    Detect edits + changes for a specific embed "block" (default = 2nd embed).
+    We include:
+      - msg id
+      - edited timestamp
+      - content
+      - chosen embed's title/desc/fields
+    """
     edited = m.edited_at.isoformat() if m.edited_at else ""
     parts = [str(m.id), edited, (m.content or "").strip()]
+
+    # pick embed block (1 = second embed, 0 = first embed)
+    e = None
     if m.embeds:
-        e = m.embeds[0]
+        if 0 <= embed_index < len(m.embeds):
+            e = m.embeds[embed_index]
+        else:
+            # fallback to last embed if user requested beyond range
+            e = m.embeds[-1]
+
+    if e:
         parts.append((e.title or "").strip())
         parts.append((e.description or "").strip())
         try:
@@ -647,18 +666,29 @@ def _msg_fingerprint(m: discord.Message) -> str:
                 parts.append((f.value or "").strip())
         except Exception:
             pass
+
     return "\n".join(parts)
 
-def _extract_text_from_message(m: discord.Message) -> str:
+def _extract_text_from_message(m: discord.Message, embed_index: int = 1) -> str:
     """
-    Turn message content + first embed into a single text blob to parse/store.
+    Turn message content + a selected embed (default = 2nd embed) into a single text blob.
+    This fixes your case where ONE Discord message contains TWO leaderboard "blocks"
+    and you want the second one (Top Active Places).
     """
     chunks = []
+
+    # (Optional) include raw content if present
     if m.content and m.content.strip():
         chunks.append(m.content.strip())
 
+    e = None
     if m.embeds:
-        e = m.embeds[0]
+        if 0 <= embed_index < len(m.embeds):
+            e = m.embeds[embed_index]
+        else:
+            e = m.embeds[-1]
+
+    if e:
         if e.title:
             chunks.append(str(e.title).strip())
         if e.description:
@@ -671,55 +701,6 @@ def _extract_text_from_message(m: discord.Message) -> str:
             pass
 
     return "\n".join(chunks).strip()
-
-def _all_text_blobs_from_message(m: discord.Message) -> list[str]:
-    blobs: list[str] = []
-    if m.content and m.content.strip():
-        blobs.append(m.content)
-
-    if m.embeds:
-        e = m.embeds[0]
-        if e.title:
-            blobs.append(str(e.title))
-        if e.description:
-            blobs.append(str(e.description))
-        try:
-            for f in (e.fields or []):
-                if f.name:
-                    blobs.append(str(f.name))
-                if f.value:
-                    blobs.append(str(f.value))
-        except Exception:
-            pass
-
-    return [b for b in (x.strip() for x in blobs) if b]
-
-def _extract_nth_codeblock_from_message(m: discord.Message, n: int = 2) -> str:
-    """
-    Returns the Nth codeblock (1-indexed) from the message (content + embed bits).
-    If not enough codeblocks exist, returns "".
-    """
-    blocks: list[str] = []
-    for blob in _all_text_blobs_from_message(m):
-        for inner in _CODEBLOCK_RE.findall(blob):
-            inner = (inner or "").strip()
-            if inner:
-                blocks.append(inner)
-
-    idx = int(n) - 1
-    if 0 <= idx < len(blocks):
-        return blocks[idx]
-    return ""
-
-def _extract_text_for_leaderboard(m: discord.Message, prefer_codeblock_n: int = 2) -> str:
-    """
-    Prefer the Nth codeblock (default: 2nd).
-    Fallback to the old extraction if not found.
-    """
-    cb = _extract_nth_codeblock_from_message(m, prefer_codeblock_n)
-    if cb:
-        return cb
-    return _extract_text_from_message(m)
 
 def parse_leaderboard(text: str) -> dict[str, int]:
     """
@@ -738,10 +719,13 @@ def parse_leaderboard(text: str) -> dict[str, int]:
 
     lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
     for ln in lines:
+        # remove common bullet/number prefixes
         ln2 = re.sub(r"^\s*(?:[#>*\-•]+|\d+[\).:-])\s*", "", ln)
 
+        # Try "name : value" / "name - value" / "name = value"
         m = re.match(r"^(.{1,64}?)\s*[:=\-]\s*([0-9][0-9,\.]*)\s*$", ln2)
         if not m:
+            # Try "name value"
             m = re.match(r"^(.{1,64}?)\s+([0-9][0-9,\.]*)\s*$", ln2)
         if not m:
             continue
@@ -770,6 +754,9 @@ def _render_barchart_frame(
     items: list[tuple[str, int]],
     size: tuple[int, int] = (720, 420),
 ):
+    """
+    Returns a PIL Image (RGBA).
+    """
     from PIL import Image, ImageDraw, ImageFont
 
     W, H = size
@@ -800,14 +787,12 @@ def _render_barchart_frame(
         return img
 
     max_val = max(v for _, v in items) or 1
-
     rows = len(items)
     row_h = max(22, (chart_bottom - chart_top) // rows)
     bar_h = max(10, row_h - 10)
 
     for i, (name, val) in enumerate(items):
         y = chart_top + i * row_h + 8
-
         draw.text((pad + 10, y - 4), name[:18], font=font_label, fill=(220, 220, 235, 255))
 
         frac = val / max_val if max_val else 0
@@ -823,12 +808,14 @@ def _render_barchart_frame(
 
     return img
 
-@bot.tree.command(name="archived_text", description="Mirror edits as messages.")
+
+@bot.tree.command(name="archived_text", description="Mirror edits as messages (choose embed block).")
 @app_commands.describe(
     mode="start or stop",
     source_channel="Channel to watch (edited leaderboard message lives here).",
     output_channel="Where to post mirrored updates (defaults to current channel).",
-    poll_seconds="How often to check (default 30)."
+    poll_seconds="How often to check (default 30).",
+    block="Which embed block to mirror: 1=first, 2=second (default 2)."
 )
 async def archived_text(
     interaction: discord.Interaction,
@@ -836,6 +823,7 @@ async def archived_text(
     source_channel: discord.TextChannel | None = None,
     output_channel: discord.TextChannel | None = None,
     poll_seconds: int = 30,
+    block: int = 2,
 ):
     guild_id = interaction.guild_id or 0
     user_id = interaction.user.id
@@ -865,13 +853,15 @@ async def archived_text(
         return
 
     poll_seconds = max(5, min(300, int(poll_seconds)))
+    # block: 1->embed_index 0, 2->embed_index 1, etc.
+    embed_index = max(1, int(block)) - 1
 
     old = _active_text_archivers.pop(key, None)
     if old and not old.done():
         old.cancel()
 
     await interaction.response.send_message(
-        f"✅ archived_text started.\n• Watching: {source_channel.mention}\n• Posting to: {out_ch.mention}\n• Poll: {poll_seconds}s",
+        f"✅ archived_text started.\n• Watching: {source_channel.mention}\n• Posting to: {out_ch.mention}\n• Poll: {poll_seconds}s\n• Block: {block}",
         ephemeral=True
     )
 
@@ -885,14 +875,14 @@ async def archived_text(
                     continue
 
                 m = msgs[0]
-                fp = _msg_fingerprint(m)
+                fp = _msg_fingerprint(m, embed_index=embed_index)
                 if fp != last_fp:
                     last_fp = fp
-                    txt = _extract_text_from_message(m)
+                    txt = _extract_text_from_message(m, embed_index=embed_index)
 
                     embed = discord.Embed(
-                        title="Leaderboard Update",
-                        description=(txt[:3900] if txt else "*No text content*"),
+                        title=f"Leaderboard Update (Block {block})",
+                        description=(txt[:3900] if txt else "*No text content in that block*"),
                     )
                     embed.set_footer(text=f"Source: #{source_channel.name} • msg_id={m.id}" + (" • edited" if m.edited_at else ""))
                     await out_ch.send(embed=embed)
@@ -910,14 +900,15 @@ async def archived_text(
     task = asyncio.create_task(runner())
     _active_text_archivers[key] = task
 
-@bot.tree.command(name="barchart", description="Make leaderboard GIF from archived messages.")
+
+@bot.tree.command(name="barchart", description="Make leaderboard GIF (choose embed block).")
 @app_commands.describe(
     channel="Channel that contains archived leaderboard updates.",
     hours="How far back to read (default 24).",
     top="How many entries to show (default 10).",
     fps="GIF FPS (default 8).",
     max_frames="Limit frames (default 120).",
-    codeblock="Which code block to parse (default 2)."
+    block="Which embed block to read: 1=first, 2=second (default 2)."
 )
 async def barchart(
     interaction: discord.Interaction,
@@ -926,7 +917,7 @@ async def barchart(
     top: int = 10,
     fps: int = 8,
     max_frames: int = 120,
-    codeblock: int = 2,
+    block: int = 2,
 ):
     from PIL import Image
 
@@ -934,18 +925,18 @@ async def barchart(
     top = max(3, min(25, int(top)))
     fps = max(2, min(20, int(fps)))
     max_frames = max(10, min(300, int(max_frames)))
-    codeblock = max(1, min(10, int(codeblock)))
+    embed_index = max(1, int(block)) - 1
 
     await interaction.response.defer(thinking=True)
 
     cutoff = discord.utils.utcnow() - timedelta(hours=hours)
 
-    snapshots: list[tuple[discord.utils.utcnow().__class__, dict[str, int]]] = []
+    snapshots: list[tuple[discord.datetime.datetime, dict[str, int]]] = []
 
     try:
         async for msg in channel.history(limit=2000, after=cutoff, oldest_first=True):
-            # IMPORTANT: parse the Nth codeblock (default 2nd) from the message/embed
-            text = _extract_text_for_leaderboard(msg, prefer_codeblock_n=codeblock)
+            # IMPORTANT: read the selected embed block, not the first one
+            text = _extract_text_from_message(msg, embed_index=embed_index)
             data = parse_leaderboard(text)
             if data:
                 snapshots.append((msg.created_at, data))
@@ -969,7 +960,7 @@ async def barchart(
     frames: list[Image.Image] = []
     for ts, data in snapshots:
         items = _pick_top(data, top)
-        title = f"Leaderboard • {ts.strftime('%Y-%m-%d %H:%M:%S')}"
+        title = f"Leaderboard (Block {block}) • {ts.strftime('%Y-%m-%d %H:%M:%S')}"
         frame = _render_barchart_frame(title=title, items=items, size=(720, 420))
         frames.append(frame.convert("P", palette=Image.Palette.ADAPTIVE, colors=256))
 
@@ -988,9 +979,11 @@ async def barchart(
     out.seek(0)
 
     await interaction.followup.send(
-        content=f"🎞️ Bar chart timelapse ({len(frames)} frames, {fps} fps, last {hours}h, top {top}, codeblock {codeblock})",
+        content=f"🎞️ Bar chart timelapse (block {block}) — {len(frames)} frames, {fps} fps, last {hours}h, top {top}",
         file=discord.File(fp=out, filename="leaderboard_timelapse.gif")
     )
+
+# ===================== END LIVE TEXT ARCHIVER + BARCHART GIF (UPDATED) =====================
 
 # -------------------- START --------------------
 if __name__ == "__main__":
