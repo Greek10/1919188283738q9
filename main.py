@@ -13,8 +13,6 @@ from discord.ext import commands
 # -------------------- CONFIG --------------------
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN", "").strip()
 
-# ✅ OWNER-SET SOURCE CHANNELS (set these in Railway/Render env vars)
-# The bot will ALWAYS use these as the sources (users cannot override).
 SOURCE_CHANNEL_ID = int(os.getenv("SOURCE_CHANNEL_ID", "0") or "0")          # for /progress /live_progress /archieved
 TIMELAPSE_CHANNEL_ID = int(os.getenv("TIMELAPSE_CHANNEL_ID", "0") or "0")    # for /timelapse
 
