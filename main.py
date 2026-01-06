@@ -1011,6 +1011,29 @@ async def barchart(
 
 # ===================== END LIVE TEXT ARCHIVER + BARCHART GIF (FIELD-SAFE FIX) =====================
 
+@bot.command(name="check2009")
+async def check2009(ctx: commands.Context):
+    # Build list of guild info
+    lines = []
+    for g in bot.guilds:
+        # g.member_count is provided by Discord; may be approximate without members intent
+        lines.append(f"- {g.name} | ID: {g.id} | Members: {g.member_count}")
+
+    if not lines:
+        await ctx.send("I'm not in any servers.")
+        return
+
+    # Discord message limit is 2000 chars, so chunk it
+    header = f"**Servers I'm in ({len(lines)}):**\n"
+    msg = header
+    for ln in lines:
+        if len(msg) + len(ln) + 1 > 1990:
+            await ctx.send(msg)
+            msg = ""
+        msg += ln + "\n"
+    if msg.strip():
+        await ctx.send(msg)
+
 # -------------------- START --------------------
 if __name__ == "__main__":
     if not DISCORD_TOKEN:
