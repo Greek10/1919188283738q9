@@ -13,8 +13,12 @@ from discord.ext import commands
 # -------------------- CONFIG --------------------
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN", "").strip()
 
-COOLDOWN_SECONDS_PER_PIXEL = 15
+# ✅ OWNER-SET SOURCE CHANNELS (set these in Railway/Render env vars)
+# The bot will ALWAYS use these as the sources (users cannot override).
+SOURCE_CHANNEL_ID = int(os.getenv("SOURCE_CHANNEL_ID", "0") or "0")          # for /progress /live_progress /archieved
+TIMELAPSE_CHANNEL_ID = int(os.getenv("TIMELAPSE_CHANNEL_ID", "0") or "0")    # for /timelapse
 
+COOLDOWN_SECONDS_PER_PIXEL = 15
 POLL_SECONDS = 30
 
 # -------------------- DISCORD BOT --------------------
@@ -25,6 +29,19 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 async def on_ready():
     await bot.tree.sync()
     print(f"✅ Logged in as {bot.user}")
+
+# -------------------- CHANNEL RESOLUTION --------------------
+async def _get_text_channel_by_id(channel_id: int) -> discord.TextChannel:
+    if not channel_id:
+        raise RuntimeError("Source channel ID is not set. Set SOURCE_CHANNEL_ID / TIMELAPSE_CHANNEL_ID in env vars.")
+
+    ch = bot.get_channel(channel_id)
+    if ch is None:
+        ch = await bot.fetch_channel(channel_id)
+
+    if not isinstance(ch, discord.TextChannel):
+        raise RuntimeError(f"Channel {channel_id} is not a text channel or is not accessible.")
+    return ch
 
 # -------------------- COMMON HELPERS --------------------
 async def _download_bytes(session, url: str, timeout_s: int = 30) -> bytes:
@@ -189,7 +206,6 @@ async def run_markarea_once(
         return (xi, yi)
 
     p1 = to_canvas_img_pt(x1, y1)
-    p2 = to_canvas_img_pt(x2, y1)  # note: coords are arbitrary; using pairs below
     p2 = to_canvas_img_pt(x2, y2)
     p3 = to_canvas_img_pt(x3, y3)
     p4 = to_canvas_img_pt(x4, y4)
@@ -248,7 +264,7 @@ async def run_markarea_once(
 
     return out.read(), box_w, box_h, matched, total, pct
 
-# -------------------- /STOPMOTION --------------------
+# -------------------- /TIMELAPSE (uses owner-set TIMELAPSE_CHANNEL_ID) --------------------
 def _fit_resize(w: int, h: int, max_side: int) -> tuple[int, int]:
     if max(w, h) <= max_side:
         return w, h
@@ -260,28 +276,30 @@ def _fit_resize(w: int, h: int, max_side: int) -> tuple[int, int]:
         nw = max(1, int(w * (max_side / h)))
     return nw, nh
 
-@bot.tree.command(name="timelapse", description="Creates a timelapse")
+@bot.tree.command(name="timelapse", description="Creates a timelapse GIF from the owner-set timelapse channel.")
 @app_commands.describe(hours="Hours back (default 24).", fps="FPS (default 4).", max_frames="Max frames (default 60).", max_side="Max side (default 512).")
-async def stopmotion(interaction: discord.Interaction, hours: int = 24, fps: int = 4, max_frames: int = 60, max_side: int = 512):
+async def timelapse(interaction: discord.Interaction, hours: int = 24, fps: int = 4, max_frames: int = 60, max_side: int = 512):
     from PIL import Image
     import aiohttp
+
+    await interaction.response.defer(thinking=True)
+
+    try:
+        channel = await _get_text_channel_by_id(TIMELAPSE_CHANNEL_ID)
+    except Exception as e:
+        await interaction.followup.send(f"❌ Timelapse source channel error: `{type(e).__name__}: {e}`")
+        return
 
     hours = max(1, min(168, int(hours)))
     fps = max(1, min(15, int(fps)))
     max_frames = max(1, min(1000, int(max_frames)))
     max_side = max(64, min(1024, int(max_side)))
 
-    channel = interaction.channel
-    if not isinstance(channel, (discord.TextChannel, discord.Thread)):
-        await interaction.response.send_message("This command only works in text channels/threads.", ephemeral=True)
-        return
-
-    await interaction.response.defer(thinking=True)
     cutoff = discord.utils.utcnow() - timedelta(hours=hours)
 
     found: list[str] = []
     try:
-        async for msg in channel.history(limit=2000, after=cutoff, oldest_first=True):
+        async for msg in channel.history(limit=5000, after=cutoff, oldest_first=True):
             for a in msg.attachments:
                 ct = (a.content_type or "")
                 if ct.startswith("image/") and a.url:
@@ -292,9 +310,10 @@ async def stopmotion(interaction: discord.Interaction, hours: int = 24, fps: int
                 if e.thumbnail and e.thumbnail.url:
                     found.append(e.thumbnail.url)
     except discord.Forbidden:
-        await interaction.followup.send("I don’t have permission to read message history in this channel.")
+        await interaction.followup.send("I don’t have permission to read message history in the timelapse channel.")
         return
 
+    # de-dupe preserve order
     seen = set()
     ordered = []
     for url in found:
@@ -303,7 +322,7 @@ async def stopmotion(interaction: discord.Interaction, hours: int = 24, fps: int
             ordered.append(url)
 
     if not ordered:
-        await interaction.followup.send(f"No images found in the last {hours} hour(s).")
+        await interaction.followup.send(f"No images found in {channel.mention} in the last {hours} hour(s).")
         return
 
     if len(ordered) > max_frames:
@@ -344,26 +363,30 @@ async def stopmotion(interaction: discord.Interaction, hours: int = 24, fps: int
     out.seek(0)
 
     await interaction.followup.send(
-        content=f"GIF generated ({len(pal_frames)} frames, {fps} fps):",
-        file=discord.File(fp=out, filename="stopmotion.gif")
+        content=f"GIF generated from {channel.mention} ({len(pal_frames)} frames, {fps} fps):",
+        file=discord.File(fp=out, filename="timelapse.gif")
     )
 
-# -------------------- /PROGRESS (single run) --------------------
-@bot.tree.command(name="progress", description="Template progresser.")
+# -------------------- /PROGRESS (single run, uses owner-set SOURCE_CHANNEL_ID) --------------------
+@bot.tree.command(name="progress", description="Template progresser (uses owner-set source channel).")
 @app_commands.describe(
-    source_channel="Channel with the latest canvas update image.",
     template="Template image attachment.",
     coords="(x1,y1)(x2,y2)(x3,y3)(x4,y4)",
     builders="How many people placing pixels in parallel (default 1)."
 )
 async def progress_cmd(
     interaction: discord.Interaction,
-    source_channel: discord.TextChannel,
     template: discord.Attachment,
     coords: str,
     builders: int = 1,
 ):
     await interaction.response.defer(thinking=True)
+
+    try:
+        source_channel = await _get_text_channel_by_id(SOURCE_CHANNEL_ID)
+    except Exception as e:
+        await interaction.followup.send(f"❌ Source channel error: `{type(e).__name__}: {e}`")
+        return
 
     if not (template.content_type or "").startswith("image/"):
         await interaction.followup.send("❌ That template doesn’t look like an image.")
@@ -391,6 +414,7 @@ async def progress_cmd(
             content=(
                 f" **Template Progress**\n"
                 f"━━━━━━━━━━━━━━━━━━\n"
+                f" **Source**: {source_channel.mention}\n"
                 f" **Region**: `{box_w}×{box_h}`\n"
                 f" **Pixels**: `{matched:,} / {total:,}`\n"
                 f" **Completion**: **{pct:.2f}%**\n"
@@ -401,14 +425,12 @@ async def progress_cmd(
     except Exception as e:
         await interaction.followup.send(f"❌ /progress failed: `{type(e).__name__}: {e}`")
 
-# -------------------- /LIVE_PROGRESS --------------------
-
+# -------------------- /LIVE_PROGRESS (uses owner-set SOURCE_CHANNEL_ID) --------------------
 _active_checks: dict[tuple[int, int], asyncio.Task] = {}
 
-@bot.tree.command(name="live_progress", description="Live version of progress.")
+@bot.tree.command(name="live_progress", description="Live version of progress (uses owner-set source channel).")
 @app_commands.describe(
     mode="start or stop",
-    source_channel="Channel containing the latest canvas updates. (required)",
     template="Template image attachment (required).",
     coords="(x1,y1)(x2,y2)(x3,y3)(x4,y4) (required).",
     builders="How many people placing pixels in parallel (default 1).",
@@ -417,7 +439,6 @@ _active_checks: dict[tuple[int, int], asyncio.Task] = {}
 async def live_progress(
     interaction: discord.Interaction,
     mode: str,
-    source_channel: discord.TextChannel | None = None,
     template: discord.Attachment | None = None,
     coords: str | None = None,
     builders: int = 1,
@@ -441,8 +462,14 @@ async def live_progress(
             await interaction.response.send_message("No active /live_progress running.", ephemeral=True)
         return
 
-    if source_channel is None or template is None or coords is None:
-        await interaction.response.send_message("❌ Provide `source_channel`, `template`, and `coords`.", ephemeral=True)
+    if template is None or coords is None:
+        await interaction.response.send_message("❌ Provide `template` and `coords`.", ephemeral=True)
+        return
+
+    try:
+        source_channel = await _get_text_channel_by_id(SOURCE_CHANNEL_ID)
+    except Exception as e:
+        await interaction.response.send_message(f"❌ Source channel error: `{type(e).__name__}: {e}`", ephemeral=True)
         return
 
     if not (template.content_type or "").startswith("image/"):
@@ -469,7 +496,7 @@ async def live_progress(
 
     await interaction.response.send_message(
         f"✅ /live_progress started.\n"
-        f"• Watching: {source_channel.mention}\n"
+        f"• Source: {source_channel.mention}\n"
         f"• Poll: every **{POLL_SECONDS}s**\n"
         f"• Builders: **{builders}**\n"
         f"• Ping role: {ping_role.mention if ping_role else 'None'}\n"
@@ -518,6 +545,7 @@ async def live_progress(
                     msg = (
                         f" **Live Template Progress**\n"
                         f"━━━━━━━━━━━━━━━━━━\n"
+                        f" **Source**: {source_channel.mention}\n"
                         f" **Region**: `{box_w}×{box_h}`\n"
                         f" **Pixels**: `{matched:,} / {total:,}`\n"
                         f" **Completion**: **{pct:.2f}%**\n"
@@ -539,19 +567,17 @@ async def live_progress(
     task = asyncio.create_task(runner())
     _active_checks[key] = task
 
-# -------------------- /ARCHIEVED (LIVE IMAGE ARCHIVER) --------------------
+# -------------------- /ARCHIEVED (LIVE IMAGE ARCHIVER, uses owner-set SOURCE_CHANNEL_ID) --------------------
 _active_archives: dict[tuple[int, int], asyncio.Task] = {}
 
-@bot.tree.command(name="archieved", description="Continuously repost the latest image from a source channel.")
+@bot.tree.command(name="archieved", description="Continuously repost the latest image from the owner-set source channel.")
 @app_commands.describe(
     mode="start or stop",
-    source_channel="Channel to watch for the latest image.",
     output_channel="Where to post copies (defaults to where you run the command)."
 )
 async def archieved(
     interaction: discord.Interaction,
     mode: str,
-    source_channel: discord.TextChannel | None = None,
     output_channel: discord.TextChannel | None = None
 ):
     guild_id = interaction.guild_id or 0
@@ -572,8 +598,10 @@ async def archieved(
             await interaction.response.send_message("No active /archieved running.", ephemeral=True)
         return
 
-    if source_channel is None:
-        await interaction.response.send_message("❌ You must provide `source_channel`.", ephemeral=True)
+    try:
+        source_channel = await _get_text_channel_by_id(SOURCE_CHANNEL_ID)
+    except Exception as e:
+        await interaction.response.send_message(f"❌ Source channel error: `{type(e).__name__}: {e}`", ephemeral=True)
         return
 
     out_ch = output_channel or interaction.channel
@@ -587,7 +615,7 @@ async def archieved(
 
     await interaction.response.send_message(
         f"✅ /archieved started.\n"
-        f"• Watching: {source_channel.mention}\n"
+        f"• Source: {source_channel.mention}\n"
         f"• Posting to: {out_ch.mention}\n"
         f"• Poll: every **{POLL_SECONDS} seconds**\n"
         f"Stop with: `/archieved mode:stop`",
@@ -596,7 +624,6 @@ async def archieved(
 
     async def runner():
         import aiohttp
-
         last_sig: str | None = None
 
         while True:
@@ -627,403 +654,17 @@ async def archieved(
     task = asyncio.create_task(runner())
     _active_archives[key] = task
 
-# ===================== LIVE TEXT ARCHIVER + BARCHART GIF (FIELD-SAFE FIX) =====================
-import re
-from io import BytesIO
-from datetime import timedelta
-from typing import Optional
-
-_active_text_archivers: dict[tuple[int, int], asyncio.Task] = {}
-
-def _normalize_text(s: str) -> str:
-    s = s or ""
-    # normalize common unicode dashes to "-"
-    s = (s.replace("—", "-")
-           .replace("–", "-")
-           .replace("−", "-")
-           .replace("―", "-"))
-    # strip zero-width chars
-    s = s.replace("\u200b", "").replace("\u200c", "").replace("\u200d", "")
-    return s
-
-def _strip_markdown(s: str) -> str:
-    # remove some common markdown wrappers that bots use
-    s = s or ""
-    s = s.replace("**", "").replace("__", "").replace("*", "").replace("`", "")
-    return s
-
-# The exact format you want to detect:
-# 1. User1 - 192
-# 2. User2 - 282
-_LINE_RE = re.compile(
-    r"^\s*(\d+)\s*[\).:-]\s*(.+?)\s*-\s*([0-9][0-9,]*)\s*$"
-)
-
-def _extract_rank_lines_from_text(text: str) -> list[str]:
-    """
-    Pull ONLY numbered leaderboard lines from a text blob.
-    Returns normalized lines like: "1. Name - 123"
-    """
-    text = _strip_markdown(_normalize_text(text))
-    out: list[str] = []
-    for raw in (text.splitlines() if text else []):
-        ln = raw.strip()
-        if not ln:
-            continue
-        m = _LINE_RE.match(ln)
-        if not m:
-            continue
-        # rebuild clean canonical line
-        rank = m.group(1)
-        name = m.group(2).strip()
-        val = m.group(3).replace(",", "").strip()
-        out.append(f"{rank}. {name} - {val}")
-    return out
-
-def _pick_preferred_embed(msg: discord.Message) -> Optional[discord.Embed]:
-    """
-    Prefer an embed that contains 'Top Active Places' in title/description/fields,
-    else prefer 2nd embed, else last.
-    """
-    embeds = msg.embeds or []
-    if not embeds:
-        return None
-
-    def blob(e: discord.Embed) -> str:
-        parts = []
-        parts.append(str(e.title or ""))
-        parts.append(str(e.description or ""))
-        try:
-            for f in (e.fields or []):
-                parts.append(str(f.name or ""))
-                parts.append(str(f.value or ""))
-        except Exception:
-            pass
-        return "\n".join(parts).lower()
-
-    for e in embeds:
-        if "top active places" in blob(e):
-            return e
-
-    if len(embeds) >= 2:
-        return embeds[1]
-    return embeds[-1]
-
-def _extract_rank_lines_from_message(msg: discord.Message) -> list[str]:
-    """
-    Gets leaderboard numbered lines from:
-      1) preferred embed fields (most common)
-      2) preferred embed description
-      3) message content (fallback)
-    """
-    lines: list[str] = []
-
-    e = _pick_preferred_embed(msg)
-    if e:
-        # First: field values (this is usually where the list is)
-        try:
-            for f in (e.fields or []):
-                lines.extend(_extract_rank_lines_from_text(str(f.value or "")))
-        except Exception:
-            pass
-
-        # Second: description
-        lines.extend(_extract_rank_lines_from_text(str(e.description or "")))
-
-    # Fallback: content
-    if not lines and msg.content:
-        lines.extend(_extract_rank_lines_from_text(msg.content))
-
-    # de-dupe while preserving order
-    seen = set()
-    out = []
-    for ln in lines:
-        if ln not in seen:
-            seen.add(ln)
-            out.append(ln)
-    return out
-
-def _msg_fingerprint(m: discord.Message) -> str:
-    edited = m.edited_at.isoformat() if m.edited_at else ""
-    parts = [str(m.id), edited, (m.content or "").strip()]
-
-    # include all embed text (title/desc/fields) so edits are detected
-    if m.embeds:
-        for e in m.embeds:
-            parts.append((e.title or "").strip())
-            parts.append((e.description or "").strip())
-            try:
-                for f in (e.fields or []):
-                    parts.append((f.name or "").strip())
-                    parts.append((f.value or "").strip())
-            except Exception:
-                pass
-
-    return "\n".join(parts)
-
-def parse_leaderboard_from_lines(lines: list[str]) -> dict[str, int]:
-    """
-    Input lines must look like: "1. Name - 123"
-    Returns dict{name -> value}
-    """
-    out: dict[str, int] = {}
-    for ln in lines:
-        m = _LINE_RE.match(_normalize_text(_strip_markdown(ln)).strip())
-        if not m:
-            continue
-        name = m.group(2).strip()
-        val = int(m.group(3).replace(",", "").strip())
-        out[name] = val
-    return out
-
-def _pick_top(values: dict[str, int], top_n: int) -> list[tuple[str, int]]:
-    items = sorted(values.items(), key=lambda kv: kv[1], reverse=True)
-    return items[:max(1, int(top_n))]
-
-def _render_barchart_frame(*, title: str, items: list[tuple[str, int]], size: tuple[int, int] = (720, 420)):
-    from PIL import Image, ImageDraw, ImageFont
-
-    W, H = size
-    img = Image.new("RGBA", (W, H), (15, 16, 20, 255))
-    draw = ImageDraw.Draw(img)
-
-    try:
-        font_title = ImageFont.truetype("DejaVuSans.ttf", 26)
-        font_label = ImageFont.truetype("DejaVuSans.ttf", 18)
-        font_small = ImageFont.truetype("DejaVuSans.ttf", 14)
-    except Exception:
-        font_title = ImageFont.load_default()
-        font_label = ImageFont.load_default()
-        font_small = ImageFont.load_default()
-
-    pad = 18
-    draw.text((pad, pad), title, font=font_title, fill=(235, 235, 245, 255))
-
-    chart_top = pad + 44
-    chart_left = pad + 160
-    chart_right = W - pad
-    chart_bottom = H - pad - 18
-
-    draw.rectangle([pad, chart_top, W - pad, chart_bottom], outline=(60, 65, 80, 255), width=2)
-
-    if not items:
-        draw.text((pad, chart_top + 20), "No parsable data in this snapshot.", font=font_label, fill=(200, 200, 210, 255))
-        return img
-
-    max_val = max(v for _, v in items) or 1
-    rows = len(items)
-    row_h = max(22, (chart_bottom - chart_top) // rows)
-    bar_h = max(10, row_h - 10)
-
-    for i, (name, val) in enumerate(items):
-        y = chart_top + i * row_h + 8
-        draw.text((pad + 10, y - 4), name[:18], font=font_label, fill=(220, 220, 235, 255))
-
-        frac = val / max_val if max_val else 0
-        bw = int((chart_right - chart_left - 10) * frac)
-
-        x1 = chart_left
-        y1 = y
-        x2 = chart_left + bw
-        y2 = y + bar_h
-
-        draw.rectangle([x1, y1, x2, y2], fill=(120, 170, 255, 255))
-        draw.rectangle([x1, y1, chart_right - 10, y2], outline=(60, 65, 80, 255), width=1)
-
-        draw.text((chart_right - 10 - 90, y - 4), f"{val:,}", font=font_small, fill=(235, 235, 245, 255))
-
-    return img
-
-@bot.tree.command(name="archived_text", description="Mirror edited leaderboard text (Top Active Places).")
-@app_commands.describe(
-    mode="start or stop",
-    source_channel="Channel to watch (edited leaderboard message lives here).",
-    output_channel="Where to post mirrored updates (defaults to current channel).",
-    poll_seconds="How often to check (default 30)."
-)
-async def archived_text(
-    interaction: discord.Interaction,
-    mode: str,
-    source_channel: discord.TextChannel | None = None,
-    output_channel: discord.TextChannel | None = None,
-    poll_seconds: int = 30,
-):
-    guild_id = interaction.guild_id or 0
-    user_id = interaction.user.id
-    key = (guild_id, user_id)
-
-    mode = (mode or "").lower().strip()
-    if mode not in ("start", "stop"):
-        await interaction.response.send_message("Mode must be `start` or `stop`.", ephemeral=True)
-        return
-
-    if mode == "stop":
-        task = _active_text_archivers.pop(key, None)
-        if task and not task.done():
-            task.cancel()
-            await interaction.response.send_message("🛑 /archived_text stopped.", ephemeral=True)
-        else:
-            await interaction.response.send_message("No active /archived_text running.", ephemeral=True)
-        return
-
-    if source_channel is None:
-        await interaction.response.send_message("❌ Provide `source_channel`.", ephemeral=True)
-        return
-
-    out_ch = output_channel or interaction.channel
-    if not isinstance(out_ch, discord.TextChannel):
-        await interaction.response.send_message("❌ Output must be a normal text channel.", ephemeral=True)
-        return
-
-    poll_seconds = max(5, min(300, int(poll_seconds)))
-
-    old = _active_text_archivers.pop(key, None)
-    if old and not old.done():
-        old.cancel()
-
-    await interaction.response.send_message(
-        f"✅ /archived_text started.\n• Watching: {source_channel.mention}\n• Posting to: {out_ch.mention}\n• Poll: {poll_seconds}s",
-        ephemeral=True
-    )
-
-    async def runner():
-        last_fp: str | None = None
-        while True:
-            try:
-                msgs = [m async for m in source_channel.history(limit=1, oldest_first=False)]
-                if not msgs:
-                    await asyncio.sleep(poll_seconds)
-                    continue
-
-                m = msgs[0]
-                fp = _msg_fingerprint(m)
-
-                if fp != last_fp:
-                    last_fp = fp
-
-                    rank_lines = _extract_rank_lines_from_message(m)
-                    if not rank_lines:
-                        # don’t spam empty posts
-                        await asyncio.sleep(poll_seconds)
-                        continue
-
-                    # Mirror ONLY the leaderboard lines so /barchart can parse perfectly
-                    embed = discord.Embed(
-                        title="Top Active Places",
-                        description="\n".join(rank_lines)[:3900],
-                    )
-                    embed.set_footer(text=f"Source: #{source_channel.name} • msg_id={m.id}" + (" • edited" if m.edited_at else ""))
-                    await out_ch.send(embed=embed)
-
-            except asyncio.CancelledError:
-                raise
-            except Exception as e:
-                try:
-                    await out_ch.send(f"⚠️ /archived_text error: `{type(e).__name__}: {e}`")
-                except Exception:
-                    pass
-
-            await asyncio.sleep(poll_seconds)
-
-    task = asyncio.create_task(runner())
-    _active_text_archivers[key] = task
-
-
-@bot.tree.command(name="barchart", description="Makes a leaderboard time lapse")
-@app_commands.describe(
-    channel="Channel that contains archived_text leaderboard updates.",
-    hours="How far back to read (default 24).",
-    top="How many entries to show (default 10).",
-    fps="GIF FPS (default 8).",
-    max_frames="Limit frames (default 120)."
-)
-async def barchart(
-    interaction: discord.Interaction,
-    channel: discord.TextChannel,
-    hours: int = 24,
-    top: int = 10,
-    fps: int = 8,
-    max_frames: int = 120,
-):
-    from PIL import Image
-
-    hours = max(1, min(168, int(hours)))
-    top = max(3, min(25, int(top)))
-    fps = max(2, min(20, int(fps)))
-    max_frames = max(10, min(1000, int(max_frames)))
-
-    await interaction.response.defer(thinking=True)
-    cutoff = discord.utils.utcnow() - timedelta(hours=hours)
-
-    snapshots: list[tuple[discord.datetime.datetime, dict[str, int]]] = []
-
-    try:
-        async for msg in channel.history(limit=5000, after=cutoff, oldest_first=True):
-            rank_lines = _extract_rank_lines_from_message(msg)
-            data = parse_leaderboard_from_lines(rank_lines)
-            if data:
-                snapshots.append((msg.created_at, data))
-    except discord.Forbidden:
-        await interaction.followup.send("❌ I can’t read message history in that channel.")
-        return
-
-    if len(snapshots) < 2:
-        await interaction.followup.send(
-            "❌ Not enough parsable snapshots found (need at least 2).\n"
-            "Your archived posts MUST contain lines like: `1. Name - 123` (in the embed description or field)."
-        )
-        return
-
-    if len(snapshots) > max_frames:
-        step = len(snapshots) / max_frames
-        kept = []
-        idx = 0.0
-        while int(idx) < len(snapshots) and len(kept) < max_frames:
-            kept.append(snapshots[int(idx)])
-            idx += step
-        snapshots = kept
-
-    frames: list[Image.Image] = []
-    for ts, data in snapshots:
-        items = _pick_top(data, top)
-        title = f"Top Active Places • {ts.strftime('%Y-%m-%d %H:%M:%S')}"
-        frame = _render_barchart_frame(title=title, items=items, size=(720, 420))
-        frames.append(frame.convert("P", palette=Image.Palette.ADAPTIVE, colors=256))
-
-    out = BytesIO()
-    duration_ms = int(1000 / fps)
-    frames[0].save(
-        out,
-        format="GIF",
-        save_all=True,
-        append_images=frames[1:],
-        duration=duration_ms,
-        loop=0,
-        optimize=True,
-        disposal=2,
-    )
-    out.seek(0)
-
-    await interaction.followup.send(
-        content=f" Bar chart timelapse — {len(frames)} frames, {fps} fps, last {hours}h, top {top}",
-        file=discord.File(fp=out, filename="leaderboard_timelapse.gif")
-    )
-
-# ===================== END LIVE TEXT ARCHIVER + BARCHART GIF (FIELD-SAFE FIX) =====================
-
+# -------------------- PREFIX COMMAND: !check2009 --------------------
 @bot.command(name="check2009")
 async def check2009(ctx: commands.Context):
-    # Build list of guild info
     lines = []
     for g in bot.guilds:
-        # g.member_count is provided by Discord; may be approximate without members intent
         lines.append(f"- {g.name} | ID: {g.id} | Members: {g.member_count}")
 
     if not lines:
         await ctx.send("I'm not in any servers.")
         return
 
-    # Discord message limit is 2000 chars, so chunk it
     header = f"**Servers I'm in ({len(lines)}):**\n"
     msg = header
     for ln in lines:
@@ -1038,4 +679,8 @@ async def check2009(ctx: commands.Context):
 if __name__ == "__main__":
     if not DISCORD_TOKEN:
         raise RuntimeError("Missing DISCORD_TOKEN env var.")
+    if SOURCE_CHANNEL_ID == 0:
+        print("⚠️ SOURCE_CHANNEL_ID is not set. /progress /live_progress /archieved will fail until you set it.")
+    if TIMELAPSE_CHANNEL_ID == 0:
+        print("⚠️ TIMELAPSE_CHANNEL_ID is not set. /timelapse will fail until you set it.")
     bot.run(DISCORD_TOKEN)
