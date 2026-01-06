@@ -286,7 +286,7 @@ async def run_markarea_once(
     return out.read(), box_w, box_h, matched, total, pct
 
 # -------------------- /CANVAS (gets recent image from SOURCE_CHANNEL_ID) --------------------
-@bot.tree.command(name="canvas", description="Gets the most recent image from the owner-set source channel.")
+@bot.tree.command(name="canvas", description="Gets the most recent canvas from pixel place")
 async def canvas(interaction: discord.Interaction):
     await interaction.response.defer(thinking=True)
     try:
@@ -307,7 +307,7 @@ async def canvas(interaction: discord.Interaction):
 
         fp = BytesIO(img_bytes)
         await interaction.followup.send(
-            content=f"🖼️ Latest canvas image from {source_channel.mention}:",
+            content=f" Latest canvas image from {source_channel.mention}:",
             file=discord.File(fp=fp, filename="canvas_latest.png"),
         )
     except Exception as e:
@@ -502,7 +502,7 @@ async def progress_cmd(
 # -------------------- /LIVE_PROGRESS (uses owner-set SOURCE_CHANNEL_ID) --------------------
 _active_checks: dict[tuple[int, int], asyncio.Task] = {}
 
-@bot.tree.command(name="live_progress", description="Live version of progress (uses owner-set source channel).")
+@bot.tree.command(name="live_progress", description="Live version of progress.")
 @app_commands.describe(
     mode="start or stop",
     template="Template image attachment (required).",
@@ -644,7 +644,7 @@ async def live_progress(
 # -------------------- /ARCHIEVED (OWNER-ONLY, LIVE IMAGE ARCHIVER, uses SOURCE_CHANNEL_ID) --------------------
 _active_archives: dict[tuple[int, int], asyncio.Task] = {}
 
-@bot.tree.command(name="archieved", description="(Owner-only) Continuously repost the latest image from the owner-set source channel.")
+@bot.tree.command(name="archieved", description="(Owner-only)")
 @app_commands.describe(
     mode="start or stop",
     output_channel="Where to post copies (defaults to where you run the command)."
