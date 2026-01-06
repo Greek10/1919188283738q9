@@ -13,10 +13,8 @@ from discord.ext import commands
 # -------------------- CONFIG --------------------
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN", "").strip()
 
-# ETA rule (your confirmed rule)
 COOLDOWN_SECONDS_PER_PIXEL = 15
 
-# Poll interval for "event-ish" checks (seconds)
 POLL_SECONDS = 30
 
 # -------------------- DISCORD BOT --------------------
@@ -262,7 +260,7 @@ def _fit_resize(w: int, h: int, max_side: int) -> tuple[int, int]:
         nw = max(1, int(w * (max_side / h)))
     return nw, nh
 
-@bot.tree.command(name="stopmotion", description="Make a stop-motion GIF from images posted in this channel in the last N hours.")
+@bot.tree.command(name="timelapse", description="Creates a timelapse")
 @app_commands.describe(hours="Hours back (default 24).", fps="FPS (default 4).", max_frames="Max frames (default 60).", max_side="Max side (default 512).")
 async def stopmotion(interaction: discord.Interaction, hours: int = 24, fps: int = 4, max_frames: int = 60, max_side: int = 512):
     from PIL import Image
@@ -403,7 +401,8 @@ async def progress_cmd(
     except Exception as e:
         await interaction.followup.send(f"❌ /progress failed: `{type(e).__name__}: {e}`")
 
-# -------------------- /LIVE_PROGRESS (polls every 30s, posts on NEW/EDITED latest image message) --------------------
+# -------------------- /LIVE_PROGRESS --------------------
+
 _active_checks: dict[tuple[int, int], asyncio.Task] = {}
 
 @bot.tree.command(name="live_progress", description="Live version of progress.")
@@ -930,7 +929,7 @@ async def archived_text(
     _active_text_archivers[key] = task
 
 
-@bot.tree.command(name="barchart", description="Make leaderboard GIF from archived_text posts.")
+@bot.tree.command(name="barchart", description="Makes a leaderboard time lapse")
 @app_commands.describe(
     channel="Channel that contains archived_text leaderboard updates.",
     hours="How far back to read (default 24).",
@@ -951,7 +950,7 @@ async def barchart(
     hours = max(1, min(168, int(hours)))
     top = max(3, min(25, int(top)))
     fps = max(2, min(20, int(fps)))
-    max_frames = max(10, min(300, int(max_frames)))
+    max_frames = max(10, min(1000, int(max_frames)))
 
     await interaction.response.defer(thinking=True)
     cutoff = discord.utils.utcnow() - timedelta(hours=hours)
@@ -1006,7 +1005,7 @@ async def barchart(
     out.seek(0)
 
     await interaction.followup.send(
-        content=f"🎞️ Bar chart timelapse — {len(frames)} frames, {fps} fps, last {hours}h, top {top}",
+        content=f" Bar chart timelapse — {len(frames)} frames, {fps} fps, last {hours}h, top {top}",
         file=discord.File(fp=out, filename="leaderboard_timelapse.gif")
     )
 
