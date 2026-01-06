@@ -351,7 +351,7 @@ def _fit_resize(w: int, h: int, max_side: int) -> tuple[int, int]:
         nw = max(1, int(w * (max_side / h)))
     return nw, nh
 
-@bot.tree.command(name="timelapse", description="Creates a timelapse GIF from the owner-set timelapse channel.")
+@bot.tree.command(name="timelapse", description="Creates a timelapse for pixel place")
 @app_commands.describe(hours="Hours back (default 24).", fps="FPS (default 4).", max_frames="Max frames (default 60).", max_side="Max side (default 512).")
 async def timelapse(interaction: discord.Interaction, hours: int = 24, fps: int = 4, max_frames: int = 60, max_side: int = 512):
     from PIL import Image
@@ -437,12 +437,12 @@ async def timelapse(interaction: discord.Interaction, hours: int = 24, fps: int 
     out.seek(0)
 
     await interaction.followup.send(
-        content=f"GIF generated from {channel.mention} ({len(pal_frames)} frames, {fps} fps):",
+        content=f"Timelapse generated from {channel.mention} ({len(pal_frames)} frames, {fps} fps):",
         file=discord.File(fp=out, filename="timelapse.gif")
     )
 
 # -------------------- /PROGRESS (single run, uses owner-set SOURCE_CHANNEL_ID) --------------------
-@bot.tree.command(name="progress", description="Template progresser (uses owner-set source channel).")
+@bot.tree.command(name="progress", description="Template progresser")
 @app_commands.describe(
     template="Template image attachment.",
     coords="(x1,y1)(x2,y2)(x3,y3)(x4,y4)",
