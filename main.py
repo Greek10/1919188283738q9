@@ -506,9 +506,9 @@ _active_checks: dict[tuple[int, int], asyncio.Task] = {}
 @app_commands.describe(
     mode="start or stop",
     template="Template image attachment (required).",
-    coords="(x1,y1)(x2,y2)(x3,y3)(x4,y4) (required).",
-    builders="How many people placing pixels in parallel (default 1).",
-    ping_role="Role to ping if progress goes backwards (optional)."
+    coords="(0,0)(1,1)(2,2)(3,3) (required).",
+    builders="How many people placing (default 1).",
+    ping_role="Role to ping if attacks are detected (optional)."
 )
 async def live_progress(
     interaction: discord.Interaction,
