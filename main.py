@@ -692,15 +692,79 @@ async def _start_liveprogress_runner_from_payload(payload: dict):
     if old and not old.done():
         old.cancel()
 
-    async def runner():
-        last_sig: str | None = None
+async def runner():
+        import discord
+
         last_matched: int | None = None
+        last_post_id: int | None = None
 
         while True:
             try:
+                # Always pull the latest image URL each poll
                 sig, _url = await _find_latest_image_with_sig(source_channel)
                 if not sig:
                     await asyncio.sleep(POLL_SECONDS)
+                    continue
+
+                png_bytes, box_w, box_h, matched, total, pct = await run_markarea_once(
+                    source_channel=source_channel,
+                    template_bytes=template_bytes,
+                    coords=coords,
+                )
+
+                # Only update if something actually changed
+                if last_matched is not None and matched == last_matched:
+                    await asyncio.sleep(POLL_SECONDS)
+                    continue
+
+                # Optional: regression ping
+                if last_matched is not None and matched < last_matched and ping_role is not None:
+                    lost = last_matched - matched
+                    dec_pct = (lost / last_matched * 100.0) if last_matched > 0 else 0.0
+                    await out_ch.send(
+                        f"{ping_role.mention} ⚠️ Progress went backwards (**-{lost:,} px**, **-{dec_pct:.2f}%**)."
+                    )
+
+                remaining, _eta_seconds, h, m, s = _eta_from_progress(matched, total, builders)
+
+                # Build an embed (cleaner)
+                emb = discord.Embed(
+                    title="Live Template Progress",
+                    description=(
+                        f"**Source:** {source_channel.mention}\n"
+                        f"**Region:** `{box_w}×{box_h}`\n"
+                        f"**Pixels:** `{matched:,} / {total:,}`\n"
+                        f"**Completion:** **{pct:.2f}%**\n"
+                        f"**ETA:** **{h}h {m}m {s}s** (`{remaining:,}` px, builders={builders}, {COOLDOWN_SECONDS_PER_PIXEL}s/px)\n"
+                        f"**Updates:** every **{POLL_SECONDS}s**"
+                    ),
+                )
+
+                file = discord.File(fp=BytesIO(png_bytes), filename="template_progress.png")
+                emb.set_image(url="attachment://template_progress.png")
+
+                # Delete previous post (if any)
+                if last_post_id is not None:
+                    try:
+                        prev = await out_ch.fetch_message(last_post_id)
+                        await prev.delete()
+                    except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                        pass
+
+                # Post new
+                msg = await out_ch.send(embed=emb, file=file)
+                last_post_id = msg.id
+                last_matched = matched
+
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                try:
+                    await out_ch.send(f"⚠️ /live_progress error: `{type(e).__name__}: {e}`")
+                except Exception:
+                    pass
+
+            await asyncio.sleep(POLL_SECONDS)
                     continue
 
                 if sig != last_sig:
