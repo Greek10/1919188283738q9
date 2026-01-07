@@ -43,7 +43,7 @@ async def on_ready():
     except Exception as e:
         print("⚠️ Restore failed:", e)
 
-# -------------------- OWNER HELPERS --------------------
+# ------------------- OWNER HELPERS --------------------
 def _is_owner_user_id(user_id: int) -> bool:
     return bool(BOT_OWNER_ID) and user_id == BOT_OWNER_ID
 
