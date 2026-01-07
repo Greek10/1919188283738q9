@@ -286,7 +286,7 @@ async def run_markarea_once(
     return out.read(), box_w, box_h, matched, total, pct
 
 # -------------------- /CANVAS (gets recent image from SOURCE_CHANNEL_ID) --------------------
-@bot.tree.command(name="canvas", description="Gets the most recent image from the owner-set source channel.")
+@bot.tree.command(name="canvas", description="Gets the most recent canvas from pixel place")
 async def canvas(interaction: discord.Interaction):
     await interaction.response.defer(thinking=True)
     try:
@@ -307,7 +307,7 @@ async def canvas(interaction: discord.Interaction):
 
         fp = BytesIO(img_bytes)
         await interaction.followup.send(
-            content=f"🖼️ Latest canvas image from {source_channel.mention}:",
+            content=f" Latest canvas image from {source_channel.mention}:",
             file=discord.File(fp=fp, filename="canvas_latest.png"),
         )
     except Exception as e:
@@ -351,9 +351,9 @@ def _fit_resize(w: int, h: int, max_side: int) -> tuple[int, int]:
         nw = max(1, int(w * (max_side / h)))
     return nw, nh
 
-@bot.tree.command(name="timelapse", description="Creates a timelapse GIF from the owner-set timelapse channel.")
-@app_commands.describe(hours="Hours back (default 24).", fps="FPS (default 4).", max_frames="Max frames (default 60).", max_side="Max side (default 512).")
-async def timelapse(interaction: discord.Interaction, hours: int = 24, fps: int = 4, max_frames: int = 60, max_side: int = 512):
+@bot.tree.command(name="timelapse", description="Creates a timelapse for pixel place")
+@app_commands.describe(hours="Hours back (default 12).", fps="FPS (default 4).", max_frames="Max frames (default 60).", max_side="Max side (default 600).")
+async def timelapse(interaction: discord.Interaction, hours: int = 12, fps: int = 4, max_frames: int = 60, max_side: int = 600):
     from PIL import Image
     import aiohttp
 
@@ -365,8 +365,8 @@ async def timelapse(interaction: discord.Interaction, hours: int = 24, fps: int 
         await interaction.followup.send(f"❌ Timelapse source channel error: `{type(e).__name__}: {e}`")
         return
 
-    hours = max(1, min(168, int(hours)))
-    fps = max(1, min(15, int(fps)))
+    hours = max(1, min(24, int(hours)))
+    fps = max(1, min(30, int(fps)))
     max_frames = max(1, min(1000, int(max_frames)))
     max_side = max(64, min(1024, int(max_side)))
 
@@ -437,12 +437,12 @@ async def timelapse(interaction: discord.Interaction, hours: int = 24, fps: int 
     out.seek(0)
 
     await interaction.followup.send(
-        content=f"GIF generated from {channel.mention} ({len(pal_frames)} frames, {fps} fps):",
+        content=f"Timelapse generated from {channel.mention} ({len(pal_frames)} frames, {fps} fps):",
         file=discord.File(fp=out, filename="timelapse.gif")
     )
 
 # -------------------- /PROGRESS (single run, uses owner-set SOURCE_CHANNEL_ID) --------------------
-@bot.tree.command(name="progress", description="Template progresser (uses owner-set source channel).")
+@bot.tree.command(name="progress", description="Template progresser")
 @app_commands.describe(
     template="Template image attachment.",
     coords="(x1,y1)(x2,y2)(x3,y3)(x4,y4)",
@@ -502,13 +502,13 @@ async def progress_cmd(
 # -------------------- /LIVE_PROGRESS (uses owner-set SOURCE_CHANNEL_ID) --------------------
 _active_checks: dict[tuple[int, int], asyncio.Task] = {}
 
-@bot.tree.command(name="live_progress", description="Live version of progress (deletes previous update).")
+@bot.tree.command(name="live_progress", description="Live version of progress.")
 @app_commands.describe(
     mode="start or stop",
     template="Template image attachment (required).",
-    coords="(x1,y1)(x2,y2)(x3,y3)(x4,y4) (required).",
-    builders="How many people placing pixels in parallel (default 1).",
-    ping_role="Role to ping if progress goes backwards (optional)."
+    coords="(0,0)(1,1)(2,2)(3,3) (required).",
+    builders="How many people placing (default 1).",
+    ping_role="Role to ping if attacks are detected (optional)."
 )
 async def live_progress(
     interaction: discord.Interaction,
@@ -679,7 +679,7 @@ async def live_progress(
 # -------------------- /ARCHIEVED (OWNER-ONLY, LIVE IMAGE ARCHIVER, uses SOURCE_CHANNEL_ID) --------------------
 _active_archives: dict[tuple[int, int], asyncio.Task] = {}
 
-@bot.tree.command(name="archieved", description="(Owner-only) Continuously repost the latest image from the owner-set source channel.")
+@bot.tree.command(name="archieved", description="(Owner-only)")
 @app_commands.describe(
     mode="start or stop",
     output_channel="Where to post copies (defaults to where you run the command)."
