@@ -915,52 +915,6 @@ async def check2009(ctx: commands.Context):
     if msg.strip():
         await ctx.send(msg)
 
-# -------------------- /SIZE (PIXEL UPSCALE) --------------------
-@bot.tree.command(name="size", description="Upscale an image")
-@app_commands.describe(
-    image="Image to upscale",
-    factor="Scale factor (default 5, max 20)"
-)
-async def size(
-    interaction: discord.Interaction,
-    image: discord.Attachment,
-    factor: int = 5,
-):
-    from PIL import Image
-
-    factor = max(1, min(20, int(factor)))
-
-    if not (image.content_type or "").startswith("image/"):
-        await interaction.response.send_message("❌ Please upload a valid image.", ephemeral=True)
-        return
-
-    await interaction.response.defer(thinking=True)
-
-    try:
-        img_bytes = await image.read()
-        img = Image.open(BytesIO(img_bytes)).convert("RGBA")
-
-        w, h = img.size
-        new_w, new_h = w * factor, h * factor
-
-        # Nearest-neighbor = pixel-perfect scaling
-        upscaled = img.resize(
-            (new_w, new_h),
-            resample=Image.Resampling.NEAREST
-        )
-
-        out = BytesIO()
-        upscaled.save(out, format="PNG")
-        out.seek(0)
-
-        await interaction.followup.send(
-            content=f" Upscaled **{w}×{h} → {new_w}×{new_h}** (×{factor})",
-            file=discord.File(fp=out, filename="upscaled.png")
-        )
-
-    except Exception as e:
-        await interaction.followup.send(f"❌ /size failed: `{type(e).__name__}: {e}`")
-
 # -------------------- START --------------------
 if __name__ == "__main__":
     if not DISCORD_TOKEN:
