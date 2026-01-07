@@ -13,6 +13,8 @@ from discord.ext import commands
 # -------------------- CONFIG --------------------
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN", "").strip()
 
+LIVEPROGRESS_LOG_CHANNEL_ID = int(os.getenv("LIVEPROGRESS_LOG_CHANNEL_ID", "0") or "0")
+
 SOURCE_CHANNEL_ID = int(os.getenv("SOURCE_CHANNEL_ID", "0") or "0")          # for /progress /live_progress /archieved + /canvas
 TIMELAPSE_CHANNEL_ID = int(os.getenv("TIMELAPSE_CHANNEL_ID", "0") or "0")    # for /timelapse
 
@@ -30,6 +32,16 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 async def on_ready():
     await bot.tree.sync()
     print(f"✅ Logged in as {bot.user}")
+
+    # 🔁 Auto-restore live_progress sessions from log channel
+    try:
+        if LIVEPROGRESS_LOG_CHANNEL_ID:
+            logs = await _load_all_liveprogress_logs()
+            for payload in logs:
+                await _start_liveprogress_runner_from_payload(payload)
+            print(f"🔁 Restored live_progress sessions: {len(logs)}")
+    except Exception as e:
+        print("⚠️ Restore failed:", e)
 
 # -------------------- OWNER HELPERS --------------------
 def _is_owner_user_id(user_id: int) -> bool:
@@ -499,94 +511,190 @@ async def progress_cmd(
     except Exception as e:
         await interaction.followup.send(f"❌ /progress failed: `{type(e).__name__}: {e}`")
 
+# -------------------- LIVE_PROGRESS PERSISTENCE (LOG CHANNEL) --------------------
+import json
+
+_LOG_TAG = "LIVE_PROGRESS_LOG_V1"
+
+async def _get_log_channel() -> discord.TextChannel:
+    if not LIVEPROGRESS_LOG_CHANNEL_ID:
+        raise RuntimeError("LIVEPROGRESS_LOG_CHANNEL_ID is not set.")
+    ch = bot.get_channel(LIVEPROGRESS_LOG_CHANNEL_ID)
+    if ch is None:
+        ch = await bot.fetch_channel(LIVEPROGRESS_LOG_CHANNEL_ID)
+    if not isinstance(ch, discord.TextChannel):
+        raise RuntimeError("LIVEPROGRESS_LOG_CHANNEL_ID is not a text channel.")
+    return ch
+
+def _make_liveprogress_payload(
+    *,
+    guild: discord.Guild,
+    output_channel_id: int,
+    coords: str,
+    template_url: str,
+    template_filename: str,
+    builders: int,
+    ping_role_id: int | None,
+) -> dict:
+    return {
+        "tag": _LOG_TAG,
+        "guild_id": guild.id,
+        "guild_name": guild.name,
+        "output_channel_id": int(output_channel_id),
+        "coords": coords,
+        "template_url": template_url,
+        "template_filename": template_filename,
+        "builders": int(builders),
+        "ping_role_id": int(ping_role_id) if ping_role_id else None,
+    }
+
+async def _post_liveprogress_log(payload: dict) -> int:
+    """
+    Creates a log message in the log channel and returns log message id.
+    """
+    log_ch = await _get_log_channel()
+
+    # Human readable embed + machine readable JSON
+    emb = discord.Embed(
+        title="Live Progress Session (Logged)",
+        description=(
+            f"**Server:** {payload.get('guild_name')}\n"
+            f"**Output Channel ID:** `{payload.get('output_channel_id')}`\n"
+            f"**Coords:** `{payload.get('coords')}`\n"
+            f"**Template:** `{payload.get('template_filename')}`\n"
+            f"**Builders:** `{payload.get('builders')}`\n"
+            f"**Ping Role ID:** `{payload.get('ping_role_id')}`"
+        )
+    )
+
+    content = "```json\n" + json.dumps(payload, ensure_ascii=False) + "\n```"
+    m = await log_ch.send(content=content, embed=emb)
+    return m.id
+
+async def _find_log_message_for_guild(guild_id: int) -> discord.Message | None:
+    """
+    Finds the newest log message matching this guild id.
+    """
+    if not LIVEPROGRESS_LOG_CHANNEL_ID:
+        return None
+    log_ch = await _get_log_channel()
+
+    async for msg in log_ch.history(limit=200, oldest_first=False):
+        if msg.author.id != bot.user.id:
+            continue
+        if not msg.content or _LOG_TAG not in msg.content:
+            continue
+
+        # Try parse JSON from ```json ... ```
+        try:
+            start = msg.content.find("{")
+            end = msg.content.rfind("}")
+            if start == -1 or end == -1:
+                continue
+            data = json.loads(msg.content[start:end+1])
+            if data.get("tag") == _LOG_TAG and int(data.get("guild_id", 0)) == int(guild_id):
+                return msg
+        except Exception:
+            continue
+
+    return None
+
+async def _delete_liveprogress_log(guild_id: int):
+    msg = await _find_log_message_for_guild(guild_id)
+    if msg:
+        try:
+            await msg.delete()
+        except Exception:
+            pass
+
+async def _load_all_liveprogress_logs() -> list[dict]:
+    """
+    Reads log channel and returns list of payload dicts.
+    """
+    if not LIVEPROGRESS_LOG_CHANNEL_ID:
+        return []
+    log_ch = await _get_log_channel()
+
+    out: list[dict] = []
+    async for msg in log_ch.history(limit=200, oldest_first=True):
+        if msg.author.id != bot.user.id:
+            continue
+        if not msg.content or _LOG_TAG not in msg.content:
+            continue
+        try:
+            start = msg.content.find("{")
+            end = msg.content.rfind("}")
+            if start == -1 or end == -1:
+                continue
+            data = json.loads(msg.content[start:end+1])
+            if data.get("tag") == _LOG_TAG:
+                out.append(data)
+        except Exception:
+            continue
+
+    return out
+
 # -------------------- /LIVE_PROGRESS (uses owner-set SOURCE_CHANNEL_ID) --------------------
-_active_checks: dict[tuple[int, int], asyncio.Task] = {}
+_active_checks: dict[int, asyncio.Task] = {}            # key = guild_id
+_liveprogress_log_msg_id: dict[int, int] = {}           # key = guild_id -> log message id (optional)
 
-@bot.tree.command(name="live_progress", description="Live version of progress.")
-@app_commands.describe(
-    mode="start or stop",
-    template="Template image attachment (required).",
-    coords="(0,0)(1,1)(2,2)(3,3) (required).",
-    builders="How many people placing (default 1).",
-    ping_role="Role to ping if attacks are detected (optional)."
-)
-async def live_progress(
-    interaction: discord.Interaction,
-    mode: str,
-    template: discord.Attachment | None = None,
-    coords: str | None = None,
-    builders: int = 1,
-    ping_role: discord.Role | None = None,
-):
-    guild_id = interaction.guild_id or 0
-    user_id = interaction.user.id
-    key = (guild_id, user_id)
-
-    mode = (mode or "").lower().strip()
-    if mode not in ("start", "stop"):
-        await interaction.response.send_message("Mode must be `start` or `stop`.", ephemeral=True)
+async def _start_liveprogress_runner_from_payload(payload: dict):
+    """
+    Starts live progress for a guild from a saved payload (used on restore).
+    """
+    guild_id = int(payload.get("guild_id", 0))
+    if not guild_id:
         return
 
-    # STOP
-    if mode == "stop":
-        task = _active_checks.pop(key, None)
-        if task and not task.done():
-            task.cancel()
-            await interaction.response.send_message("🛑 /live_progress stopped.", ephemeral=True)
-        else:
-            await interaction.response.send_message("No active /live_progress running.", ephemeral=True)
-        return
-
-    # START validation
-    if template is None or coords is None:
-        await interaction.response.send_message("❌ Provide `template` and `coords`.", ephemeral=True)
+    # Only restore if bot is still in that guild
+    guild = discord.utils.get(bot.guilds, id=guild_id)
+    if not guild:
         return
 
     try:
         source_channel = await _get_text_channel_by_id(SOURCE_CHANNEL_ID)
-    except Exception as e:
-        await interaction.response.send_message(f"❌ Source channel error: `{type(e).__name__}: {e}`", ephemeral=True)
+    except Exception:
         return
 
-    if not (template.content_type or "").startswith("image/"):
-        await interaction.response.send_message("❌ That template doesn’t look like an image.", ephemeral=True)
+    # Output channel
+    out_ch_id = int(payload.get("output_channel_id", 0))
+    if not out_ch_id:
         return
 
-    try:
-        parse_coords_4pairs(coords)
-    except Exception as e:
-        await interaction.response.send_message(f"❌ Invalid coords: {e}", ephemeral=True)
-        return
-
-    template_bytes = await template.read()
-    builders = max(1, int(builders))
-
-    out_ch = interaction.channel
+    out_ch = bot.get_channel(out_ch_id)
+    if out_ch is None:
+        try:
+            out_ch = await bot.fetch_channel(out_ch_id)
+        except Exception:
+            return
     if not isinstance(out_ch, discord.TextChannel):
-        await interaction.response.send_message("This command must be used in a normal text channel.", ephemeral=True)
         return
 
-    # cancel old if exists
-    old = _active_checks.pop(key, None)
+    coords = str(payload.get("coords") or "").strip()
+    template_url = str(payload.get("template_url") or "").strip()
+    if not coords or not template_url:
+        return
+
+    builders = max(1, int(payload.get("builders", 1)))
+    ping_role_id = payload.get("ping_role_id")
+    ping_role = guild.get_role(int(ping_role_id)) if ping_role_id else None
+
+    # Download template bytes from saved URL
+    import aiohttp
+    try:
+        async with aiohttp.ClientSession() as session:
+            template_bytes = await _download_bytes(session, template_url, timeout_s=45)
+    except Exception:
+        return
+
+    # Stop any existing runner for this guild
+    old = _active_checks.pop(guild_id, None)
     if old and not old.done():
         old.cancel()
-
-    await interaction.response.send_message(
-        f"✅ /live_progress started.\n"
-        f"• Source: {source_channel.mention}\n"
-        f"• Poll: every **{POLL_SECONDS}s**\n"
-        f"• Builders: **{builders}**\n"
-        f"• Ping role: {ping_role.mention if ping_role else 'None'}\n"
-        f"Stop with: `/live_progress mode:stop`",
-        ephemeral=True
-    )
 
     async def runner():
         last_sig: str | None = None
         last_matched: int | None = None
-
-        # Track the previously posted message so we can delete it
-        last_posted_msg: discord.Message | None = None
 
         while True:
             try:
@@ -604,7 +712,7 @@ async def live_progress(
                         coords=coords,
                     )
 
-                    # Regression detection ping (separate message so it isn't lost)
+                    # Regression ping
                     if last_matched is not None and matched < last_matched and ping_role is not None:
                         lost = last_matched - matched
                         dec_pct = (lost / last_matched * 100.0) if last_matched > 0 else 0.0
@@ -613,7 +721,6 @@ async def live_progress(
                             f"(**-{lost:,} px**, **-{dec_pct:.2f}%**)."
                         )
 
-                    # Optional "progress made" message (separate, you can remove if you want)
                     if last_matched is not None and matched > last_matched:
                         gained = matched - last_matched
                         inc_pct = (gained / total * 100.0) if total > 0 else 0.0
@@ -623,58 +730,112 @@ async def live_progress(
 
                     remaining, _eta_seconds, h, m, s = _eta_from_progress(matched, total, builders)
 
-                    # Build embed + attach image
-                    embed = discord.Embed(
-                        title="Live Template Progress",
-                        description=(
-                            f"**Source**: {source_channel.mention}\n"
-                            f"**Region**: `{box_w}×{box_h}`\n"
-                            f"**Pixels**: `{matched:,} / {total:,}`\n"
-                            f"**Completion**: **{pct:.2f}%**\n"
-                            f"**ETA**: **{h}h {m}m {s}s** (`{remaining:,}` px, builders={builders}, {COOLDOWN_SECONDS_PER_PIXEL}s/px)\n"
-                            f"**Update**: new/edited image detected."
-                        ),
+                    # ✅ Post new update (you asked: repost, but delete previous is separate — you can add that later if desired)
+                    out = BytesIO(png_bytes)
+                    msg = (
+                        f" **Live Template Progress**\n"
+                        f"━━━━━━━━━━━━━━━━━━\n"
+                        f" **Source**: {source_channel.mention}\n"
+                        f" **Region**: `{box_w}×{box_h}`\n"
+                        f" **Pixels**: `{matched:,} / {total:,}`\n"
+                        f" **Completion**: **{pct:.2f}%**\n"
+                        f" **ETA**: **{h}h {m}m {s}s**  (`{remaining:,}` px, builders={builders}, {COOLDOWN_SECONDS_PER_PIXEL}s/px)\n"
+                        f" **Source update detected** (new/edited image message)."
                     )
-
-                    fp = BytesIO(png_bytes)
-                    file = discord.File(fp=fp, filename="template_progress.png")
-                    embed.set_image(url="attachment://template_progress.png")
-
-                    # Post new message first (so you never end up with none if delete fails)
-                    new_msg = await out_ch.send(embed=embed, file=file)
-
-                    # Delete previous live message
-                    if last_posted_msg is not None:
-                        try:
-                            await last_posted_msg.delete()
-                        except discord.Forbidden:
-                            # Bot lacks Manage Messages in this channel
-                            pass
-                        except discord.NotFound:
-                            pass
-                        except Exception:
-                            pass
-
-                    last_posted_msg = new_msg
+                    await out_ch.send(content=msg, file=discord.File(fp=out, filename="template_progress.png"))
 
             except asyncio.CancelledError:
-                # optional: delete the last live message when stopping
-                if last_posted_msg is not None:
-                    try:
-                        await last_posted_msg.delete()
-                    except Exception:
-                        pass
                 raise
-            except Exception as e:
-                try:
-                    await out_ch.send(f"⚠️ /live_progress error: `{type(e).__name__}: {e}`")
-                except Exception:
-                    pass
+            except Exception:
+                pass
 
             await asyncio.sleep(POLL_SECONDS)
 
-    task = asyncio.create_task(runner())
-    _active_checks[key] = task
+    _active_checks[guild_id] = asyncio.create_task(runner())
+
+
+@bot.tree.command(name="live_progress", description="Live version of progress.")
+@app_commands.describe(
+    mode="start or stop",
+    template="Template image attachment (required).",
+    coords="(x1,y1)(x2,y2)(x3,y3)(x4,y4) (required).",
+    builders="How many people placing pixels in parallel (default 1).",
+    ping_role="Role to ping if progress goes backwards (optional)."
+)
+async def live_progress(
+    interaction: discord.Interaction,
+    mode: str,
+    template: discord.Attachment | None = None,
+    coords: str | None = None,
+    builders: int = 1,
+    ping_role: discord.Role | None = None,
+):
+    guild = interaction.guild
+    if guild is None:
+        await interaction.response.send_message("This command only works in a server.", ephemeral=True)
+        return
+
+    guild_id = guild.id
+    mode = (mode or "").lower().strip()
+
+    if mode not in ("start", "stop"):
+        await interaction.response.send_message("Mode must be `start` or `stop`.", ephemeral=True)
+        return
+
+    if mode == "stop":
+        task = _active_checks.pop(guild_id, None)
+        if task and not task.done():
+            task.cancel()
+
+        # delete log
+        try:
+            await _delete_liveprogress_log(guild_id)
+        except Exception:
+            pass
+
+        await interaction.response.send_message("🛑 /live_progress stopped (and log removed).", ephemeral=True)
+        return
+
+    # start
+    if template is None or coords is None:
+        await interaction.response.send_message("❌ Provide `template` and `coords`.", ephemeral=True)
+        return
+
+    if not (template.content_type or "").startswith("image/"):
+        await interaction.response.send_message("❌ That template doesn’t look like an image.", ephemeral=True)
+        return
+
+    try:
+        parse_coords_4pairs(coords)
+    except Exception as e:
+        await interaction.response.send_message(f"❌ Invalid coords: {e}", ephemeral=True)
+        return
+
+    # create log entry (persistent)
+    try:
+        payload = _make_liveprogress_payload(
+            guild=guild,
+            output_channel_id=interaction.channel_id,
+            coords=coords,
+            template_url=template.url,                 # ✅ this is what lets restore work
+            template_filename=template.filename,
+            builders=max(1, int(builders)),
+            ping_role_id=ping_role.id if ping_role else None,
+        )
+        # Remove old log first so there is only one per guild
+        await _delete_liveprogress_log(guild_id)
+        await _post_liveprogress_log(payload)
+    except Exception as e:
+        await interaction.response.send_message(f"⚠️ Could not write restore log: `{type(e).__name__}: {e}`", ephemeral=True)
+        return
+
+    await interaction.response.send_message(
+        "✅ /live_progress started and logged for auto-restore.\n"
+        f"Stop with: `/live_progress mode:stop`",
+        ephemeral=True
+    )
+
+    await _start_liveprogress_runner_from_payload(payload)
 
 # -------------------- /ARCHIEVED (OWNER-ONLY, LIVE IMAGE ARCHIVER, uses SOURCE_CHANNEL_ID) --------------------
 _active_archives: dict[tuple[int, int], asyncio.Task] = {}
