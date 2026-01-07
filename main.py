@@ -765,7 +765,6 @@ async def runner():
                     pass
 
             await asyncio.sleep(POLL_SECONDS)
-                    continue
 
                 if sig != last_sig:
                     last_sig = sig
