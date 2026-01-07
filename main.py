@@ -352,8 +352,8 @@ def _fit_resize(w: int, h: int, max_side: int) -> tuple[int, int]:
     return nw, nh
 
 @bot.tree.command(name="timelapse", description="Creates a timelapse for pixel place")
-@app_commands.describe(hours="Hours back (default 24).", fps="FPS (default 4).", max_frames="Max frames (default 60).", max_side="Max side (default 512).")
-async def timelapse(interaction: discord.Interaction, hours: int = 24, fps: int = 4, max_frames: int = 60, max_side: int = 512):
+@app_commands.describe(hours="Hours back (default 12).", fps="FPS (default 4).", max_frames="Max frames (default 60).", max_side="Max side (default 600).")
+async def timelapse(interaction: discord.Interaction, hours: int = 12, fps: int = 4, max_frames: int = 60, max_side: int = 600):
     from PIL import Image
     import aiohttp
 
@@ -365,8 +365,8 @@ async def timelapse(interaction: discord.Interaction, hours: int = 24, fps: int 
         await interaction.followup.send(f"❌ Timelapse source channel error: `{type(e).__name__}: {e}`")
         return
 
-    hours = max(1, min(168, int(hours)))
-    fps = max(1, min(15, int(fps)))
+    hours = max(1, min(24, int(hours)))
+    fps = max(1, min(30, int(fps)))
     max_frames = max(1, min(1000, int(max_frames)))
     max_side = max(64, min(1024, int(max_side)))
 
@@ -527,6 +527,7 @@ async def live_progress(
         await interaction.response.send_message("Mode must be `start` or `stop`.", ephemeral=True)
         return
 
+    # STOP
     if mode == "stop":
         task = _active_checks.pop(key, None)
         if task and not task.done():
@@ -536,6 +537,7 @@ async def live_progress(
             await interaction.response.send_message("No active /live_progress running.", ephemeral=True)
         return
 
+    # START validation
     if template is None or coords is None:
         await interaction.response.send_message("❌ Provide `template` and `coords`.", ephemeral=True)
         return
@@ -564,6 +566,7 @@ async def live_progress(
         await interaction.response.send_message("This command must be used in a normal text channel.", ephemeral=True)
         return
 
+    # cancel old if exists
     old = _active_checks.pop(key, None)
     if old and not old.done():
         old.cancel()
@@ -582,6 +585,9 @@ async def live_progress(
         last_sig: str | None = None
         last_matched: int | None = None
 
+        # Track the previously posted message so we can delete it
+        last_posted_msg: discord.Message | None = None
+
         while True:
             try:
                 sig, _url = await _find_latest_image_with_sig(source_channel)
@@ -598,6 +604,7 @@ async def live_progress(
                         coords=coords,
                     )
 
+                    # Regression detection ping (separate message so it isn't lost)
                     if last_matched is not None and matched < last_matched and ping_role is not None:
                         lost = last_matched - matched
                         dec_pct = (lost / last_matched * 100.0) if last_matched > 0 else 0.0
@@ -606,6 +613,7 @@ async def live_progress(
                             f"(**-{lost:,} px**, **-{dec_pct:.2f}%**)."
                         )
 
+                    # Optional "progress made" message (separate, you can remove if you want)
                     if last_matched is not None and matched > last_matched:
                         gained = matched - last_matched
                         inc_pct = (gained / total * 100.0) if total > 0 else 0.0
@@ -615,20 +623,47 @@ async def live_progress(
 
                     remaining, _eta_seconds, h, m, s = _eta_from_progress(matched, total, builders)
 
-                    out = BytesIO(png_bytes)
-                    msg = (
-                        f" **Live Template Progress**\n"
-                        f"━━━━━━━━━━━━━━━━━━\n"
-                        f" **Source**: {source_channel.mention}\n"
-                        f" **Region**: `{box_w}×{box_h}`\n"
-                        f" **Pixels**: `{matched:,} / {total:,}`\n"
-                        f" **Completion**: **{pct:.2f}%**\n"
-                        f" **ETA**: **{h}h {m}m {s}s**  (`{remaining:,}` px, builders={builders}, {COOLDOWN_SECONDS_PER_PIXEL}s/px)\n"
-                        f" **Source update detected** (new/edited image message)."
+                    # Build embed + attach image
+                    embed = discord.Embed(
+                        title="Live Template Progress",
+                        description=(
+                            f"**Source**: {source_channel.mention}\n"
+                            f"**Region**: `{box_w}×{box_h}`\n"
+                            f"**Pixels**: `{matched:,} / {total:,}`\n"
+                            f"**Completion**: **{pct:.2f}%**\n"
+                            f"**ETA**: **{h}h {m}m {s}s** (`{remaining:,}` px, builders={builders}, {COOLDOWN_SECONDS_PER_PIXEL}s/px)\n"
+                            f"**Update**: new/edited image detected."
+                        ),
                     )
-                    await out_ch.send(content=msg, file=discord.File(fp=out, filename="template_progress.png"))
+
+                    fp = BytesIO(png_bytes)
+                    file = discord.File(fp=fp, filename="template_progress.png")
+                    embed.set_image(url="attachment://template_progress.png")
+
+                    # Post new message first (so you never end up with none if delete fails)
+                    new_msg = await out_ch.send(embed=embed, file=file)
+
+                    # Delete previous live message
+                    if last_posted_msg is not None:
+                        try:
+                            await last_posted_msg.delete()
+                        except discord.Forbidden:
+                            # Bot lacks Manage Messages in this channel
+                            pass
+                        except discord.NotFound:
+                            pass
+                        except Exception:
+                            pass
+
+                    last_posted_msg = new_msg
 
             except asyncio.CancelledError:
+                # optional: delete the last live message when stopping
+                if last_posted_msg is not None:
+                    try:
+                        await last_posted_msg.delete()
+                    except Exception:
+                        pass
                 raise
             except Exception as e:
                 try:
