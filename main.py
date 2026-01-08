@@ -634,9 +634,7 @@ async def live_progress(
 
     await interaction.response.send_message(
         content=(
-            f"✅ **Live progress started**\n"
-            f"• Source: {source_channel.mention}\n"
-            f"• Poll: every **{POLL_SECONDS}s**\n"
+            f" **Live progress started**\n"
             f"• Builders: **{builders}**\n"
             f"• Ping role: {ping_role.mention if ping_role else 'None'}\n"
             f"Use the buttons below."
