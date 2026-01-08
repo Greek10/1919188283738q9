@@ -499,22 +499,91 @@ async def progress_cmd(
     except Exception as e:
         await interaction.followup.send(f"❌ /progress failed: `{type(e).__name__}: {e}`")
 
-# -------------------- /LIVE_PROGRESS (uses owner-set SOURCE_CHANNEL_ID) --------------------
+# -------------------- /LIVE_PROGRESS (buttons: Extract / Pause / Stop) --------------------
+# Replace your entire current /LIVE_PROGRESS block with this.
+
 _active_checks: dict[tuple[int, int], asyncio.Task] = {}
 
-@bot.tree.command(name="live_progress", description="Live version of progress.")
+class LiveProgressControls(discord.ui.View):
+    def __init__(self, session_key: tuple[int, int], *, timeout: float | None = None):
+        super().__init__(timeout=timeout)
+        self.session_key = session_key
+
+    async def _get_session(self):
+        return _live_sessions.get(self.session_key)
+
+    @discord.ui.button(label="Extract", style=discord.ButtonStyle.secondary)
+    async def extract_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        session = await self._get_session()
+        if not session:
+            await interaction.response.send_message("❌ No active live progress session.", ephemeral=True)
+            return
+
+        fp = BytesIO(session["template_bytes"])
+        await interaction.response.send_message(
+            content="📌 Template used for this live progress:",
+            file=discord.File(fp=fp, filename=session["template_filename"]),
+            ephemeral=True
+        )
+
+    @discord.ui.button(label="Pause", style=discord.ButtonStyle.primary)
+    async def pause_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        session = await self._get_session()
+        if not session:
+            await interaction.response.send_message("❌ No active live progress session.", ephemeral=True)
+            return
+
+        session["paused"] = not session["paused"]
+        paused = session["paused"]
+
+        button.label = "Resume" if paused else "Pause"
+        button.style = discord.ButtonStyle.success if paused else discord.ButtonStyle.primary
+
+        # Update the control message UI
+        try:
+            await interaction.response.edit_message(view=self)
+        except Exception:
+            try:
+                await interaction.response.send_message("✅ Toggled pause.", ephemeral=True)
+            except Exception:
+                pass
+
+    @discord.ui.button(label="Stop", style=discord.ButtonStyle.danger)
+    async def stop_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        # Cancel task + disable buttons
+        task = _active_checks.pop(self.session_key, None)
+        _live_sessions.pop(self.session_key, None)
+
+        if task and not task.done():
+            task.cancel()
+
+        for child in self.children:
+            if isinstance(child, discord.ui.Button):
+                child.disabled = True
+
+        try:
+            await interaction.response.edit_message(content="🛑 Live progress stopped.", view=self)
+        except Exception:
+            try:
+                await interaction.response.send_message("🛑 Live progress stopped.", ephemeral=True)
+            except Exception:
+                pass
+
+
+# Session state stored in-memory (not persistent across restarts)
+_live_sessions: dict[tuple[int, int], dict] = {}
+
+@bot.tree.command(name="live_progress", description="Live template progress.")
 @app_commands.describe(
-    mode="start or stop",
     template="Template image attachment (required).",
-    coords="(0,0)(1,1)(2,2)(3,3) (required).",
+    coords="(x1,y1)(x2,y2)(x3,y3)(x4,y4) (required).",
     builders="How many people placing (default 1).",
     ping_role="Role to ping if attacks are detected (optional)."
 )
 async def live_progress(
     interaction: discord.Interaction,
-    mode: str,
-    template: discord.Attachment | None = None,
-    coords: str | None = None,
+    template: discord.Attachment,
+    coords: str,
     builders: int = 1,
     ping_role: discord.Role | None = None,
 ):
@@ -522,32 +591,14 @@ async def live_progress(
     user_id = interaction.user.id
     key = (guild_id, user_id)
 
-    mode = (mode or "").lower().strip()
-    if mode not in ("start", "stop"):
-        await interaction.response.send_message("Mode must be `start` or `stop`.", ephemeral=True)
-        return
-
-    # STOP
-    if mode == "stop":
-        task = _active_checks.pop(key, None)
-        if task and not task.done():
-            task.cancel()
-            await interaction.response.send_message("🛑 /live_progress stopped.", ephemeral=True)
-        else:
-            await interaction.response.send_message("No active /live_progress running.", ephemeral=True)
-        return
-
-    # START validation
-    if template is None or coords is None:
-        await interaction.response.send_message("❌ Provide `template` and `coords`.", ephemeral=True)
-        return
-
+    # Validate source channel
     try:
         source_channel = await _get_text_channel_by_id(SOURCE_CHANNEL_ID)
     except Exception as e:
         await interaction.response.send_message(f"❌ Source channel error: `{type(e).__name__}: {e}`", ephemeral=True)
         return
 
+    # Validate template + coords
     if not (template.content_type or "").startswith("image/"):
         await interaction.response.send_message("❌ That template doesn’t look like an image.", ephemeral=True)
         return
@@ -558,43 +609,69 @@ async def live_progress(
         await interaction.response.send_message(f"❌ Invalid coords: {e}", ephemeral=True)
         return
 
-    template_bytes = await template.read()
     builders = max(1, int(builders))
 
-    out_ch = interaction.channel
-    if not isinstance(out_ch, discord.TextChannel):
-        await interaction.response.send_message("This command must be used in a normal text channel.", ephemeral=True)
+    # Read template bytes once
+    try:
+        template_bytes = await template.read()
+    except Exception as e:
+        await interaction.response.send_message(f"❌ Failed to read template: `{e}`", ephemeral=True)
         return
 
-    # cancel old if exists
+    # Cancel any existing session for this user in this guild
     old = _active_checks.pop(key, None)
     if old and not old.done():
         old.cancel()
+    _live_sessions.pop(key, None)
+
+    # Create controls + initial message
+    view = LiveProgressControls(key, timeout=None)
+    _live_sessions[key] = {
+        "paused": False,
+        "template_bytes": template_bytes,
+        "template_filename": (template.filename or "template.png"),
+    }
 
     await interaction.response.send_message(
-        f"✅ /live_progress started.\n"
-        f"• Source: {source_channel.mention}\n"
-        f"• Poll: every **{POLL_SECONDS}s**\n"
-        f"• Builders: **{builders}**\n"
-        f"• Ping role: {ping_role.mention if ping_role else 'None'}\n"
-        f"Stop with: `/live_progress mode:stop`",
-        ephemeral=True
+        content=(
+            f"✅ **Live progress started**\n"
+            f"• Source: {source_channel.mention}\n"
+            f"• Poll: every **{POLL_SECONDS}s**\n"
+            f"• Builders: **{builders}**\n"
+            f"• Ping role: {ping_role.mention if ping_role else 'None'}\n"
+            f"Use the buttons below."
+        ),
+        view=view,
+        ephemeral=False
     )
+
+    # Track live output message (we'll keep the “delete previous update” behavior)
+    out_ch = interaction.channel
+    if not isinstance(out_ch, discord.TextChannel):
+        # Buttons still exist on the control message, but live updates require a text channel
+        return
 
     async def runner():
         last_sig: str | None = None
         last_matched: int | None = None
-
-        # Track the previously posted message so we can delete it
         last_posted_msg: discord.Message | None = None
 
         while True:
             try:
+                session = _live_sessions.get(key)
+                if not session:
+                    return
+
+                if session.get("paused"):
+                    await asyncio.sleep(POLL_SECONDS)
+                    continue
+
                 sig, _url = await _find_latest_image_with_sig(source_channel)
                 if not sig:
                     await asyncio.sleep(POLL_SECONDS)
                     continue
 
+                # Only post when the source changes (new msg OR edit)
                 if sig != last_sig:
                     last_sig = sig
 
@@ -604,7 +681,7 @@ async def live_progress(
                         coords=coords,
                     )
 
-                    # Regression detection ping (separate message so it isn't lost)
+                    # Regression ping
                     if last_matched is not None and matched < last_matched and ping_role is not None:
                         lost = last_matched - matched
                         dec_pct = (lost / last_matched * 100.0) if last_matched > 0 else 0.0
@@ -613,7 +690,7 @@ async def live_progress(
                             f"(**-{lost:,} px**, **-{dec_pct:.2f}%**)."
                         )
 
-                    # Optional "progress made" message (separate, you can remove if you want)
+                    # Optional progress-made note (no ping)
                     if last_matched is not None and matched > last_matched:
                         gained = matched - last_matched
                         inc_pct = (gained / total * 100.0) if total > 0 else 0.0
@@ -623,7 +700,6 @@ async def live_progress(
 
                     remaining, _eta_seconds, h, m, s = _eta_from_progress(matched, total, builders)
 
-                    # Build embed + attach image
                     embed = discord.Embed(
                         title="Live Template Progress",
                         description=(
@@ -632,7 +708,7 @@ async def live_progress(
                             f"**Pixels**: `{matched:,} / {total:,}`\n"
                             f"**Completion**: **{pct:.2f}%**\n"
                             f"**ETA**: **{h}h {m}m {s}s** (`{remaining:,}` px, builders={builders}, {COOLDOWN_SECONDS_PER_PIXEL}s/px)\n"
-                            f"**Update**: new/edited image detected."
+                            f"**Update**: source changed (new/edited)."
                         ),
                     )
 
@@ -640,31 +716,20 @@ async def live_progress(
                     file = discord.File(fp=fp, filename="template_progress.png")
                     embed.set_image(url="attachment://template_progress.png")
 
-                    # Post new message first (so you never end up with none if delete fails)
                     new_msg = await out_ch.send(embed=embed, file=file)
 
-                    # Delete previous live message
+                    # Delete previous update message
                     if last_posted_msg is not None:
                         try:
                             await last_posted_msg.delete()
-                        except discord.Forbidden:
-                            # Bot lacks Manage Messages in this channel
-                            pass
-                        except discord.NotFound:
-                            pass
                         except Exception:
                             pass
 
                     last_posted_msg = new_msg
 
             except asyncio.CancelledError:
-                # optional: delete the last live message when stopping
-                if last_posted_msg is not None:
-                    try:
-                        await last_posted_msg.delete()
-                    except Exception:
-                        pass
-                raise
+                # If stopped via button, silently end
+                return
             except Exception as e:
                 try:
                     await out_ch.send(f"⚠️ /live_progress error: `{type(e).__name__}: {e}`")
