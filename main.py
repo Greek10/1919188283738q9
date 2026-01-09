@@ -631,21 +631,26 @@ async def progress_cmd(
     except Exception as e:
         await interaction.followup.send(f"❌ /progress failed: `{type(e).__name__}: {e}`")
 
-# -------------------- /LIVE_PROGRESS (buttons + preset support) --------------------
+# -------------------- /LIVE_PROGRESS (buttons: Extract / Pause / Stop + preset title) --------------------
+# Replace your entire current /LIVE_PROGRESS block with this.
+
 _active_checks: dict[tuple[int, int], asyncio.Task] = {}
+
+# Session state stored in-memory (not persistent across restarts)
 _live_sessions: dict[tuple[int, int], dict] = {}
+
 
 class LiveProgressControls(discord.ui.View):
     def __init__(self, session_key: tuple[int, int], *, timeout: float | None = None):
         super().__init__(timeout=timeout)
         self.session_key = session_key
 
-    async def _get_session(self):
+    def _get_session(self) -> dict | None:
         return _live_sessions.get(self.session_key)
 
     @discord.ui.button(label="Extract", style=discord.ButtonStyle.secondary)
     async def extract_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
-        session = await self._get_session()
+        session = self._get_session()
         if not session:
             await interaction.response.send_message("❌ No active live progress session.", ephemeral=True)
             return
@@ -659,12 +664,12 @@ class LiveProgressControls(discord.ui.View):
 
     @discord.ui.button(label="Pause", style=discord.ButtonStyle.primary)
     async def pause_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
-        session = await self._get_session()
+        session = self._get_session()
         if not session:
             await interaction.response.send_message("❌ No active live progress session.", ephemeral=True)
             return
 
-        session["paused"] = not session.get("paused", False)
+        session["paused"] = not bool(session.get("paused", False))
         paused = session["paused"]
 
         button.label = "Resume" if paused else "Pause"
@@ -698,21 +703,22 @@ class LiveProgressControls(discord.ui.View):
             except Exception:
                 pass
 
+
 @bot.tree.command(name="live_progress", description="Live template progress.")
 @app_commands.describe(
-    preset="Optional preset name (use /preset to make one)",
-    template="Template image attachment (optional if using preset).",
-    coords="(x1,y1)(x2,y2)(x3,y3)(x4,y4) (optional if using preset).",
+    template="Template image attachment (required(optional if using preset)).",
+    coords="(x1,y1)(x2,y2)(x3,y3)(x4,y4) (required(optional if using preset)).",
     builders="How many people placing (default 1).",
-    ping_role="Role to ping if attacks are detected (optional if using preset)"
+    ping_role="Role to ping if attacks are detected (optional).",
+    preset="Optional preset name (Use /preset to make one)."
 )
 async def live_progress(
     interaction: discord.Interaction,
-    preset: str | None = None,
-    template: discord.Attachment | None = None,
-    coords: str | None = None,
+    template: discord.Attachment,
+    coords: str,
     builders: int = 1,
     ping_role: discord.Role | None = None,
+    preset: str | None = None,
 ):
     guild_id = interaction.guild_id or 0
     user_id = interaction.user.id
@@ -725,31 +731,9 @@ async def live_progress(
         await interaction.response.send_message(f"❌ Source channel error: `{type(e).__name__}: {e}`", ephemeral=True)
         return
 
-    builders = max(1, int(builders))
-
-    preset_data: dict | None = None
-    if preset:
-        try:
-            preset_data = await load_preset_by_name(preset)
-        except Exception as e:
-            await interaction.response.send_message(f"❌ Failed to read presets: `{type(e).__name__}: {e}`", ephemeral=True)
-            return
-
-        if not preset_data:
-            await interaction.response.send_message(f"❌ Preset **{preset}** not found.", ephemeral=True)
-            return
-
-        # Fill missing coords / ping_role from preset
-        if coords is None:
-            coords = preset_data.get("coords")
-
-        if ping_role is None:
-            rid = int(preset_data.get("ping_role_id") or 0)
-            if rid and interaction.guild:
-                ping_role = interaction.guild.get_role(rid)
-
-    if not coords:
-        await interaction.response.send_message("❌ Missing coords. Provide `coords` or `preset`.", ephemeral=True)
+    # Validate template + coords
+    if not (template.content_type or "").startswith("image/"):
+        await interaction.response.send_message("❌ That template doesn’t look like an image.", ephemeral=True)
         return
 
     try:
@@ -758,36 +742,16 @@ async def live_progress(
         await interaction.response.send_message(f"❌ Invalid coords: {e}", ephemeral=True)
         return
 
-    # Template bytes: prefer upload, else from preset
-    template_bytes: bytes | None = None
-    template_filename: str = "template.png"
+    builders = max(1, int(builders))
 
-    if template is not None:
-        if not (template.content_type or "").startswith("image/"):
-            await interaction.response.send_message("❌ That template doesn’t look like an image.", ephemeral=True)
-            return
+    # Read template bytes once
+    try:
         template_bytes = await template.read()
-        template_filename = template.filename or "template.png"
-    else:
-        if not preset_data:
-            await interaction.response.send_message("❌ Missing template. Provide `template` or `preset`.", ephemeral=True)
-            return
-        turl = preset_data.get("template_url")
-        if not turl:
-            await interaction.response.send_message("❌ Preset has no template_url.", ephemeral=True)
-            return
-        try:
-            template_bytes = await _download_template_url(turl)
-            template_filename = preset_data.get("template_filename") or "template.png"
-        except Exception as e:
-            await interaction.response.send_message(f"❌ Failed to download preset template: `{e}`", ephemeral=True)
-            return
-
-    if template_bytes is None:
-        await interaction.response.send_message("❌ Template bytes missing.", ephemeral=True)
+    except Exception as e:
+        await interaction.response.send_message(f"❌ Failed to read template: `{e}`", ephemeral=True)
         return
 
-    # Cancel any existing session
+    # Cancel any existing session for this user in this guild
     old = _active_checks.pop(key, None)
     if old and not old.done():
         old.cancel()
@@ -798,21 +762,25 @@ async def live_progress(
     _live_sessions[key] = {
         "paused": False,
         "template_bytes": template_bytes,
-        "template_filename": template_filename,
-        "coords": coords,
+        "template_filename": (template.filename or "template.png"),
+        "preset_name": (preset or "").strip(),  # <-- used for embed title
         "builders": builders,
-        "ping_role_id": int(ping_role.id) if ping_role else 0,
-        "preset_name": preset or "",
+        "coords": coords,
+        "ping_role_id": int(ping_role.id) if ping_role else None,
     }
 
     await interaction.response.send_message(
         content=(
             f" **Live progress started**\n"
-            f"• Preset: **{preset}**\n" if preset else " **Live progress started**\n"
-        ) + (
             f"• Builders: **{builders}**\n"
             f"• Ping role: {ping_role.mention if ping_role else 'None'}\n"
-            f"Use the buttons below."
+            f"• Preset: **{preset}**" if preset else
+            (
+                f" **Live progress started**\n"
+                f"• Builders: **{builders}**\n"
+                f"• Ping role: {ping_role.mention if ping_role else 'None'}\n"
+                f"Use the buttons below."
+            )
         ),
         view=view,
         ephemeral=False
@@ -837,26 +805,32 @@ async def live_progress(
                     await asyncio.sleep(POLL_SECONDS)
                     continue
 
-                # allow changes later if you expand controls
-                coords_local = session.get("coords", coords)
-                builders_local = int(session.get("builders", builders))
-                ping_role_id = int(session.get("ping_role_id") or 0)
-                ping_role_local = interaction.guild.get_role(ping_role_id) if (interaction.guild and ping_role_id) else ping_role
+                # If you ever add “Change builders/template/role”, read them from session here.
+                builders_local = max(1, int(session.get("builders") or builders))
+                ping_role_local = None
+                try:
+                    pr_id = session.get("ping_role_id")
+                    if pr_id and interaction.guild:
+                        ping_role_local = interaction.guild.get_role(int(pr_id))
+                except Exception:
+                    ping_role_local = None
 
                 sig, _url = await _find_latest_image_with_sig(source_channel)
                 if not sig:
                     await asyncio.sleep(POLL_SECONDS)
                     continue
 
+                # Only post when the source changes (new msg OR edit)
                 if sig != last_sig:
                     last_sig = sig
 
                     png_bytes, box_w, box_h, matched, total, pct = await run_markarea_once(
                         source_channel=source_channel,
                         template_bytes=template_bytes,
-                        coords=coords_local,
+                        coords=session.get("coords") or coords,
                     )
 
+                    # Regression ping
                     if last_matched is not None and matched < last_matched and ping_role_local is not None:
                         lost = last_matched - matched
                         dec_pct = (lost / last_matched * 100.0) if last_matched > 0 else 0.0
@@ -865,6 +839,7 @@ async def live_progress(
                             f"(**-{lost:,} px**, **-{dec_pct:.2f}%**)."
                         )
 
+                    # Optional progress-made note (no ping)
                     if last_matched is not None and matched > last_matched:
                         gained = matched - last_matched
                         inc_pct = (gained / total * 100.0) if total > 0 else 0.0
@@ -874,8 +849,12 @@ async def live_progress(
 
                     remaining, _eta_seconds, h, m, s = _eta_from_progress(matched, total, builders_local)
 
+                    # ✅ Title change: if preset_name exists -> "<Preset> progress"
+                    preset_name = (session.get("preset_name") or "").strip()
+                    title = f"{preset_name.title()} progress" if preset_name else "Live Template Progress"
+
                     embed = discord.Embed(
-                        title="Live Template Progress",
+                        title=title,
                         description=(
                             f"**Source**: {source_channel.mention}\n"
                             f"**Region**: `{box_w}×{box_h}`\n"
@@ -892,6 +871,7 @@ async def live_progress(
 
                     new_msg = await out_ch.send(embed=embed, file=file)
 
+                    # Delete previous update message
                     if last_posted_msg is not None:
                         try:
                             await last_posted_msg.delete()
