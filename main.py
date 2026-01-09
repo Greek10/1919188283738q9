@@ -701,12 +701,10 @@ async def live_progress(
                     embed = discord.Embed(
                         title="Live Template Progress",
                         description=(
-                            f"**Source**: {source_channel.mention}\n"
                             f"**Region**: `{box_w}×{box_h}`\n"
                             f"**Pixels**: `{matched:,} / {total:,}`\n"
                             f"**Completion**: **{pct:.2f}%**\n"
                             f"**ETA**: **{h}h {m}m {s}s** (`{remaining:,}` px, builders={builders}, {COOLDOWN_SECONDS_PER_PIXEL}s/px)\n"
-                            f"**Update**: source changed (new/edited)."
                         ),
                     )
 
