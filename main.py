@@ -655,7 +655,12 @@ class LiveProgressControls(discord.ui.View):
             await interaction.response.send_message("❌ No active live progress session.", ephemeral=True)
             return
 
-        fp = BytesIO(session["template_bytes"])
+        tb = session.get("template_bytes")
+        if not tb:
+            await interaction.response.send_message("❌ No template loaded for this session.", ephemeral=True)
+            return
+
+        fp = BytesIO(tb)
         await interaction.response.send_message(
             content="📌 Template used for this live progress:",
             file=discord.File(fp=fp, filename=session.get("template_filename", "template.png")),
@@ -706,16 +711,16 @@ class LiveProgressControls(discord.ui.View):
 
 @bot.tree.command(name="live_progress", description="Live template progress.")
 @app_commands.describe(
-    template="Template image attachment (required(optional if using preset)).",
-    coords="(x1,y1)(x2,y2)(x3,y3)(x4,y4) (required(optional if using preset)).",
+    template="Optional: template image attachment (if not using preset).",
+    coords="Optional: (x1,y1)(x2,y2)(x3,y3)(x4,y4) (if not using preset).",
     builders="How many people placing (default 1).",
     ping_role="Role to ping if attacks are detected (optional).",
-    preset="Optional preset name (Use /preset to make one)."
+    preset="Optional preset name (use /preset to make one)"
 )
 async def live_progress(
     interaction: discord.Interaction,
-    template: discord.Attachment,
-    coords: str,
+    template: discord.Attachment | None = None,
+    coords: str | None = None,
     builders: int = 1,
     ping_role: discord.Role | None = None,
     preset: str | None = None,
@@ -731,24 +736,39 @@ async def live_progress(
         await interaction.response.send_message(f"❌ Source channel error: `{type(e).__name__}: {e}`", ephemeral=True)
         return
 
-    # Validate template + coords
-    if not (template.content_type or "").startswith("image/"):
-        await interaction.response.send_message("❌ That template doesn’t look like an image.", ephemeral=True)
-        return
-
-    try:
-        parse_coords_4pairs(coords)
-    except Exception as e:
-        await interaction.response.send_message(f"❌ Invalid coords: {e}", ephemeral=True)
-        return
-
     builders = max(1, int(builders))
 
-    # Read template bytes once
-    try:
-        template_bytes = await template.read()
-    except Exception as e:
-        await interaction.response.send_message(f"❌ Failed to read template: `{e}`", ephemeral=True)
+    # --- Resolve template + coords ---
+    # If you have a preset system elsewhere, this is where you’d fill template_bytes/coords from it.
+    template_bytes: bytes | None = None
+    template_filename: str = "template.png"
+
+    # Use uploaded template if provided
+    if template is not None:
+        if not (template.content_type or "").startswith("image/"):
+            await interaction.response.send_message("❌ That template doesn’t look like an image.", ephemeral=True)
+            return
+        try:
+            template_bytes = await template.read()
+            template_filename = template.filename or "template.png"
+        except Exception as e:
+            await interaction.response.send_message(f"❌ Failed to read template: `{e}`", ephemeral=True)
+            return
+
+    # Validate coords if provided
+    if coords is not None:
+        try:
+            parse_coords_4pairs(coords)
+        except Exception as e:
+            await interaction.response.send_message(f"❌ Invalid coords: {e}", ephemeral=True)
+            return
+
+    # If no preset AND missing either template or coords -> cannot run
+    if not preset and (template_bytes is None or coords is None):
+        await interaction.response.send_message(
+            "❌ You must provide **template + coords**, or provide a **preset** (that supplies them).",
+            ephemeral=True
+        )
         return
 
     # Cancel any existing session for this user in this guild
@@ -761,26 +781,23 @@ async def live_progress(
     view = LiveProgressControls(key, timeout=None)
     _live_sessions[key] = {
         "paused": False,
-        "template_bytes": template_bytes,
-        "template_filename": (template.filename or "template.png"),
-        "preset_name": (preset or "").strip(),  # <-- used for embed title
+        "template_bytes": template_bytes,                 # may be None if relying on preset (your preset system should fill it)
+        "template_filename": template_filename,
+        "preset_name": (preset or "").strip(),
         "builders": builders,
-        "coords": coords,
+        "coords": coords,                                # may be None if relying on preset
         "ping_role_id": int(ping_role.id) if ping_role else None,
     }
 
+    # Control message (buttons live here)
+    preset_line = f"\n• Preset: **{preset}**" if preset else ""
     await interaction.response.send_message(
         content=(
             f" **Live progress started**\n"
             f"• Builders: **{builders}**\n"
-            f"• Ping role: {ping_role.mention if ping_role else 'None'}\n"
-            f"• Preset: **{preset}**" if preset else
-            (
-                f" **Live progress started**\n"
-                f"• Builders: **{builders}**\n"
-                f"• Ping role: {ping_role.mention if ping_role else 'None'}\n"
-                f"Use the buttons below."
-            )
+            f"• Ping role: {ping_role.mention if ping_role else 'None'}"
+            f"{preset_line}\n"
+            f"Use the buttons below."
         ),
         view=view,
         ephemeral=False
@@ -805,8 +822,9 @@ async def live_progress(
                     await asyncio.sleep(POLL_SECONDS)
                     continue
 
-                # If you ever add “Change builders/template/role”, read them from session here.
                 builders_local = max(1, int(session.get("builders") or builders))
+
+                # Resolve ping role each loop (in case you later add change buttons)
                 ping_role_local = None
                 try:
                     pr_id = session.get("ping_role_id")
@@ -814,6 +832,15 @@ async def live_progress(
                         ping_role_local = interaction.guild.get_role(int(pr_id))
                 except Exception:
                     ping_role_local = None
+
+                # ✅ Ensure we have template+coords before doing work
+                tb = session.get("template_bytes")
+                cc = session.get("coords")
+
+                # If your preset system fills these later, we just wait
+                if not tb or not cc:
+                    await asyncio.sleep(POLL_SECONDS)
+                    continue
 
                 sig, _url = await _find_latest_image_with_sig(source_channel)
                 if not sig:
@@ -826,8 +853,8 @@ async def live_progress(
 
                     png_bytes, box_w, box_h, matched, total, pct = await run_markarea_once(
                         source_channel=source_channel,
-                        template_bytes=template_bytes,
-                        coords=session.get("coords") or coords,
+                        template_bytes=tb,
+                        coords=cc,
                     )
 
                     # Regression ping
@@ -892,6 +919,7 @@ async def live_progress(
 
     task = asyncio.create_task(runner())
     _active_checks[key] = task
+
 
 # -------------------- /ARCHIEVED (OWNER-ONLY, LIVE IMAGE ARCHIVER, uses SOURCE_CHANNEL_ID) --------------------
 _active_archives: dict[tuple[int, int], asyncio.Task] = {}
