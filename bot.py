@@ -5,7 +5,7 @@ from io import BytesIO
 from datetime import timedelta
 import re
 import math
-
+from aiohttp import web
 import discord
 from discord import app_commands
 from discord.ext import commands
@@ -1148,6 +1148,20 @@ async def check2009(ctx: commands.Context):
         msg += ln + "\n"
     if msg.strip():
         await ctx.send(msg)
+async def handle_ping(request):
+    return web.Response(text="Bot is alive!")
+
+async def start_keep_alive_server():
+    app = web.Application()
+    app.add_routes([web.get("/", handle_ping)])
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", 8080)  # Port 8080 for free hosts
+    await site.start()
+    print("🌐 Keep-alive server running on port 8080")
+
+# Start server inside bot loop
+bot.loop.create_task(start_keep_alive_server())
 
 # -------------------- START --------------------
 if __name__ == "__main__":
