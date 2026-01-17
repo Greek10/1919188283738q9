@@ -1,3 +1,4 @@
 discord.py
 pillow
 psycopg2-binary
+aiohttp
