@@ -484,8 +484,23 @@ class OwnerPanel(discord.ui.View):
 
         try:
             msg = await interaction.client.wait_for("message", check=check, timeout=60)
-            channel_id, content = msg.content.split(" ", 1)
-            channel = interaction.client.get_channel(int(channel_id))
+            parts = msg.content.strip().split()
+
+if len(parts) < 2:
+    await interaction.followup.send(
+        "❌ Format must be:\n`<channel_id> <message>`",
+        ephemeral=True
+    )
+    return
+
+channel_id = parts[0]
+
+if not channel_id.isdigit():
+    await interaction.followup.send("❌ Channel ID must be numeric.", ephemeral=True)
+    return
+
+content = msg.content.strip()[len(channel_id) + 1:]
+channel = interaction.client.get_channel(int(channel_id))
         except Exception:
             await interaction.followup.send("Invalid format.", ephemeral=True)
             return
