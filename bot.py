@@ -1149,6 +1149,26 @@ async def check2009(ctx: commands.Context):
     if msg.strip():
         await ctx.send(msg)
 
+from aiohttp import web
+import asyncio
+
+async def handle(request):
+    return web.Response(text="OK")
+
+async def start_web():
+    app = web.Application()
+    app.router.add_get("/", handle)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", 10000)
+    await site.start()
+
+async def main():
+    await start_web()
+    await bot.start(DISCORD_TOKEN)
+
+asyncio.run(main())
+
 # -------------------- START --------------------
 if __name__ == "__main__":
     if not DISCORD_TOKEN:
