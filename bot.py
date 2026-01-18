@@ -1149,26 +1149,6 @@ async def check2009(ctx: commands.Context):
     if msg.strip():
         await ctx.send(msg)
 
-from aiohttp import web
-import asyncio
-
-async def handle(request):
-    return web.Response(text="OK")
-
-async def start_web():
-    app = web.Application()
-    app.router.add_get("/", handle)
-    runner = web.AppRunner(app)
-    await runner.setup()
-    site = web.TCPSite(runner, "0.0.0.0", 10000)
-    await site.start()
-
-async def main():
-    await start_web()
-    await bot.start(DISCORD_TOKEN)
-
-asyncio.run(main())
-
 # -------------------- START --------------------
 if __name__ == "__main__":
     if not DISCORD_TOKEN:
@@ -1185,4 +1165,27 @@ if __name__ == "__main__":
     if TIMELAPSE_CHANNEL_ID == 0:
         print("⚠️ TIMELAPSE_CHANNEL_ID is not set. /timelapse will fail until you set it.")
 
-    bot.run(DISCORD_TOKEN)
+from aiohttp import web
+import os
+import asyncio
+
+async def handle(request):
+    return web.Response(text="OK")
+
+async def start_web():
+    app = web.Application()
+    app.router.add_get("/", handle)
+
+    runner = web.AppRunner(app)
+    await runner.setup()
+
+    port = int(os.environ.get("PORT", 10000))
+    site = web.TCPSite(runner, "0.0.0.0", port)
+    await site.start()
+
+async def main():
+    await start_web()
+    await bot.start(DISCORD_TOKEN)
+
+if __name__ == "__main__":
+    asyncio.run(main())
