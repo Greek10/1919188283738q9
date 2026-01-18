@@ -7,7 +7,7 @@ import re
 import math
 
 import discord
-from discord import app_commands
+from discord import app_commands, Interaction
 from discord.ext import commands
 
 # ----------------- CONFIG --------------------
