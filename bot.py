@@ -417,31 +417,124 @@ async def preset_cmd(
         ephemeral=True
     )
 
-# -------------------- /CHECK (OWNER-ONLY) --------------------
-@bot.tree.command(name="check", description="(Owner)")
+# -------------------- OWNER CONTROL PANEL --------------------
+
+BLACKLISTED_GUILDS = set()  # persist this later if needed
+
+
+class OwnerPanel(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=180)
+
+    # -------- CHECK BUTTON --------
+    @discord.ui.button(label="Check Servers", style=discord.ButtonStyle.primary)
+    async def check_servers(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if await _deny_if_not_owner_interaction(interaction):
+            return
+
+        lines = [
+            f"- {g.name} (ID: {g.id}) — Members: {g.member_count}"
+            for g in interaction.client.guilds
+        ]
+
+        if not lines:
+            await interaction.response.send_message(
+                "I'm not in any servers.", ephemeral=True
+            )
+            return
+
+        msg = "**Servers:**\n" + "\n".join(lines[:50])
+        await interaction.response.send_message(msg, ephemeral=True)
+
+    # -------- BLACKLIST BUTTON --------
+    @discord.ui.button(label="Blacklist Server", style=discord.ButtonStyle.danger)
+    async def blacklist_server(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if await _deny_if_not_owner_interaction(interaction):
+            return
+
+        await interaction.response.send_message(
+            "Send the **Server ID** to blacklist.", ephemeral=True
+        )
+
+        def check(m: discord.Message):
+            return (
+                m.author.id == interaction.user.id
+                and m.channel == interaction.channel
+            )
+
+        try:
+            msg = await interaction.client.wait_for("message", check=check, timeout=30)
+            guild_id = int(msg.content.strip())
+        except Exception:
+            await interaction.followup.send("Invalid or timed out.", ephemeral=True)
+            return
+
+        BLACKLISTED_GUILDS.add(guild_id)
+        await interaction.followup.send(
+            f"✅ Server `{guild_id}` blacklisted.", ephemeral=True
+        )
+
+    # -------- SPEAK BUTTON --------
+    @discord.ui.button(label="Speak", style=discord.ButtonStyle.secondary)
+    async def speak(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if await _deny_if_not_owner_interaction(interaction):
+            return
+
+        await interaction.response.send_message(
+            "Send:\n`<channel_id> <message>`", ephemeral=True
+        )
+
+        def check(m: discord.Message):
+            return (
+                m.author.id == interaction.user.id
+                and m.channel == interaction.channel
+            )
+
+        try:
+            msg = await interaction.client.wait_for("message", check=check, timeout=60)
+            channel_id, content = msg.content.split(" ", 1)
+            channel = interaction.client.get_channel(int(channel_id))
+        except Exception:
+            await interaction.followup.send("Invalid format.", ephemeral=True)
+            return
+
+        if not channel:
+            await interaction.followup.send("Channel not found.", ephemeral=True)
+            return
+
+        await channel.send(content)
+        await interaction.followup.send("✅ Message sent.", ephemeral=True)
+
+
+# -------------------- /CHECK (OWNER PANEL) --------------------
+@bot.tree.command(name="check", description="Owner control")
 async def check(interaction: discord.Interaction):
     if await _deny_if_not_owner_interaction(interaction):
         return
 
-    await interaction.response.defer(thinking=True, ephemeral=True)
+    await interaction.response.send_message(
+        "Owner Control Panel:",
+        view=OwnerPanel(),
+        ephemeral=True
+    )
 
-    lines = []
-    for g in bot.guilds:
-        lines.append(f"- {g.name} — Members: {g.member_count}")
 
-    if not lines:
-        await interaction.followup.send("I'm not in any servers.", ephemeral=True)
-        return
+# -------------------- GLOBAL BLACKLIST ENFORCEMENT --------------------
+@bot.check
+async def block_blacklisted(ctx):
+    if ctx.guild and ctx.guild.id in BLACKLISTED_GUILDS:
+        return False
+    return True
 
-    header = f"**Servers ({len(lines)}):**\n"
-    msg = header
-    for ln in lines:
-        if len(msg) + len(ln) + 1 > 1900:
-            await interaction.followup.send(msg, ephemeral=True)
-            msg = ""
-        msg += ln + "\n"
-    if msg.strip():
-        await interaction.followup.send(msg, ephemeral=True)
+
+@bot.tree.check
+async def block_blacklisted_interaction(interaction: discord.Interaction):
+    if interaction.guild and interaction.guild.id in BLACKLISTED_GUILDS:
+        await interaction.response.send_message(
+            "❌ This server is blacklisted.", ephemeral=True
+        )
+        return False
+    return True
 
 # -------------------- /TIMELAPSE (uses owner-set TIMELAPSE_CHANNEL_ID) --------------------
 def _fit_resize(w: int, h: int, max_side: int) -> tuple[int, int]:
