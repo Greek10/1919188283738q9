@@ -1151,7 +1151,7 @@ async def check2009(ctx: commands.Context):
 
 
 # ---------------- CONFIG ----------------
-TEMPLATE_CHANNEL_ID = 1447105408006361168 
+TEMPLATE_CHANNEL_ID = 1462384080716038205 
 
 # ---------------- COMMANDS ----------------
 @bot.tree.command(
