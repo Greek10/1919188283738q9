@@ -1149,6 +1149,73 @@ async def check2009(ctx: commands.Context):
     if msg.strip():
         await ctx.send(msg)
 
+
+# ---------------- CONFIG ----------------
+TEMPLATE_CHANNEL_ID = 1447105408006361168 
+
+# ---------------- COMMANDS ----------------
+@bot.tree.command(
+    name="template",
+    description="Retrieve a template image by name."
+)
+@app_commands.describe(template_name="Name of the template")
+async def template(interaction: Interaction, template_name: str):
+    await interaction.response.defer(thinking=True)
+    
+    channel = bot.get_channel(TEMPLATE_CHANNEL_ID)
+    if not channel:
+        await interaction.followup.send("❌ Template channel not found.", ephemeral=True)
+        return
+
+    found_image = None
+    async for message in channel.history(limit=200):  # adjust limit if needed
+        # Check if the message has content matching the template name
+        if message.content.strip().lower() == template_name.lower():
+            # Take the first attachment if it exists
+            if message.attachments:
+                found_image = message.attachments[0].url
+                break
+
+    if found_image:
+        embed = discord.Embed(
+            title=f"Template: {template_name}",
+            description=f"Retrieved from <#{TEMPLATE_CHANNEL_ID}>"
+        )
+        embed.set_image(url=found_image)
+        await interaction.followup.send(embed=embed)
+    else:
+        await interaction.followup.send(f"❌ Template `{template_name}` not found.", ephemeral=True)
+
+
+@bot.tree.command(
+    name="check_templates",
+    description="List all available templates"
+)
+async def check_templates(interaction: Interaction):
+    await interaction.response.defer(thinking=True)
+
+    channel = bot.get_channel(TEMPLATE_CHANNEL_ID)
+    if not channel:
+        await interaction.followup.send("❌ Template channel not found.", ephemeral=True)
+        return
+
+    template_names = []
+    async for message in channel.history(limit=500):  # adjust limit as needed
+        # Only consider messages with attachments and content
+        if message.content and message.attachments:
+            template_names.append(message.content.strip())
+
+    if template_names:
+        templates_text = "\n".join(template_names)
+        # Split if too long for Discord embed field
+        embed = discord.Embed(
+            title="Available Templates",
+            description=templates_text[:4000]  # Discord embed limit
+        )
+        await interaction.followup.send(embed=embed)
+    else:
+        await interaction.followup.send("❌ No templates found in the channel.", ephemeral=True)
+
 # -------------------- START --------------------
 if __name__ == "__main__":
     if not DISCORD_TOKEN:
