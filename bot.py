@@ -417,36 +417,8 @@ async def preset_cmd(
         ephemeral=True
     )
 
-# -------------------- /CANVAS (gets recent image from SOURCE_CHANNEL_ID) --------------------
-@bot.tree.command(name="canvas", description="Gets the most recent canvas from pixel place")
-async def canvas(interaction: discord.Interaction):
-    await interaction.response.defer(thinking=True)
-    try:
-        source_channel = await _get_text_channel_by_id(SOURCE_CHANNEL_ID)
-    except Exception as e:
-        await interaction.followup.send(f"❌ Source channel error: `{type(e).__name__}: {e}`")
-        return
-
-    try:
-        sig, url = await _find_latest_image_with_sig(source_channel)
-        if not url:
-            await interaction.followup.send(f"❌ No recent image found in {source_channel.mention}.")
-            return
-
-        import aiohttp
-        async with aiohttp.ClientSession() as session:
-            img_bytes = await _download_bytes(session, url, timeout_s=45)
-
-        fp = BytesIO(img_bytes)
-        await interaction.followup.send(
-            content=f" Latest canvas image from {source_channel.mention}:",
-            file=discord.File(fp=fp, filename="canvas_latest.png"),
-        )
-    except Exception as e:
-        await interaction.followup.send(f"❌ /canvas failed: `{type(e).__name__}: {e}`")
-
 # -------------------- /CHECK (OWNER-ONLY) --------------------
-@bot.tree.command(name="check", description="(Owner-only) Lists servers the bot is in (name + member count).")
+@bot.tree.command(name="check", description="(Owner)")
 async def check(interaction: discord.Interaction):
     if await _deny_if_not_owner_interaction(interaction):
         return
@@ -578,7 +550,7 @@ async def timelapse(interaction: discord.Interaction, hours: int = 12, fps: int 
 @app_commands.describe(
     template="Template image attachment.",
     coords="(x1,y1)(x2,y2)(x3,y3)(x4,y4)",
-    builders="How many people placing pixels in parallel (default 1)."
+    builders="How many people placing (default 1)."
 )
 async def progress_cmd(
     interaction: discord.Interaction,
@@ -620,7 +592,6 @@ async def progress_cmd(
             content=(
                 f" **Template Progress**\n"
                 f"━━━━━━━━━━━━━━━━━━\n"
-                f" **Source**: {source_channel.mention}\n"
                 f" **Region**: `{box_w}×{box_h}`\n"
                 f" **Pixels**: `{matched:,} / {total:,}`\n"
                 f" **Completion**: **{pct:.2f}%**\n"
@@ -877,7 +848,6 @@ async def live_progress(
                     embed = discord.Embed(
                         title="Live Template Progress",
                         description=(
-                            f"**Source**: {source_channel.mention}\n"
                             f"**Region**: `{box_w}×{box_h}`\n"
                             f"**Pixels**: `{matched:,} / {total:,}`\n"
                             f"**Completion**: **{pct:.2f}%**\n"
@@ -916,7 +886,7 @@ async def live_progress(
 # -------------------- /ARCHIEVED (OWNER-ONLY, LIVE IMAGE ARCHIVER, uses SOURCE_CHANNEL_ID) --------------------
 _active_archives: dict[tuple[int, int], asyncio.Task] = {}
 
-@bot.tree.command(name="archieved", description="(Owner-only)")
+@bot.tree.command(name="archieved", description="(Owner)")
 @app_commands.describe(
     mode="start or stop",
     output_channel="Where to post copies (defaults to where you run the command)."
@@ -1002,153 +972,6 @@ async def archieved(
 
     task = asyncio.create_task(runner())
     _active_archives[key] = task
-
-# -------------------- /ARCHIEVED_TEXT (OWNER-ONLY, SIMPLE TEXT MIRROR) --------------------
-_active_text_archivers: dict[tuple[int, int], asyncio.Task] = {}
-
-def _msg_fingerprint(m: discord.Message) -> str:
-    edited = m.edited_at.isoformat() if m.edited_at else ""
-    parts = [str(m.id), edited, (m.content or "").strip()]
-    if m.embeds:
-        for e in m.embeds:
-            parts.append((e.title or "").strip())
-            parts.append((e.description or "").strip())
-            try:
-                for f in (e.fields or []):
-                    parts.append((f.name or "").strip())
-                    parts.append((f.value or "").strip())
-            except Exception:
-                pass
-    return "\n".join(parts)
-
-def _extract_text_blob(m: discord.Message) -> str:
-    chunks = []
-    if m.content and m.content.strip():
-        chunks.append(m.content.strip())
-    for e in (m.embeds or []):
-        if e.title:
-            chunks.append(str(e.title).strip())
-        if e.description:
-            chunks.append(str(e.description).strip())
-        try:
-            for f in (e.fields or []):
-                if f.name and f.value:
-                    chunks.append(f"{str(f.name).strip()}: {str(f.value).strip()}")
-        except Exception:
-            pass
-    return "\n".join(chunks).strip()
-
-@bot.tree.command(name="archieved_text", description="(Owner-only) Continuously repost the latest text/embed from a channel when it changes.")
-@app_commands.describe(
-    mode="start or stop",
-    source_channel="Channel to watch (the edited/bot-updated message lives here).",
-    output_channel="Where to post copies (defaults to where you run the command).",
-    poll_seconds="How often to check (default 30)."
-)
-async def archieved_text(
-    interaction: discord.Interaction,
-    mode: str,
-    source_channel: discord.TextChannel | None = None,
-    output_channel: discord.TextChannel | None = None,
-    poll_seconds: int = 30,
-):
-    if await _deny_if_not_owner_interaction(interaction):
-        return
-
-    guild_id = interaction.guild_id or 0
-    user_id = interaction.user.id
-    key = (guild_id, user_id)
-
-    mode = (mode or "").lower().strip()
-    if mode not in ("start", "stop"):
-        await interaction.response.send_message("Mode must be `start` or `stop`.", ephemeral=True)
-        return
-
-    if mode == "stop":
-        task = _active_text_archivers.pop(key, None)
-        if task and not task.done():
-            task.cancel()
-            await interaction.response.send_message("🛑 /archieved_text stopped.", ephemeral=True)
-        else:
-            await interaction.response.send_message("No active /archieved_text running.", ephemeral=True)
-        return
-
-    if source_channel is None:
-        await interaction.response.send_message("❌ Provide `source_channel`.", ephemeral=True)
-        return
-
-    out_ch = output_channel or interaction.channel
-    if not isinstance(out_ch, discord.TextChannel):
-        await interaction.response.send_message("❌ Output must be a normal text channel.", ephemeral=True)
-        return
-
-    poll_seconds = max(5, min(300, int(poll_seconds)))
-
-    old = _active_text_archivers.pop(key, None)
-    if old and not old.done():
-        old.cancel()
-
-    await interaction.response.send_message(
-        f"✅ /archieved_text started (owner-only).\n• Watching: {source_channel.mention}\n• Posting to: {out_ch.mention}\n• Poll: {poll_seconds}s",
-        ephemeral=True
-    )
-
-    async def runner():
-        last_fp: str | None = None
-        while True:
-            try:
-                msgs = [m async for m in source_channel.history(limit=1, oldest_first=False)]
-                if not msgs:
-                    await asyncio.sleep(poll_seconds)
-                    continue
-
-                m = msgs[0]
-                fp = _msg_fingerprint(m)
-                if fp != last_fp:
-                    last_fp = fp
-                    blob = _extract_text_blob(m)
-
-                    embed = discord.Embed(
-                        title="Archived Text Update",
-                        description=(blob[:3900] if blob else "*No text content*"),
-                    )
-                    embed.set_footer(text=f"Source: #{source_channel.name} • msg_id={m.id}" + (" • edited" if m.edited_at else ""))
-                    await out_ch.send(embed=embed)
-
-            except asyncio.CancelledError:
-                raise
-            except Exception as e:
-                try:
-                    await out_ch.send(f"⚠️ /archieved_text error: `{type(e).__name__}: {e}`")
-                except Exception:
-                    pass
-
-            await asyncio.sleep(poll_seconds)
-
-    task = asyncio.create_task(runner())
-    _active_text_archivers[key] = task
-
-# -------------------- PREFIX COMMAND: !check2009 --------------------
-@bot.command(name="check2009")
-async def check2009(ctx: commands.Context):
-    lines = []
-    for g in bot.guilds:
-        lines.append(f"- {g.name} | ID: {g.id} | Members: {g.member_count}")
-
-    if not lines:
-        await ctx.send("I'm not in any servers.")
-        return
-
-    header = f"**Servers I'm in ({len(lines)}):**\n"
-    msg = header
-    for ln in lines:
-        if len(msg) + len(ln) + 1 > 1990:
-            await ctx.send(msg)
-            msg = ""
-        msg += ln + "\n"
-    if msg.strip():
-        await ctx.send(msg)
-
 
 # ---------------- CONFIG ----------------
 TEMPLATE_CHANNEL_ID = 1462384080716038205 
