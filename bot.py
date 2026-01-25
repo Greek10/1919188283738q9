@@ -1013,6 +1013,154 @@ async def check_templates(interaction: Interaction):
     else:
         await interaction.followup.send("❌ No templates found in the channel.", ephemeral=True)
 
+# ==================== AUTO TIMELAPSE (USER-DEFINED) ====================
+
+_auto_timelapse_task: asyncio.Task | None = None
+_auto_timelapse_config: dict | None = None
+
+async def run_timelapse_once(hours: int):
+    from PIL import Image
+    import aiohttp
+
+    channel = await _get_text_channel_by_id(TIMELAPSE_CHANNEL_ID)
+    cutoff = discord.utils.utcnow() - timedelta(hours=hours)
+
+    urls: list[str] = []
+
+    async for msg in channel.history(limit=5000, after=cutoff, oldest_first=True):
+        for a in msg.attachments:
+            if (a.content_type or "").startswith("image/"):
+                urls.append(a.url)
+        for e in msg.embeds:
+            if e.image and e.image.url:
+                urls.append(e.image.url)
+
+    urls = list(dict.fromkeys(urls))  # dedupe
+
+    if len(urls) < 2:
+        return
+
+    frames = []
+    async with aiohttp.ClientSession() as session:
+        for url in urls[-60]:
+            try:
+                b = await _download_bytes(session, url)
+                im = Image.open(BytesIO(b)).convert("RGBA")
+                frames.append(im)
+            except Exception:
+                continue
+
+    if len(frames) < 2:
+        return
+
+    out = BytesIO()
+    duration_ms = 250  # 4 FPS
+
+    pal = [im.convert("P", palette=Image.Palette.ADAPTIVE) for im in frames]
+    pal[0].save(
+        out,
+        format="GIF",
+        save_all=True,
+        append_images=pal[1:],
+        duration=duration_ms,
+        loop=0,
+        optimize=True,
+        disposal=2
+    )
+    out.seek(0)
+
+    await channel.send(
+        content=f"🕒 **Automatic timelapse** (last {hours}h)",
+        file=discord.File(fp=out, filename="auto_timelapse.gif")
+    )
+
+async def auto_timelapse_runner(interval_minutes: int, hours: int):
+    while True:
+        try:
+            await run_timelapse_once(hours)
+        except asyncio.CancelledError:
+            return
+        except Exception as e:
+            print(f"[AUTO_TIMELAPSE ERROR] {e}")
+
+        await asyncio.sleep(interval_minutes * 60)
+
+@bot.tree.command(name="auto_time", description=" Automatic timelapse")
+@app_commands.describe(
+    mode="start | stop | status",
+    interval="Minutes between each timelapse run",
+    hours="How many hours back to collect images"
+)
+async def auto_time(
+    interaction: discord.Interaction,
+    mode: str,
+    interval: int | None = None,
+    hours: int | None = None
+):
+    if await _deny_if_not_owner_interaction(interaction):
+        return
+
+    global _auto_timelapse_task, _auto_timelapse_config
+    mode = mode.lower().strip()
+
+    if mode == "start":
+        if interval is None or hours is None:
+            await interaction.response.send_message(
+                "❌ You must provide `interval` and `hours` when starting.",
+                ephemeral=True
+            )
+            return
+
+        interval = max(1, min(1440, int(interval)))  # 1 min → 24h
+        hours = max(1, min(168, int(hours)))        # 1h → 7 days
+
+        if _auto_timelapse_task and not _auto_timelapse_task.done():
+            await interaction.response.send_message("⚠️ Auto timelapse already running.", ephemeral=True)
+            return
+
+        _auto_timelapse_config = {
+            "interval": interval,
+            "hours": hours
+        }
+
+        _auto_timelapse_task = asyncio.create_task(
+            auto_timelapse_runner(interval, hours)
+        )
+
+        await interaction.response.send_message(
+            f"✅ Auto timelapse started\n"
+            f"• Every: **{interval} min**\n"
+            f"• Lookback: **{hours} hours**",
+            ephemeral=True
+        )
+
+    elif mode == "stop":
+        if _auto_timelapse_task:
+            _auto_timelapse_task.cancel()
+            _auto_timelapse_task = None
+            _auto_timelapse_config = None
+            await interaction.response.send_message("🛑 Auto timelapse stopped.", ephemeral=True)
+        else:
+            await interaction.response.send_message("No auto timelapse running.", ephemeral=True)
+
+    elif mode == "status":
+        if _auto_timelapse_task and _auto_timelapse_config:
+            await interaction.response.send_message(
+                f"📊 Auto timelapse **RUNNING**\n"
+                f"• Interval: {_auto_timelapse_config['interval']} min\n"
+                f"• Lookback: {_auto_timelapse_config['hours']}h",
+                ephemeral=True
+            )
+        else:
+            await interaction.response.send_message("📊 Auto timelapse **STOPPED**", ephemeral=True)
+
+    else:
+        await interaction.response.send_message(
+            "Mode must be `start`, `stop`, or `status`.",
+            ephemeral=True
+        )
+
+
 # -------------------- START --------------------
 if __name__ == "__main__":
     if not DISCORD_TOKEN:
