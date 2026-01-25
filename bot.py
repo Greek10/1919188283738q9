@@ -1014,7 +1014,6 @@ async def check_templates(interaction: Interaction):
         await interaction.followup.send("❌ No templates found in the channel.", ephemeral=True)
 
 # -------------------- AUTO TIMELAPSE --------------------
-_auto_timelapse_task: asyncio.Task | None = None
 
 @bot.tree.command(name="auto_time", description="Automatically post timelapses on a schedule")
 @app_commands.describe(
@@ -1028,9 +1027,10 @@ async def auto_time(
     hours: int = 12,
     interval_minutes: int = 30
 ):
-    global _auto_timelapse_task
-
     mode = (mode or "").lower().strip()
+
+    if not hasattr(bot, "auto_timelapse_task"):
+        bot.auto_timelapse_task = None
 
     if mode not in ("start", "stop"):
         await interaction.response.send_message(
@@ -1039,10 +1039,13 @@ async def auto_time(
         )
         return
 
+    # ---------- STOP ----------
     if mode == "stop":
-        if _auto_timelapse_task and not _auto_timelapse_task.done():
-            _auto_timelapse_task.cancel()
-            _auto_timelapse_task = None
+        task = bot.auto_timelapse_task
+
+        if task and not task.done():
+            task.cancel()
+            bot.auto_timelapse_task = None
             await interaction.response.send_message(
                 "🛑 Auto timelapse stopped.",
                 ephemeral=True
@@ -1054,13 +1057,13 @@ async def auto_time(
             )
         return
 
-    # ---- START MODE ----
+    # ---------- START ----------
     hours = max(1, min(48, int(hours)))
     interval_minutes = max(5, min(1440, int(interval_minutes)))
 
-    # Stop existing task if running
-    if _auto_timelapse_task and not _auto_timelapse_task.done():
-        _auto_timelapse_task.cancel()
+    # Kill existing task if it exists
+    if bot.auto_timelapse_task and not bot.auto_timelapse_task.done():
+        bot.auto_timelapse_task.cancel()
 
     async def runner():
         try:
@@ -1070,7 +1073,7 @@ async def auto_time(
         except asyncio.CancelledError:
             return
 
-    _auto_timelapse_task = asyncio.create_task(runner())
+    bot.auto_timelapse_task = asyncio.create_task(runner())
 
     await interaction.response.send_message(
         f"✅ Auto timelapse started.\n"
