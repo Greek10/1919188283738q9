@@ -1013,70 +1013,71 @@ async def check_templates(interaction: Interaction):
     else:
         await interaction.followup.send("❌ No templates found in the channel.", ephemeral=True)
 
-async def run_timelapse_once(hours: int):
-    from PIL import Image
-    import aiohttp
+# -------------------- AUTO TIMELAPSE --------------------
+_auto_timelapse_task: asyncio.Task | None = None
 
-    channel = bot.get_channel(TIMELAPSE_CHANNEL_ID)
-    if not channel:
-        print("[AUTO_TIMELAPSE] Channel not found")
+@bot.tree.command(name="auto_time", description="Automatically post timelapses on a schedule")
+@app_commands.describe(
+    mode="start or stop",
+    hours="How far back to collect images (e.g. 12)",
+    interval_minutes="How often to post (e.g. 30)"
+)
+async def auto_time(
+    interaction: discord.Interaction,
+    mode: str,
+    hours: int = 12,
+    interval_minutes: int = 30
+):
+    global _auto_timelapse_task
+
+    mode = (mode or "").lower().strip()
+
+    if mode not in ("start", "stop"):
+        await interaction.response.send_message(
+            "Mode must be `start` or `stop`.",
+            ephemeral=True
+        )
         return
 
-    cutoff = discord.utils.utcnow() - timedelta(hours=hours)
-    urls: list[str] = []
-
-    async for msg in channel.history(limit=5000, after=cutoff):
-        for a in msg.attachments:
-            if (a.content_type or "").startswith("image/"):
-                urls.append(a.url)
-        for e in msg.embeds:
-            if e.image and e.image.url:
-                urls.append(e.image.url)
-
-    urls = list(dict.fromkeys(urls))  # dedupe
-
-    if len(urls) < 2:
-        print("[AUTO_TIMELAPSE] Not enough images")
+    if mode == "stop":
+        if _auto_timelapse_task and not _auto_timelapse_task.done():
+            _auto_timelapse_task.cancel()
+            _auto_timelapse_task = None
+            await interaction.response.send_message(
+                "🛑 Auto timelapse stopped.",
+                ephemeral=True
+            )
+        else:
+            await interaction.response.send_message(
+                "No auto timelapse is currently running.",
+                ephemeral=True
+            )
         return
 
-    frames = []
-    async with aiohttp.ClientSession() as session:
-        for url in urls[-60:]:  # ✅ FIXED
-            try:
-                async with session.get(url) as r:
-                    if r.status != 200:
-                        continue
-                    b = await r.read()
-                im = Image.open(BytesIO(b)).convert("RGBA")
-                frames.append(im)
-            except Exception as e:
-                print(f"[AUTO_TIMELAPSE] Frame error: {e}")
+    # ---- START MODE ----
+    hours = max(1, min(48, int(hours)))
+    interval_minutes = max(5, min(1440, int(interval_minutes)))
 
-    if len(frames) < 2:
-        print("[AUTO_TIMELAPSE] Frame build failed")
-        return
+    # Stop existing task if running
+    if _auto_timelapse_task and not _auto_timelapse_task.done():
+        _auto_timelapse_task.cancel()
 
-    out = BytesIO()
-    pal = [im.convert("P", palette=Image.Palette.ADAPTIVE) for im in frames]
+    async def runner():
+        try:
+            while True:
+                await run_timelapse_once(hours)
+                await asyncio.sleep(interval_minutes * 60)
+        except asyncio.CancelledError:
+            return
 
-    pal[0].save(
-        out,
-        format="GIF",
-        save_all=True,
-        append_images=pal[1:],
-        duration=250,
-        loop=0,
-        optimize=True,
-        disposal=2
+    _auto_timelapse_task = asyncio.create_task(runner())
+
+    await interaction.response.send_message(
+        f"✅ Auto timelapse started.\n"
+        f"• Looks back: **{hours}h**\n"
+        f"• Interval: every **{interval_minutes} minutes**",
+        ephemeral=True
     )
-    out.seek(0)
-
-    await channel.send(
-        content=f"🕒 **Automatic timelapse** (last {hours}h)",
-        file=discord.File(out, "auto_timelapse.gif")
-    )
-
-    print("[AUTO_TIMELAPSE] Sent timelapse")
 
 
 # -------------------- START --------------------
