@@ -418,22 +418,25 @@ async def preset_cmd(
     )
 
 # -------------------- /TIMELAPSE (uses owner-set TIMELAPSE_CHANNEL_ID) --------------------
-def _fit_resize(w: int, h: int, max_side: int) -> tuple[int, int]:
-    if max(w, h) <= max_side:
-        return w, h
-    if w >= h:
-        nw = max_side
-        nh = max(1, int(h * (max_side / w)))
-    else:
-        nh = max_side
-        nw = max(1, int(w * (max_side / h)))
-    return nw, nh
-
 @bot.tree.command(name="timelapse", description="Creates a timelapse for pixel place")
-@app_commands.describe(hours="Hours back (default 12).", fps="FPS (default 4).", max_frames="Max frames (default 60).", max_side="Max side (default 600).")
-async def timelapse(interaction: discord.Interaction, hours: int = 12, fps: int = 4, max_frames: int = 60, max_side: int = 600):
+@app_commands.describe(
+    hours="Hours back (default 12).",
+    fps="FPS (default 4).",
+    max_frames="Max frames (default 60).",
+    max_side="Max side (default 600).",
+    time="Optional end time: (dd,mm,yy),(HH:MM) e.g. (01,02,26),(17:00)"
+)
+async def timelapse(
+    interaction: discord.Interaction,
+    hours: int = 12,
+    fps: int = 4,
+    max_frames: int = 60,
+    max_side: int = 600,
+    time: str | None = None
+):
     from PIL import Image
     import aiohttp
+    import re
 
     await interaction.response.defer(thinking=True)
 
@@ -448,14 +451,49 @@ async def timelapse(interaction: discord.Interaction, hours: int = 12, fps: int 
     max_frames = max(1, min(1000, int(max_frames)))
     max_side = max(64, min(1024, int(max_side)))
 
-    cutoff = discord.utils.utcnow() - timedelta(hours=hours)
+    # -------------------- TIME PARSING --------------------
+    end_time = discord.utils.utcnow()
 
+    if time:
+        try:
+            # Expected: (dd,mm,yy),(HH:MM)
+            m = re.fullmatch(r"\((\d{2}),(\d{2}),(\d{2})\),\((\d{2}):(\d{2})\)", time.strip())
+            if not m:
+                raise ValueError("Invalid format")
+
+            dd, mm, yy, hh, mi = map(int, m.groups())
+            year = 2000 + yy
+
+            end_time = datetime(
+                year=year,
+                month=mm,
+                day=dd,
+                hour=hh,
+                minute=mi,
+                tzinfo=timezone.utc
+            )
+        except Exception:
+            await interaction.followup.send(
+                "❌ Invalid time format.\n"
+                "Use: `(dd,mm,yy),(HH:MM)`\n"
+                "Example: `(01,02,26),(17:00)`"
+            )
+            return
+
+    start_time = end_time - timedelta(hours=hours)
+
+    # -------------------- COLLECT IMAGES --------------------
     found: list[str] = []
+
     try:
-        async for msg in channel.history(limit=5000, after=cutoff, oldest_first=True):
+        async for msg in channel.history(
+            limit=5000,
+            after=start_time,
+            before=end_time,
+            oldest_first=True
+        ):
             for a in msg.attachments:
-                ct = (a.content_type or "")
-                if ct.startswith("image/") and a.url:
+                if (a.content_type or "").startswith("image/") and a.url:
                     found.append(a.url)
             for e in msg.embeds:
                 if e.image and e.image.url:
@@ -466,6 +504,7 @@ async def timelapse(interaction: discord.Interaction, hours: int = 12, fps: int 
         await interaction.followup.send("I don’t have permission to read message history in the timelapse channel.")
         return
 
+    # Deduplicate while preserving order
     seen = set()
     ordered = []
     for url in found:
@@ -474,12 +513,17 @@ async def timelapse(interaction: discord.Interaction, hours: int = 12, fps: int 
             ordered.append(url)
 
     if not ordered:
-        await interaction.followup.send(f"No images found in {channel.mention} in the last {hours} hour(s).")
+        await interaction.followup.send(
+            f"No images found in {channel.mention} "
+            f"from `{start_time:%d/%m/%Y %H:%M}` "
+            f"to `{end_time:%d/%m/%Y %H:%M}`."
+        )
         return
 
     if len(ordered) > max_frames:
         ordered = ordered[-max_frames:]
 
+    # -------------------- BUILD GIF --------------------
     frames: list[Image.Image] = []
     async with aiohttp.ClientSession() as session:
         for url in ordered:
@@ -499,6 +543,7 @@ async def timelapse(interaction: discord.Interaction, hours: int = 12, fps: int 
 
     max_w = max(im.width for im in frames)
     max_h = max(im.height for im in frames)
+
     normalized = []
     for im in frames:
         if im.width == max_w and im.height == max_h:
@@ -511,11 +556,25 @@ async def timelapse(interaction: discord.Interaction, hours: int = 12, fps: int 
     out = BytesIO()
     duration_ms = int(1000 / fps)
     pal_frames = [im.convert("P", palette=Image.Palette.ADAPTIVE, colors=256) for im in normalized]
-    pal_frames[0].save(out, format="GIF", save_all=True, append_images=pal_frames[1:], duration=duration_ms, loop=0, optimize=True, disposal=2)
+
+    pal_frames[0].save(
+        out,
+        format="GIF",
+        save_all=True,
+        append_images=pal_frames[1:],
+        duration=duration_ms,
+        loop=0,
+        optimize=True,
+        disposal=2
+    )
     out.seek(0)
 
     await interaction.followup.send(
-        content=f"Timelapse generated from {channel.mention} ({len(pal_frames)} frames, {fps} fps):",
+        content=(
+            f"Timelapse generated from {channel.mention}\n"
+            f" `{start_time:%d/%m/%Y %H:%M}` → `{end_time:%d/%m/%Y %H:%M}`\n"
+            f" {len(pal_frames)} frames @ {fps} fps"
+        ),
         file=discord.File(fp=out, filename="timelapse.gif")
     )
 
