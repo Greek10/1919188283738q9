@@ -600,9 +600,9 @@ async def timelapse(
 
     await interaction.followup.send(
         content=(
-            f"🎞️ **Timelapse Generated**\n"
+            f" **Timelapse**\n"
             f"Channel: {channel.mention}\n"
-            f"Frames: {len(pal)} | FPS: {fps}\n"
+            f"FPS: {len(pal)} | FPS: {fps}\n"
             f"From: <t:{int(start_time.timestamp())}:f>\n"
             f"To: <t:{int(end_time.timestamp())}:f>"
         ),
@@ -1102,76 +1102,6 @@ async def check_templates(interaction: Interaction):
         await interaction.followup.send(embed=embed)
     else:
         await interaction.followup.send("❌ No templates found in the channel.", ephemeral=True)
-
-# -------------------- AUTO TIMELAPSE --------------------
-
-@bot.tree.command(name="auto_time", description="Automatically post timelapses on a schedule")
-@app_commands.describe(
-    mode="start or stop",
-    hours="How far back to collect images (e.g. 12)",
-    interval_minutes="How often to post (e.g. 30)"
-)
-async def auto_time(
-    interaction: discord.Interaction,
-    mode: str,
-    hours: int = 12,
-    interval_minutes: int = 30
-):
-    mode = (mode or "").lower().strip()
-
-    if not hasattr(bot, "auto_timelapse_task"):
-        bot.auto_timelapse_task = None
-
-    if mode not in ("start", "stop"):
-        await interaction.response.send_message(
-            "Mode must be `start` or `stop`.",
-            ephemeral=True
-        )
-        return
-
-    # ---------- STOP ----------
-    if mode == "stop":
-        task = bot.auto_timelapse_task
-
-        if task and not task.done():
-            task.cancel()
-            bot.auto_timelapse_task = None
-            await interaction.response.send_message(
-                "🛑 Auto timelapse stopped.",
-                ephemeral=True
-            )
-        else:
-            await interaction.response.send_message(
-                "No auto timelapse is currently running.",
-                ephemeral=True
-            )
-        return
-
-    # ---------- START ----------
-    hours = max(1, min(48, int(hours)))
-    interval_minutes = max(5, min(1440, int(interval_minutes)))
-
-    # Kill existing task if it exists
-    if bot.auto_timelapse_task and not bot.auto_timelapse_task.done():
-        bot.auto_timelapse_task.cancel()
-
-    async def runner():
-        try:
-            while True:
-                await run_timelapse_once(hours)
-                await asyncio.sleep(interval_minutes * 60)
-        except asyncio.CancelledError:
-            return
-
-    bot.auto_timelapse_task = asyncio.create_task(runner())
-
-    await interaction.response.send_message(
-        f"✅ Auto timelapse started.\n"
-        f"• Looks back: **{hours}h**\n"
-        f"• Interval: every **{interval_minutes} minutes**",
-        ephemeral=True
-    )
-
 
 # -------------------- START --------------------
 if __name__ == "__main__":
