@@ -958,13 +958,13 @@ async def live_progress(
     task = asyncio.create_task(runner())
     _active_checks[key] = task
 
-# -------------------- /ARCHIEVED (OWNER-ONLY, LIVE IMAGE ARCHIVER) --------------------
+# -------------------- /ARCHIEVED (OWNER-ONLY, LIVE IMAGE ARCHIVER, uses SOURCE_CHANNEL_ID) --------------------
 _active_archives: dict[tuple[int, int], asyncio.Task] = {}
 
 @bot.tree.command(name="archieved", description="(Owner) Live image archiver")
 @app_commands.describe(
     mode="start or stop",
-    output_channel="Where to post copies (defaults to current channel)"
+    output_channel="Where to post copies (defaults to where you run the command)."
 )
 async def archieved(
     interaction: discord.Interaction,
@@ -986,7 +986,7 @@ async def archieved(
         )
         return
 
-    # ---------------- STOP ----------------
+    # -------------------- STOP --------------------
     if mode == "stop":
         task = _active_archives.pop(key, None)
         if task and not task.done():
@@ -1002,7 +1002,7 @@ async def archieved(
             )
         return
 
-    # ---------------- START ----------------
+    # -------------------- START --------------------
     try:
         source_channel = await _get_text_channel_by_id(SOURCE_CHANNEL_ID)
     except Exception as e:
@@ -1015,12 +1015,12 @@ async def archieved(
     out_ch = output_channel or interaction.channel
     if not isinstance(out_ch, discord.TextChannel):
         await interaction.response.send_message(
-            "Output channel must be a text channel.",
+            "Output channel must be a normal text channel.",
             ephemeral=True
         )
         return
 
-    # Cancel existing task
+    # Cancel any existing archive for this user/guild
     old = _active_archives.pop(key, None)
     if old and not old.done():
         old.cancel()
@@ -1028,9 +1028,9 @@ async def archieved(
     await interaction.response.send_message(
         f"✅ /archieved started\n"
         f"• Source: {source_channel.mention}\n"
-        f"• Output: {out_ch.mention}\n"
-        f"• Poll interval: **{POLL_SECONDS}s**\n"
-        f"Stop with `/archieved stop`",
+        f"• Posting to: {out_ch.mention}\n"
+        f"• Poll interval: **{POLL_SECONDS} seconds**\n"
+        f"Stop with: `/archieved stop`",
         ephemeral=True
     )
 
@@ -1046,14 +1046,12 @@ async def archieved(
                     last_sig = sig
 
                     async with aiohttp.ClientSession() as session:
-                        img_bytes = await _download_bytes(
-                            session,
-                            url)
-                        )
+                        # 🔧 FIX: no timeout_s argument
+                        img_bytes = await _download_bytes(session, url)
 
                     fp = BytesIO(img_bytes)
                     await out_ch.send(
-                        content=f"🖼️ **Canvas image** (from {source_channel.mention})",
+                        content=f"🖼️ **Canvas image** (source: {source_channel.mention})",
                         file=discord.File(fp=fp, filename="archived.png")
                     )
 
