@@ -10,6 +10,17 @@ import discord
 from discord import app_commands, Interaction
 from discord.ext import commands
 
+import aiohttp
+
+async def _download_bytes(
+    session: aiohttp.ClientSession,
+    url: str,
+    timeout_s: int = 15
+) -> bytes:
+    timeout = aiohttp.ClientTimeout(total=timeout_s)
+    async with session.get(url, timeout=timeout) as resp:
+        resp.raise_for_status()
+        return await resp.read()
 # ----------------- CONFIG --------------------
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN", "").strip()
 
@@ -947,13 +958,13 @@ async def live_progress(
     task = asyncio.create_task(runner())
     _active_checks[key] = task
 
-# -------------------- /ARCHIEVED (OWNER-ONLY, LIVE IMAGE ARCHIVER, uses SOURCE_CHANNEL_ID) --------------------
+# -------------------- /ARCHIEVED (OWNER-ONLY, LIVE IMAGE ARCHIVER) --------------------
 _active_archives: dict[tuple[int, int], asyncio.Task] = {}
 
-@bot.tree.command(name="archieved", description="(Owner)")
+@bot.tree.command(name="archieved", description="(Owner) Live image archiver")
 @app_commands.describe(
     mode="start or stop",
-    output_channel="Where to post copies (defaults to where you run the command)."
+    output_channel="Where to post copies (defaults to current channel)"
 )
 async def archieved(
     interaction: discord.Interaction,
@@ -969,39 +980,57 @@ async def archieved(
 
     mode = (mode or "").lower().strip()
     if mode not in ("start", "stop"):
-        await interaction.response.send_message("Mode must be `start` or `stop`.", ephemeral=True)
+        await interaction.response.send_message(
+            "Mode must be `start` or `stop`.",
+            ephemeral=True
+        )
         return
 
+    # ---------------- STOP ----------------
     if mode == "stop":
         task = _active_archives.pop(key, None)
         if task and not task.done():
             task.cancel()
-            await interaction.response.send_message("🛑 /archieved stopped.", ephemeral=True)
+            await interaction.response.send_message(
+                "🛑 /archieved stopped.",
+                ephemeral=True
+            )
         else:
-            await interaction.response.send_message("No active /archieved running.", ephemeral=True)
+            await interaction.response.send_message(
+                "No active /archieved running.",
+                ephemeral=True
+            )
         return
 
+    # ---------------- START ----------------
     try:
         source_channel = await _get_text_channel_by_id(SOURCE_CHANNEL_ID)
     except Exception as e:
-        await interaction.response.send_message(f"❌ Source channel error: `{type(e).__name__}: {e}`", ephemeral=True)
+        await interaction.response.send_message(
+            f"❌ Source channel error: `{type(e).__name__}: {e}`",
+            ephemeral=True
+        )
         return
 
     out_ch = output_channel or interaction.channel
     if not isinstance(out_ch, discord.TextChannel):
-        await interaction.response.send_message("Output channel must be a normal text channel.", ephemeral=True)
+        await interaction.response.send_message(
+            "Output channel must be a text channel.",
+            ephemeral=True
+        )
         return
 
+    # Cancel existing task
     old = _active_archives.pop(key, None)
     if old and not old.done():
         old.cancel()
 
     await interaction.response.send_message(
-        f"✅ /archieved started (owner-only).\n"
+        f"✅ /archieved started\n"
         f"• Source: {source_channel.mention}\n"
-        f"• Posting to: {out_ch.mention}\n"
-        f"• Poll: every **{POLL_SECONDS} seconds**\n"
-        f"Stop with: `/archieved mode:stop`",
+        f"• Output: {out_ch.mention}\n"
+        f"• Poll interval: **{POLL_SECONDS}s**\n"
+        f"Stop with `/archieved stop`",
         ephemeral=True
     )
 
@@ -1012,23 +1041,30 @@ async def archieved(
         while True:
             try:
                 sig, url = await _find_latest_image_with_sig(source_channel)
+
                 if sig and url and sig != last_sig:
                     last_sig = sig
 
                     async with aiohttp.ClientSession() as session:
-                        img_bytes = await _download_bytes(session, url, timeout_s=45)
+                        img_bytes = await _download_bytes(
+                            session,
+                            url,
+                            timeout_s=45
+                        )
 
                     fp = BytesIO(img_bytes)
                     await out_ch.send(
-                        content=f" **Canvas image** (source: {source_channel.mention})",
+                        content=f"🖼️ **Canvas image** (from {source_channel.mention})",
                         file=discord.File(fp=fp, filename="archived.png")
                     )
 
             except asyncio.CancelledError:
-                raise
+                break
             except Exception as e:
                 try:
-                    await out_ch.send(f"⚠️ /archieved error: `{type(e).__name__}: {e}`")
+                    await out_ch.send(
+                        f"⚠️ /archieved error: `{type(e).__name__}: {e}`"
+                    )
                 except Exception:
                     pass
 
