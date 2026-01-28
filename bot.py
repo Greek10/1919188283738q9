@@ -151,7 +151,7 @@ async def run_markarea_once(source_channel, template_bytes, coords):
 async def timelapse(interaction, hours: int = 12, fps: int = 4, max_frames: int = 60, max_side: int = 600, time: str | None = None):
     await interaction.response.send_message("Timelapse unchanged.", ephemeral=True)
 
-# -------------------- /LIVE_PROGRESS (OLD STYLE EMBED + RED OVERLAY) --------------------
+# -------------------- /LIVE_PROGRESS (OLD STYLE EMBED + RED OVERLAY + TIMESTAMP) --------------------
 _active_checks = {}
 
 class LiveControls(discord.ui.View):
@@ -226,12 +226,16 @@ async def live_progress(interaction, template: discord.Attachment, coords: str, 
         remaining = max(total - matched, 0)
         eta_seconds = math.ceil(remaining * COOLDOWN_SECONDS_PER_PIXEL / max(builders, 1))
 
+        # Current timestamp
+        now = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
+
         # Create embed
         embed = discord.Embed(title="Live Template Progress", color=0x2F3136)
         embed.add_field(name="Pixels", value=f"{matched} / {total}", inline=False)
         embed.add_field(name="Completion", value=f"{pct:.2f}%", inline=False)
         embed.add_field(name="ETA", value=f"{format_eta(eta_seconds)} ({remaining} px, builders={builders}, {COOLDOWN_SECONDS_PER_PIXEL}s/px)", inline=False)
         embed.set_image(url="attachment://progress.png")  # embed image inside
+        embed.set_footer(text=f"Last Updated: {now}")
 
         file = discord.File(out, filename="progress.png")
 
@@ -261,7 +265,6 @@ async def live_progress(interaction, template: discord.Attachment, coords: str, 
 
     task = asyncio.create_task(runner())
     _active_checks[key] = task
-
 
 # ---------------- TEMPLATE COMMANDS (UNCHANGED) ----------------
 TEMPLATE_CHANNEL_ID = 1462384080716038205
