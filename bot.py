@@ -147,41 +147,56 @@ async def run_markarea_once(source_channel, template_bytes, coords):
 
     return out.read(), right-left, bottom-top, matched, total, pct
 
+from datetime import datetime, timedelta
+from io import BytesIO
+import aiohttp
+from PIL import Image
+
 # -------------------- /TIMELAPSE --------------------
 @bot.tree.command(name="timelapse")
 @app_commands.describe(
-    hours="Hours back",
-    fps="Frames per second for the timelapse",
+    hours="How many hours back to retrieve images",
+    fps="Frames per second for the GIF",
     resolution="Maximum width/height of the output GIF",
-    time="Optional specific time (HH:MM) to start the timelapse"
+    time="Optional specific time (HH:MM) or full date+time (DD/MM/YY HH:MM) to start the timelapse"
 )
 async def timelapse(interaction, hours: int = 12, fps: int = 4, resolution: int = 600, time: str | None = None):
     await interaction.response.defer()
 
-    # Resolve the timelapse channel
     timelapse_channel = await _get_text_channel_by_id(TIMELAPSE_CHANNEL_ID)
-
-    # Compute the cutoff time
     cutoff = datetime.utcnow() - timedelta(hours=hours)
 
-    # Optional time filter
-    time_hour, time_minute = None, None
+    target_datetime = None
+
     if time:
         try:
-            time_hour, time_minute = map(int, time.split(":"))
+            if "/" in time:  # DD/MM/YY HH:MM
+                target_datetime = datetime.strptime(time, "%d/%m/%y %H:%M")
+            else:  # just HH:MM
+                h, m = map(int, time.split(":"))
+                target_datetime = {"hour": h, "minute": m}
         except Exception:
-            await interaction.followup.send("❌ Invalid time format. Use HH:MM")
+            await interaction.followup.send("❌ Invalid time format. Use either HH:MM or DD/MM/YY HH:MM")
             return
 
     images = []
 
-    # Fetch messages in the last <hours> and filter attachments
     async for msg in timelapse_channel.history(limit=None, after=cutoff):
-        # If specific time is requested, skip messages that don't match the hour:minute
-        if time_hour is not None:
-            msg_time = msg.created_at
-            if msg_time.hour != time_hour or msg_time.minute != time_minute:
-                continue
+        # Filter by exact time if requested
+        if target_datetime:
+            if isinstance(target_datetime, dict):
+                # Only hour:minute
+                if msg.created_at.hour != target_datetime["hour"] or msg.created_at.minute != target_datetime["minute"]:
+                    continue
+            else:
+                # Full datetime: match day/month/year/hour/minute
+                msg_time = msg.created_at
+                if (msg_time.day != target_datetime.day or
+                    msg_time.month != target_datetime.month or
+                    msg_time.year % 100 != target_datetime.year % 100 or  # Python datetime uses full year
+                    msg_time.hour != target_datetime.hour or
+                    msg_time.minute != target_datetime.minute):
+                    continue
 
         for a in msg.attachments:
             if (a.content_type or "").startswith("image/"):
