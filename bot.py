@@ -146,39 +146,20 @@ async def run_markarea_once(source_channel, template_bytes, coords):
     return out.read(), right-left, bottom-top, matched, total, pct
 
 # -------------------- /TIMELAPSE --------------------
-from PIL import Image
-import io
-import math
-
 @bot.tree.command(name="timelapse")
 @app_commands.describe(
-    hours="Hours back",
-    fps="Frames per second",
-    max_frames="Maximum number of frames",
-    max_side="Maximum width or height in pixels",
-    time="Optional start time (ISO format: YYYY-MM-DDTHH:MM:SS)"
+    hours="Hours back", fps="FPS", max_frames="Max frames", max_side="Max size", time="Optional time"
 )
 async def timelapse(interaction, hours: int = 12, fps: int = 4, max_frames: int = 60, max_side: int = 600, time: str | None = None):
     await interaction.response.defer()
 
-    source_channel = await _get_text_channel_by_id(SOURCE_CHANNEL_ID)
-
-    # Calculate cutoff timestamp
-    now = datetime.utcnow()
-    if time:
-        try:
-            start_time = datetime.fromisoformat(time)
-        except ValueError:
-            await interaction.followup.send("❌ Invalid ISO time format. Use YYYY-MM-DDTHH:MM:SS")
-            return
-    else:
-        start_time = now - timedelta(hours=hours)
-
-    # Collect images
+    # Fetch the correct channel
+    timelapse_channel = await _get_text_channel_by_id(TIMELAPSE_CHANNEL_ID)
+    cutoff = datetime.utcnow() - timedelta(hours=hours)
     images = []
-    async for msg in source_channel.history(limit=200, oldest_first=True):
-        if msg.created_at < start_time:
-            continue
+
+    # Fetch images from timelapse channel
+    async for msg in timelapse_channel.history(limit=200, after=cutoff):
         for a in msg.attachments:
             if (a.content_type or "").startswith("image/"):
                 images.append(a.url)
@@ -186,40 +167,47 @@ async def timelapse(interaction, hours: int = 12, fps: int = 4, max_frames: int 
             break
 
     if not images:
-        await interaction.followup.send("❌ No images found in the specified timeframe.")
+        await interaction.followup.send("❌ No images found in that time range.")
         return
 
-    # Download images and resize
+    from PIL import Image
+    import aiohttp
+
     frames = []
     async with aiohttp.ClientSession() as session:
         for url in images[:max_frames]:
             async with session.get(url) as resp:
-                img_bytes = await resp.read()
-            img = Image.open(io.BytesIO(img_bytes)).convert("RGBA")
+                data = await resp.read()
+                img = Image.open(BytesIO(data)).convert("RGBA")
 
-            # Resize if needed
-            w, h = img.size
-            scale = min(max_side / max(w, h), 1.0)
-            if scale < 1.0:
-                img = img.resize((math.ceil(w*scale), math.ceil(h*scale)), Image.ANTIALIAS)
+                # Resize if larger than max_side
+                w, h = img.size
+                scale = min(max_side / max(w, h), 1.0)
+                if scale < 1.0:
+                    img = img.resize((int(w*scale), int(h*scale)), Image.LANCZOS)
 
-            frames.append(img)
+                frames.append(img)
 
-    # Create GIF in memory
-    gif_bytes = io.BytesIO()
+    if not frames:
+        await interaction.followup.send("❌ Failed to load images.")
+        return
+
+    out_bytes = BytesIO()
     frames[0].save(
-        gif_bytes,
+        out_bytes,
         format="GIF",
         save_all=True,
         append_images=frames[1:],
-        duration=1000//fps,
+        duration=int(1000/fps),
         loop=0,
-        transparency=0,
         disposal=2
     )
-    gif_bytes.seek(0)
+    out_bytes.seek(0)
 
-    await interaction.followup.send(file=discord.File(gif_bytes, filename="timelapse.gif"))
+    await interaction.followup.send(
+        content=f"Timelapse for last {hours} hours ({len(frames)} frames).",
+        file=discord.File(out_bytes, "timelapse.gif")
+    )
 
 # -------------------- /LIVE_PROGRESS (OLD STYLE EMBED + RED OVERLAY + TIMESTAMP) --------------------
 _active_checks = {}
