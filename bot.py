@@ -156,9 +156,9 @@ from PIL import Image
 @bot.tree.command(name="timelapse")
 @app_commands.describe(
     hours="How many hours back to retrieve images",
-    fps="Frames per second for the GIF",
-    resolution="Maximum width/height of the output GIF",
-    time="Optional specific time (HH:MM) or full date+time (DD/MM/YY HH:MM) to start the timelapse"
+    fps="Frames per second",
+    resolution="Maximum width/height",
+    time="format: DD/MM/YY HH:MM"
 )
 async def timelapse(interaction, hours: int = 12, fps: int = 4, resolution: int = 600, time: str | None = None):
     await interaction.response.defer()
