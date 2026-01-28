@@ -1048,8 +1048,7 @@ async def archieved(
                     async with aiohttp.ClientSession() as session:
                         img_bytes = await _download_bytes(
                             session,
-                            url,
-                            timeout_s=45
+                            url)
                         )
 
                     fp = BytesIO(img_bytes)
