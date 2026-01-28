@@ -151,7 +151,7 @@ async def run_markarea_once(source_channel, template_bytes, coords):
 async def timelapse(interaction, hours: int = 12, fps: int = 4, max_frames: int = 60, max_side: int = 600, time: str | None = None):
     await interaction.response.send_message("Timelapse unchanged.", ephemeral=True)
 
-# -------------------- /LIVE_PROGRESS (merged) --------------------
+# -------------------- /LIVE_PROGRESS (OLD STYLE EMBED) --------------------
 _active_checks = {}
 
 class LiveControls(discord.ui.View):
@@ -165,6 +165,12 @@ class LiveControls(discord.ui.View):
         if task:
             task.cancel()
         await interaction.response.edit_message(content="🛑 Stopped.", view=None)
+
+def format_eta(seconds: int) -> str:
+    h = seconds // 3600
+    m = (seconds % 3600) // 60
+    s = seconds % 60
+    return f"{h}h {m}m {s}s"
 
 @bot.tree.command(name="live_progress")
 @app_commands.describe(
@@ -183,12 +189,25 @@ async def live_progress(interaction, template: discord.Attachment, coords: str, 
     source_channel = await _get_text_channel_by_id(SOURCE_CHANNEL_ID)
     template_bytes = await template.read()
 
-    async def run_once():
+    progress_message = None
+
+    async def run_once(message: discord.Message | None = None):
         png, w, h, matched, total, pct = await run_markarea_once(source_channel, template_bytes, coords)
-        await interaction.followup.send(
-            content=f"**Progress:** {pct:.2f}% ({matched}/{total})",
-            file=discord.File(BytesIO(png), "progress.png")
-        )
+        remaining = max(total - matched, 0)
+        eta_seconds = math.ceil(remaining * COOLDOWN_SECONDS_PER_PIXEL / max(builders, 1))
+
+        embed = discord.Embed(title="Live Template Progress", color=0x2F3136)
+        embed.add_field(name="Pixels", value=f"{matched} / {total}", inline=False)
+        embed.add_field(name="Completion", value=f"{pct:.2f}%", inline=False)
+        embed.add_field(name="ETA", value=f"{format_eta(eta_seconds)} ({remaining} px, builders={builders}, {COOLDOWN_SECONDS_PER_PIXEL}s/px)", inline=False)
+
+        file = discord.File(BytesIO(png), filename="progress.png")
+
+        if message:
+            await message.edit(embed=embed, attachments=[file])
+            return message
+        else:
+            return await interaction.followup.send(embed=embed, file=file)
 
     if once:
         await run_once()
@@ -196,7 +215,7 @@ async def live_progress(interaction, template: discord.Attachment, coords: str, 
 
     key = (interaction.guild_id, interaction.user.id)
     view = LiveControls(key)
-    await interaction.followup.send("📡 Live progress started", view=view)
+    progress_message = await interaction.followup.send("📡 Live progress started", view=view)
 
     async def runner():
         last_sig = None
@@ -204,7 +223,7 @@ async def live_progress(interaction, template: discord.Attachment, coords: str, 
             sig,_ = await _find_latest_image_with_sig(source_channel)
             if sig != last_sig:
                 last_sig = sig
-                await run_once()
+                await run_once(progress_message)
             await asyncio.sleep(POLL_SECONDS)
 
     task = asyncio.create_task(runner())
