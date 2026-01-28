@@ -151,7 +151,7 @@ async def run_markarea_once(source_channel, template_bytes, coords):
 async def timelapse(interaction, hours: int = 12, fps: int = 4, max_frames: int = 60, max_side: int = 600, time: str | None = None):
     await interaction.response.send_message("Timelapse unchanged.", ephemeral=True)
 
-# -------------------- /LIVE_PROGRESS (OLD STYLE EMBED) --------------------
+# -------------------- /LIVE_PROGRESS (OLD STYLE EMBED + RED OVERLAY) --------------------
 _active_checks = {}
 
 class LiveControls(discord.ui.View):
@@ -192,16 +192,48 @@ async def live_progress(interaction, template: discord.Attachment, coords: str, 
     progress_message = None
 
     async def run_once(message: discord.Message | None = None):
+        # Get basic progress info and cropped template PNG
         png, w, h, matched, total, pct = await run_markarea_once(source_channel, template_bytes, coords)
+
+        # ---- Create red overlay showing mismatched pixels ----
+        latest_sig, latest_url = await _find_latest_image_with_sig(source_channel)
+        if not latest_url:
+            canvas_img = Image.open(BytesIO(template_bytes)).convert("RGBA")
+        else:
+            async with aiohttp.ClientSession() as session:
+                canvas_bytes = await _download_bytes(session, latest_url)
+                canvas_img = Image.open(BytesIO(canvas_bytes)).convert("RGBA")
+
+        tmpl_img = Image.open(BytesIO(template_bytes)).convert("RGBA")
+        overlay = Image.new("RGBA", tmpl_img.size)
+        cpx, tpx = canvas_img.load(), tmpl_img.load()
+
+        for y in range(tmpl_img.height):
+            for x in range(tmpl_img.width):
+                tr, tg, tb, ta = tpx[x, y]
+                if ta == 0:
+                    continue
+                if cpx[x, y][:3] != (tr, tg, tb):
+                    overlay.putpixel((x, y), (255, 0, 0, 180))  # semi-transparent red
+
+        # Combine template + red overlay
+        combined = Image.alpha_composite(tmpl_img, overlay)
+        out = BytesIO()
+        combined.save(out, format="PNG")
+        out.seek(0)
+
+        # Compute ETA
         remaining = max(total - matched, 0)
         eta_seconds = math.ceil(remaining * COOLDOWN_SECONDS_PER_PIXEL / max(builders, 1))
 
+        # Create embed
         embed = discord.Embed(title="Live Template Progress", color=0x2F3136)
         embed.add_field(name="Pixels", value=f"{matched} / {total}", inline=False)
         embed.add_field(name="Completion", value=f"{pct:.2f}%", inline=False)
         embed.add_field(name="ETA", value=f"{format_eta(eta_seconds)} ({remaining} px, builders={builders}, {COOLDOWN_SECONDS_PER_PIXEL}s/px)", inline=False)
+        embed.set_image(url="attachment://progress.png")  # embed image inside
 
-        file = discord.File(BytesIO(png), filename="progress.png")
+        file = discord.File(out, filename="progress.png")
 
         if message:
             await message.edit(embed=embed, attachments=[file])
@@ -213,6 +245,7 @@ async def live_progress(interaction, template: discord.Attachment, coords: str, 
         await run_once()
         return
 
+    # Start live progress
     key = (interaction.guild_id, interaction.user.id)
     view = LiveControls(key)
     progress_message = await interaction.followup.send("📡 Live progress started", view=view)
@@ -228,6 +261,7 @@ async def live_progress(interaction, template: discord.Attachment, coords: str, 
 
     task = asyncio.create_task(runner())
     _active_checks[key] = task
+
 
 # ---------------- TEMPLATE COMMANDS (UNCHANGED) ----------------
 TEMPLATE_CHANNEL_ID = 1462384080716038205
