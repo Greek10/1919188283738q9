@@ -14,6 +14,8 @@ import aiohttp
 from PIL import Image
 from aiohttp import web
 
+
+
 # ----------------- CONFIG --------------------
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN", "").strip()
 
@@ -148,57 +150,70 @@ async def run_markarea_once(source_channel, template_bytes, coords):
 # -------------------- /TIMELAPSE --------------------
 @bot.tree.command(name="timelapse")
 @app_commands.describe(
-    hours="Hours back", fps="FPS", max_frames="Max frames", max_side="Max size", time="Optional time"
+    hours="Hours back",
+    fps="Frames per second for the timelapse",
+    resolution="Maximum width/height of the output GIF",
+    time="Optional specific time (HH:MM) to start the timelapse"
 )
-async def timelapse(interaction, hours: int = 12, fps: int = 4, max_frames: int = 60, max_side: int = 600, time: str | None = None):
+async def timelapse(interaction, hours: int = 12, fps: int = 4, resolution: int = 600, time: str | None = None):
     await interaction.response.defer()
 
-    # Fetch the correct channel
+    # Resolve the timelapse channel
     timelapse_channel = await _get_text_channel_by_id(TIMELAPSE_CHANNEL_ID)
+
+    # Compute the cutoff time
     cutoff = datetime.utcnow() - timedelta(hours=hours)
+
+    # Optional time filter
+    time_hour, time_minute = None, None
+    if time:
+        try:
+            time_hour, time_minute = map(int, time.split(":"))
+        except Exception:
+            await interaction.followup.send("❌ Invalid time format. Use HH:MM")
+            return
+
     images = []
 
-    # Fetch images from timelapse channel
-    async for msg in timelapse_channel.history(limit=200, after=cutoff):
+    # Fetch messages in the last <hours> and filter attachments
+    async for msg in timelapse_channel.history(limit=None, after=cutoff):
+        # If specific time is requested, skip messages that don't match the hour:minute
+        if time_hour is not None:
+            msg_time = msg.created_at
+            if msg_time.hour != time_hour or msg_time.minute != time_minute:
+                continue
+
         for a in msg.attachments:
             if (a.content_type or "").startswith("image/"):
                 images.append(a.url)
-        if len(images) >= max_frames:
-            break
 
     if not images:
         await interaction.followup.send("❌ No images found in that time range.")
         return
 
-    from PIL import Image
-    import aiohttp
-
     frames = []
     async with aiohttp.ClientSession() as session:
-        for url in images[:max_frames]:
+        for url in images:
             async with session.get(url) as resp:
                 data = await resp.read()
                 img = Image.open(BytesIO(data)).convert("RGBA")
 
-                # Resize if larger than max_side
+                # Resize if larger than max resolution
                 w, h = img.size
-                scale = min(max_side / max(w, h), 1.0)
+                scale = min(resolution / max(w, h), 1.0)
                 if scale < 1.0:
-                    img = img.resize((int(w*scale), int(h*scale)), Image.LANCZOS)
+                    img = img.resize((int(w * scale), int(h * scale)), Image.LANCZOS)
 
                 frames.append(img)
 
-    if not frames:
-        await interaction.followup.send("❌ Failed to load images.")
-        return
-
+    # Save frames to GIF
     out_bytes = BytesIO()
     frames[0].save(
         out_bytes,
         format="GIF",
         save_all=True,
         append_images=frames[1:],
-        duration=int(1000/fps),
+        duration=int(1000 / fps),
         loop=0,
         disposal=2
     )
