@@ -427,12 +427,11 @@ async def check_templates(interaction: Interaction):
 @bot.tree.command(name="instructions")
 async def instructions(interaction: discord.Interaction):
     """
-    Sends the bot/server instructions as an embed.
-    Edit the embed content below.
+ lalal
     """
 
     embed = discord.Embed(
-        title="🧩 Template Instructions",
+        title=" Template Instructions",
         description=(
             "lala \n\n"
             "test1 \n"
