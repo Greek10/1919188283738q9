@@ -239,7 +239,7 @@ async def timelapse(interaction, hours: int = 12, fps: int = 4, resolution: int 
         file=discord.File(out_bytes, "timelapse.gif")
     )
 
-# -------------------- /LIVE_PROGRESS (OLD STYLE EMBED + RED OVERLAY + TIMESTAMP) --------------------
+# -------------------- /LIVE_PROGRESS --------------------
 _active_checks = {}
 
 class LiveControls(discord.ui.View):
@@ -254,36 +254,57 @@ class LiveControls(discord.ui.View):
             task.cancel()
         await interaction.response.edit_message(content="🛑 Stopped.", view=None)
 
+
 def format_eta(seconds: int) -> str:
     h = seconds // 3600
     m = (seconds % 3600) // 60
     s = seconds % 60
     return f"{h}h {m}m {s}s"
 
+
 @bot.tree.command(name="live_progress")
 @app_commands.describe(
     template="Template image",
     coords="(x1,y1)(x2,y2)(x3,y3)(x4,y4)",
     builders="Builders",
-    once="Run once and stop"
+    once="Run once and stop",
+    alert_role="Role to ping if progress goes backwards"
 )
-async def live_progress(interaction, template: discord.Attachment, coords: str, builders: int = 1, once: bool = False):
+async def live_progress(
+    interaction,
+    template: discord.Attachment,
+    coords: str,
+    builders: int = 1,
+    once: bool = False,
+    alert_role: discord.Role | None = None
+):
     await interaction.response.defer()
 
     if not (template.content_type or "").startswith("image/"):
-        await interaction.followup.send("❌ Template must be image.")
+        await interaction.followup.send("❌ Template must be an image.")
         return
 
     source_channel = await _get_text_channel_by_id(SOURCE_CHANNEL_ID)
     template_bytes = await template.read()
 
     progress_message = None
+    last_pct = None  # <-- track previous progress %
 
     async def run_once(message: discord.Message | None = None):
-        # Get basic progress info and cropped template PNG
-        png, w, h, matched, total, pct = await run_markarea_once(source_channel, template_bytes, coords)
+        nonlocal last_pct
 
-        # ---- Create red overlay showing mismatched pixels ----
+        # ---- Progress calculation ----
+        png, w, h, matched, total, pct = await run_markarea_once(
+            source_channel, template_bytes, coords
+        )
+
+        # ---- Detect regression ----
+        went_backwards = False
+        if last_pct is not None and pct < last_pct:
+            went_backwards = True
+        last_pct = pct
+
+        # ---- Get latest canvas ----
         latest_sig, latest_url = await _find_latest_image_with_sig(source_channel)
         if not latest_url:
             canvas_img = Image.open(BytesIO(template_bytes)).convert("RGBA")
@@ -292,6 +313,7 @@ async def live_progress(interaction, template: discord.Attachment, coords: str, 
                 canvas_bytes = await _download_bytes(session, latest_url)
                 canvas_img = Image.open(BytesIO(canvas_bytes)).convert("RGBA")
 
+        # ---- Red overlay for mismatched pixels ----
         tmpl_img = Image.open(BytesIO(template_bytes)).convert("RGBA")
         overlay = Image.new("RGBA", tmpl_img.size)
         cpx, tpx = canvas_img.load(), tmpl_img.load()
@@ -302,50 +324,84 @@ async def live_progress(interaction, template: discord.Attachment, coords: str, 
                 if ta == 0:
                     continue
                 if cpx[x, y][:3] != (tr, tg, tb):
-                    overlay.putpixel((x, y), (255, 0, 0, 180))  # semi-transparent red
+                    overlay.putpixel((x, y), (255, 0, 0, 180))
 
-        # Combine template + red overlay
         combined = Image.alpha_composite(tmpl_img, overlay)
         out = BytesIO()
         combined.save(out, format="PNG")
         out.seek(0)
 
-        # Compute ETA
+        # ---- ETA ----
         remaining = max(total - matched, 0)
-        eta_seconds = math.ceil(remaining * COOLDOWN_SECONDS_PER_PIXEL / max(builders, 1))
+        eta_seconds = math.ceil(
+            remaining * COOLDOWN_SECONDS_PER_PIXEL / max(builders, 1)
+        )
 
-        # Current timestamp
+        # ---- Timestamp ----
         now = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
 
-        # Create embed
-        embed = discord.Embed(title="Live Template Progress", color=0x2F3136)
-        embed.add_field(name="Pixels", value=f"{matched} / {total}", inline=False)
-        embed.add_field(name="Completion", value=f"{pct:.2f}%", inline=False)
-        embed.add_field(name="ETA", value=f"{format_eta(eta_seconds)} ({remaining} px, builders={builders}, {COOLDOWN_SECONDS_PER_PIXEL}s/px)", inline=False)
-        embed.set_image(url="attachment://progress.png")  # embed image inside
+        # ---- Embed ----
+        embed = discord.Embed(
+            title="Live Template Progress",
+            color=0x2F3136
+        )
+        embed.add_field(
+            name="Pixels",
+            value=f"{matched} / {total}",
+            inline=False
+        )
+        embed.add_field(
+            name="Completion",
+            value=f"{pct:.2f}%",
+            inline=False
+        )
+        embed.add_field(
+            name="ETA",
+            value=f"{format_eta(eta_seconds)} "
+                  f"({remaining} px, builders={builders}, {COOLDOWN_SECONDS_PER_PIXEL}s/px)",
+            inline=False
+        )
+        embed.set_image(url="attachment://progress.png")
         embed.set_footer(text=f"Last Updated: {now}")
 
         file = discord.File(out, filename="progress.png")
 
+        # ---- Role ping on regression ----
+        content = None
+        if went_backwards and alert_role:
+            content = f"⚠️ **Progress went backwards!** {alert_role.mention}"
+
         if message:
-            await message.edit(embed=embed, attachments=[file])
+            await message.edit(
+                content=content,
+                embed=embed,
+                attachments=[file]
+            )
             return message
         else:
-            return await interaction.followup.send(embed=embed, file=file)
+            return await interaction.followup.send(
+                content=content,
+                embed=embed,
+                file=file
+            )
 
+    # ---- Run once ----
     if once:
         await run_once()
         return
 
-    # Start live progress
+    # ---- Live mode ----
     key = (interaction.guild_id, interaction.user.id)
     view = LiveControls(key)
-    progress_message = await interaction.followup.send("📡 Live progress started", view=view)
+    progress_message = await interaction.followup.send(
+        "📡 Live progress started",
+        view=view
+    )
 
     async def runner():
         last_sig = None
         while True:
-            sig,_ = await _find_latest_image_with_sig(source_channel)
+            sig, _ = await _find_latest_image_with_sig(source_channel)
             if sig != last_sig:
                 last_sig = sig
                 await run_once(progress_message)
