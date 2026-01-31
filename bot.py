@@ -239,7 +239,7 @@ async def timelapse(interaction, hours: int = 12, fps: int = 4, resolution: int 
         file=discord.File(out_bytes, "timelapse.gif")
     )
 
-# -------------------- /LIVE_PROGRESS --------------------
+# -------------------- /LIVE_PROGRESS (OLD STYLE EMBED + RED OVERLAY + TIMESTAMP + REGRESSION PING) --------------------
 _active_checks = {}
 
 class LiveControls(discord.ui.View):
@@ -288,7 +288,7 @@ async def live_progress(
     template_bytes = await template.read()
 
     progress_message = None
-    last_pct = None  # <-- track previous progress %
+    last_pct: float | None = None
 
     async def run_once(message: discord.Message | None = None):
         nonlocal last_pct
@@ -299,10 +299,25 @@ async def live_progress(
         )
 
         # ---- Detect regression ----
-        went_backwards = False
-        if last_pct is not None and pct < last_pct:
-            went_backwards = True
+        went_backwards = (
+            last_pct is not None and pct < last_pct
+        )
         last_pct = pct
+
+        # ---- Send regression ping (NEW MESSAGE) ----
+        if went_backwards and alert_role:
+            ping_msg = await interaction.channel.send(
+                f"⚠️ **Template progress went backwards!** {alert_role.mention}"
+            )
+
+            async def delete_later(msg: discord.Message):
+                await asyncio.sleep(20)
+                try:
+                    await msg.delete()
+                except discord.NotFound:
+                    pass
+
+            asyncio.create_task(delete_later(ping_msg))
 
         # ---- Get latest canvas ----
         latest_sig, latest_url = await _find_latest_image_with_sig(source_channel)
@@ -313,7 +328,7 @@ async def live_progress(
                 canvas_bytes = await _download_bytes(session, latest_url)
                 canvas_img = Image.open(BytesIO(canvas_bytes)).convert("RGBA")
 
-        # ---- Red overlay for mismatched pixels ----
+        # ---- Red overlay ----
         tmpl_img = Image.open(BytesIO(template_bytes)).convert("RGBA")
         overlay = Image.new("RGBA", tmpl_img.size)
         cpx, tpx = canvas_img.load(), tmpl_img.load()
@@ -366,24 +381,11 @@ async def live_progress(
 
         file = discord.File(out, filename="progress.png")
 
-        # ---- Role ping on regression ----
-        content = None
-        if went_backwards and alert_role:
-            content = f"⚠️ **Progress went backwards!** {alert_role.mention}"
-
         if message:
-            await message.edit(
-                content=content,
-                embed=embed,
-                attachments=[file]
-            )
+            await message.edit(embed=embed, attachments=[file])
             return message
         else:
-            return await interaction.followup.send(
-                content=content,
-                embed=embed,
-                file=file
-            )
+            return await interaction.followup.send(embed=embed, file=file)
 
     # ---- Run once ----
     if once:
