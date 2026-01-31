@@ -431,22 +431,18 @@ async def instructions(interaction: discord.Interaction):
     """
 
     embed = discord.Embed(
-        title=" Template Instructions",
+        title="Live Information",
         description=(
-            "lala \n\n"
-            "test1 \n"
-            "test2 \n\n"
-            "test3 \n"
-            "test4 \n\n"
-            "test5 \n"
-            "test6 \n\n"
-            "test7\n"
-            "test8"
+            "• Coordinates for live progress has to be (0,0)(0,600)(600,0)(600,600), unless you want specific coordinates (which require more effort)\n"
+            "• Template image size has to be 600x600 \n"
+            "• If bot does not update, this is a problem within the actual map update and not the bot itself\n\n"
+            "• Bot updates every 5-10 minutes \n"
+            "• Ecuador is a good country \n"
         ),
         color=0x2F3136
     )
 
-    embed.set_footer(text="footer test")
+    embed.set_footer(text="-")
 
     await interaction.response.send_message(
         embed=embed,
