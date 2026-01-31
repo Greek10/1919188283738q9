@@ -423,6 +423,38 @@ async def template(interaction: Interaction, template_name: str):
 async def check_templates(interaction: Interaction):
     await interaction.response.send_message("Check templates unchanged.")
 
+# -------------------- /INSTRUCTIONS (EMBED) --------------------
+@bot.tree.command(name="instructions")
+async def instructions(interaction: discord.Interaction):
+    """
+    Sends the bot/server instructions as an embed.
+    Edit the embed content below.
+    """
+
+    embed = discord.Embed(
+        title="🧩 Template Instructions",
+        description=(
+            "lala \n\n"
+            "test1 \n"
+            "test2 \n\n"
+            "test3 \n"
+            "test4 \n\n"
+            "test5 \n"
+            "test6 \n\n"
+            "test7\n"
+            "test8"
+        ),
+        color=0x2F3136
+    )
+
+    embed.set_footer(text="footer test")
+
+    await interaction.response.send_message(
+        embed=embed,
+        ephemeral=False
+    )
+
+
 # -------------------- UPTIME WEB --------------------
 async def handle(request):
     return web.Response(text="OK")
