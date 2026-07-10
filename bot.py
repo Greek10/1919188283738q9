@@ -10,7 +10,7 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 
-# -------------------- CONFIG --------------------
+# ----------------- CONFIG --------------------
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN", "").strip()
 
 SOURCE_CHANNEL_ID = int(os.getenv("SOURCE_CHANNEL_ID", "0") or "0")          # for /progress /live_progress /archieved + /canvas
@@ -18,6 +18,9 @@ TIMELAPSE_CHANNEL_ID = int(os.getenv("TIMELAPSE_CHANNEL_ID", "0") or "0")    # f
 
 # OWNER (for owner-only slash commands)
 BOT_OWNER_ID = int(os.getenv("BOT_OWNER_ID", "0") or "0")
+
+# Preset log channel (presets are stored as messages here)
+PRESET_LOG_CHANNEL_ID = int(os.getenv("PRESET_LOG_CHANNEL_ID", "0") or "0")
 
 COOLDOWN_SECONDS_PER_PIXEL = 15
 POLL_SECONDS = 30
@@ -63,6 +66,71 @@ async def _get_text_channel_by_id(channel_id: int) -> discord.TextChannel:
     if not isinstance(ch, discord.TextChannel):
         raise RuntimeError(f"Channel {channel_id} is not a text channel or is not accessible.")
     return ch
+
+# -------------------- PRESET HELPERS --------------------
+async def _get_preset_log_channel() -> discord.TextChannel:
+    if not PRESET_LOG_CHANNEL_ID:
+        raise RuntimeError("PRESET_LOG_CHANNEL_ID is not set. Set it to the channel where presets will be logged.")
+    ch = bot.get_channel(PRESET_LOG_CHANNEL_ID)
+    if ch is None:
+        ch = await bot.fetch_channel(PRESET_LOG_CHANNEL_ID)
+    if not isinstance(ch, discord.TextChannel):
+        raise RuntimeError("PRESET_LOG_CHANNEL_ID is not a text channel or is not accessible.")
+    return ch
+
+def _preset_marker_line(name: str, coords: str, ping_role_id: int, template_url: str, template_filename: str) -> str:
+    # Stable marker format so we can parse from message history
+    return f"PRESET|{name}|{coords}|{ping_role_id}|{template_url}|{template_filename}"
+
+def _parse_preset_marker(blob: str) -> dict | None:
+    # PRESET|name|coords|ping_role_id|template_url|template_filename
+    m = re.search(r"PRESET\|(.+?)\|(.+?)\|(\d+)\|(\S+)\|(.+)", blob or "")
+    if not m:
+        return None
+    return {
+        "name": m.group(1).strip(),
+        "coords": m.group(2).strip(),
+        "ping_role_id": int(m.group(3)),
+        "template_url": m.group(4).strip(),
+        "template_filename": m.group(5).strip(),
+    }
+
+async def load_preset_by_name(preset_name: str) -> dict | None:
+    """
+    Loads the MOST RECENT preset with this name from the preset log channel.
+    """
+    preset_name = (preset_name or "").strip()
+    if not preset_name:
+        return None
+
+    log_ch = await _get_preset_log_channel()
+
+    async for msg in log_ch.history(limit=800, oldest_first=False):
+        # Search message content
+        parsed = _parse_preset_marker(msg.content or "")
+        if parsed and parsed["name"].lower() == preset_name.lower():
+            return parsed
+
+        # Search embeds
+        for e in (msg.embeds or []):
+            parts = [str(e.title or ""), str(e.description or "")]
+            try:
+                for f in (e.fields or []):
+                    parts.append(str(f.name or ""))
+                    parts.append(str(f.value or ""))
+            except Exception:
+                pass
+            blob = "\n".join(parts)
+            parsed = _parse_preset_marker(blob)
+            if parsed and parsed["name"].lower() == preset_name.lower():
+                return parsed
+
+    return None
+
+async def _download_template_url(url: str) -> bytes:
+    import aiohttp
+    async with aiohttp.ClientSession() as session:
+        return await _download_bytes(session, url, timeout_s=45)
 
 # -------------------- COMMON HELPERS --------------------
 async def _download_bytes(session, url: str, timeout_s: int = 30) -> bytes:
@@ -285,6 +353,70 @@ async def run_markarea_once(
 
     return out.read(), box_w, box_h, matched, total, pct
 
+# -------------------- /PRESET (logs to PRESET_LOG_CHANNEL_ID) --------------------
+@bot.tree.command(name="preset", description="Save a preset (logged to the preset log channel).")
+@app_commands.describe(
+    template_name="Preset name (e.g. logo1)",
+    template_image="Template image attachment",
+    coordinates="(x1,y1)(x2,y2)(x3,y3)(x4,y4)",
+    ping_role="Optional ping role for /live_progress when regressions happen"
+)
+async def preset_cmd(
+    interaction: discord.Interaction,
+    template_name: str,
+    template_image: discord.Attachment,
+    coordinates: str,
+    ping_role: discord.Role | None = None,
+):
+    await interaction.response.defer(thinking=True, ephemeral=True)
+
+    if not template_name or len(template_name) > 40:
+        await interaction.followup.send("❌ `template_name` must be 1–40 characters.", ephemeral=True)
+        return
+
+    if not (template_image.content_type or "").startswith("image/"):
+        await interaction.followup.send("❌ That template_image doesn’t look like an image.", ephemeral=True)
+        return
+
+    try:
+        parse_coords_4pairs(coordinates)
+    except Exception as e:
+        await interaction.followup.send(f"❌ Invalid coordinates: {e}", ephemeral=True)
+        return
+
+    try:
+        log_ch = await _get_preset_log_channel()
+    except Exception as e:
+        await interaction.followup.send(f"❌ Preset log channel error: `{type(e).__name__}: {e}`", ephemeral=True)
+        return
+
+    ping_role_id = int(ping_role.id) if ping_role else 0
+    marker = _preset_marker_line(
+        template_name.strip(),
+        coordinates.strip(),
+        ping_role_id,
+        template_image.url,
+        template_image.filename or "template.png"
+    )
+
+    embed = discord.Embed(
+        title=f"Preset Saved: {template_name.strip()}",
+        description=(
+            f"**Name:** `{template_name.strip()}`\n"
+            f"**Coords:** `{coordinates.strip()}`\n"
+            f"**Ping Role:** {f'<@&{ping_role_id}>' if ping_role_id else 'None'}\n"
+            f"**Template:** `{template_image.filename or 'template.png'}`\n\n"
+            f"**Marker (do not edit):**\n`{marker}`"
+        )
+    )
+
+    await log_ch.send(embed=embed)
+
+    await interaction.followup.send(
+        f"✅ Preset saved as **{template_name.strip()}** (logged in {log_ch.mention}).",
+        ephemeral=True
+    )
+
 # -------------------- /CANVAS (gets recent image from SOURCE_CHANNEL_ID) --------------------
 @bot.tree.command(name="canvas", description="Gets the most recent canvas from pixel place")
 async def canvas(interaction: discord.Interaction):
@@ -499,20 +631,84 @@ async def progress_cmd(
     except Exception as e:
         await interaction.followup.send(f"❌ /progress failed: `{type(e).__name__}: {e}`")
 
-# -------------------- /LIVE_PROGRESS (uses owner-set SOURCE_CHANNEL_ID) --------------------
+# -------------------- /LIVE_PROGRESS (buttons + preset support) --------------------
 _active_checks: dict[tuple[int, int], asyncio.Task] = {}
+_live_sessions: dict[tuple[int, int], dict] = {}
 
-@bot.tree.command(name="live_progress", description="Live version of progress.")
+class LiveProgressControls(discord.ui.View):
+    def __init__(self, session_key: tuple[int, int], *, timeout: float | None = None):
+        super().__init__(timeout=timeout)
+        self.session_key = session_key
+
+    async def _get_session(self):
+        return _live_sessions.get(self.session_key)
+
+    @discord.ui.button(label="Extract", style=discord.ButtonStyle.secondary)
+    async def extract_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        session = await self._get_session()
+        if not session:
+            await interaction.response.send_message("❌ No active live progress session.", ephemeral=True)
+            return
+
+        fp = BytesIO(session["template_bytes"])
+        await interaction.response.send_message(
+            content="📌 Template used for this live progress:",
+            file=discord.File(fp=fp, filename=session.get("template_filename", "template.png")),
+            ephemeral=True
+        )
+
+    @discord.ui.button(label="Pause", style=discord.ButtonStyle.primary)
+    async def pause_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        session = await self._get_session()
+        if not session:
+            await interaction.response.send_message("❌ No active live progress session.", ephemeral=True)
+            return
+
+        session["paused"] = not session.get("paused", False)
+        paused = session["paused"]
+
+        button.label = "Resume" if paused else "Pause"
+        button.style = discord.ButtonStyle.success if paused else discord.ButtonStyle.primary
+
+        try:
+            await interaction.response.edit_message(view=self)
+        except Exception:
+            try:
+                await interaction.response.send_message("✅ Toggled pause.", ephemeral=True)
+            except Exception:
+                pass
+
+    @discord.ui.button(label="Stop", style=discord.ButtonStyle.danger)
+    async def stop_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        task = _active_checks.pop(self.session_key, None)
+        _live_sessions.pop(self.session_key, None)
+
+        if task and not task.done():
+            task.cancel()
+
+        for child in self.children:
+            if isinstance(child, discord.ui.Button):
+                child.disabled = True
+
+        try:
+            await interaction.response.edit_message(content="🛑 Live progress stopped.", view=self)
+        except Exception:
+            try:
+                await interaction.response.send_message("🛑 Live progress stopped.", ephemeral=True)
+            except Exception:
+                pass
+
+@bot.tree.command(name="live_progress", description="Live template progress.")
 @app_commands.describe(
-    mode="start or stop",
-    template="Template image attachment (required).",
-    coords="(0,0)(1,1)(2,2)(3,3) (required).",
+    preset="Optional preset name (use /preset to make one)",
+    template="Template image attachment (optional if using preset).",
+    coords="(x1,y1)(x2,y2)(x3,y3)(x4,y4) (optional if using preset).",
     builders="How many people placing (default 1).",
-    ping_role="Role to ping if attacks are detected (optional)."
+    ping_role="Role to ping if attacks are detected (optional if using preset)"
 )
 async def live_progress(
     interaction: discord.Interaction,
-    mode: str,
+    preset: str | None = None,
     template: discord.Attachment | None = None,
     coords: str | None = None,
     builders: int = 1,
@@ -522,34 +718,38 @@ async def live_progress(
     user_id = interaction.user.id
     key = (guild_id, user_id)
 
-    mode = (mode or "").lower().strip()
-    if mode not in ("start", "stop"):
-        await interaction.response.send_message("Mode must be `start` or `stop`.", ephemeral=True)
-        return
-
-    # STOP
-    if mode == "stop":
-        task = _active_checks.pop(key, None)
-        if task and not task.done():
-            task.cancel()
-            await interaction.response.send_message("🛑 /live_progress stopped.", ephemeral=True)
-        else:
-            await interaction.response.send_message("No active /live_progress running.", ephemeral=True)
-        return
-
-    # START validation
-    if template is None or coords is None:
-        await interaction.response.send_message("❌ Provide `template` and `coords`.", ephemeral=True)
-        return
-
+    # Validate source channel
     try:
         source_channel = await _get_text_channel_by_id(SOURCE_CHANNEL_ID)
     except Exception as e:
         await interaction.response.send_message(f"❌ Source channel error: `{type(e).__name__}: {e}`", ephemeral=True)
         return
 
-    if not (template.content_type or "").startswith("image/"):
-        await interaction.response.send_message("❌ That template doesn’t look like an image.", ephemeral=True)
+    builders = max(1, int(builders))
+
+    preset_data: dict | None = None
+    if preset:
+        try:
+            preset_data = await load_preset_by_name(preset)
+        except Exception as e:
+            await interaction.response.send_message(f"❌ Failed to read presets: `{type(e).__name__}: {e}`", ephemeral=True)
+            return
+
+        if not preset_data:
+            await interaction.response.send_message(f"❌ Preset **{preset}** not found.", ephemeral=True)
+            return
+
+        # Fill missing coords / ping_role from preset
+        if coords is None:
+            coords = preset_data.get("coords")
+
+        if ping_role is None:
+            rid = int(preset_data.get("ping_role_id") or 0)
+            if rid and interaction.guild:
+                ping_role = interaction.guild.get_role(rid)
+
+    if not coords:
+        await interaction.response.send_message("❌ Missing coords. Provide `coords` or `preset`.", ephemeral=True)
         return
 
     try:
@@ -558,38 +758,91 @@ async def live_progress(
         await interaction.response.send_message(f"❌ Invalid coords: {e}", ephemeral=True)
         return
 
-    template_bytes = await template.read()
-    builders = max(1, int(builders))
+    # Template bytes: prefer upload, else from preset
+    template_bytes: bytes | None = None
+    template_filename: str = "template.png"
 
-    out_ch = interaction.channel
-    if not isinstance(out_ch, discord.TextChannel):
-        await interaction.response.send_message("This command must be used in a normal text channel.", ephemeral=True)
+    if template is not None:
+        if not (template.content_type or "").startswith("image/"):
+            await interaction.response.send_message("❌ That template doesn’t look like an image.", ephemeral=True)
+            return
+        template_bytes = await template.read()
+        template_filename = template.filename or "template.png"
+    else:
+        if not preset_data:
+            await interaction.response.send_message("❌ Missing template. Provide `template` or `preset`.", ephemeral=True)
+            return
+        turl = preset_data.get("template_url")
+        if not turl:
+            await interaction.response.send_message("❌ Preset has no template_url.", ephemeral=True)
+            return
+        try:
+            template_bytes = await _download_template_url(turl)
+            template_filename = preset_data.get("template_filename") or "template.png"
+        except Exception as e:
+            await interaction.response.send_message(f"❌ Failed to download preset template: `{e}`", ephemeral=True)
+            return
+
+    if template_bytes is None:
+        await interaction.response.send_message("❌ Template bytes missing.", ephemeral=True)
         return
 
-    # cancel old if exists
+    # Cancel any existing session
     old = _active_checks.pop(key, None)
     if old and not old.done():
         old.cancel()
+    _live_sessions.pop(key, None)
+
+    # Create controls + initial message
+    view = LiveProgressControls(key, timeout=None)
+    _live_sessions[key] = {
+        "paused": False,
+        "template_bytes": template_bytes,
+        "template_filename": template_filename,
+        "coords": coords,
+        "builders": builders,
+        "ping_role_id": int(ping_role.id) if ping_role else 0,
+        "preset_name": preset or "",
+    }
 
     await interaction.response.send_message(
-        f"✅ /live_progress started.\n"
-        f"• Source: {source_channel.mention}\n"
-        f"• Poll: every **{POLL_SECONDS}s**\n"
-        f"• Builders: **{builders}**\n"
-        f"• Ping role: {ping_role.mention if ping_role else 'None'}\n"
-        f"Stop with: `/live_progress mode:stop`",
-        ephemeral=True
+        content=(
+            f" **Live progress started**\n"
+            f"• Preset: **{preset}**\n" if preset else " **Live progress started**\n"
+        ) + (
+            f"• Builders: **{builders}**\n"
+            f"• Ping role: {ping_role.mention if ping_role else 'None'}\n"
+            f"Use the buttons below."
+        ),
+        view=view,
+        ephemeral=False
     )
+
+    out_ch = interaction.channel
+    if not isinstance(out_ch, discord.TextChannel):
+        return
 
     async def runner():
         last_sig: str | None = None
         last_matched: int | None = None
-
-        # Track the previously posted message so we can delete it
         last_posted_msg: discord.Message | None = None
 
         while True:
             try:
+                session = _live_sessions.get(key)
+                if not session:
+                    return
+
+                if session.get("paused"):
+                    await asyncio.sleep(POLL_SECONDS)
+                    continue
+
+                # allow changes later if you expand controls
+                coords_local = session.get("coords", coords)
+                builders_local = int(session.get("builders", builders))
+                ping_role_id = int(session.get("ping_role_id") or 0)
+                ping_role_local = interaction.guild.get_role(ping_role_id) if (interaction.guild and ping_role_id) else ping_role
+
                 sig, _url = await _find_latest_image_with_sig(source_channel)
                 if not sig:
                     await asyncio.sleep(POLL_SECONDS)
@@ -601,19 +854,17 @@ async def live_progress(
                     png_bytes, box_w, box_h, matched, total, pct = await run_markarea_once(
                         source_channel=source_channel,
                         template_bytes=template_bytes,
-                        coords=coords,
+                        coords=coords_local,
                     )
 
-                    # Regression detection ping (separate message so it isn't lost)
-                    if last_matched is not None and matched < last_matched and ping_role is not None:
+                    if last_matched is not None and matched < last_matched and ping_role_local is not None:
                         lost = last_matched - matched
                         dec_pct = (lost / last_matched * 100.0) if last_matched > 0 else 0.0
                         await out_ch.send(
-                            f"{ping_role.mention} ⚠️ **Users may be attacking** — progress went backwards "
+                            f"{ping_role_local.mention} ⚠️ **Users may be attacking** — progress went backwards "
                             f"(**-{lost:,} px**, **-{dec_pct:.2f}%**)."
                         )
 
-                    # Optional "progress made" message (separate, you can remove if you want)
                     if last_matched is not None and matched > last_matched:
                         gained = matched - last_matched
                         inc_pct = (gained / total * 100.0) if total > 0 else 0.0
@@ -621,9 +872,8 @@ async def live_progress(
 
                     last_matched = matched
 
-                    remaining, _eta_seconds, h, m, s = _eta_from_progress(matched, total, builders)
+                    remaining, _eta_seconds, h, m, s = _eta_from_progress(matched, total, builders_local)
 
-                    # Build embed + attach image
                     embed = discord.Embed(
                         title="Live Template Progress",
                         description=(
@@ -631,8 +881,8 @@ async def live_progress(
                             f"**Region**: `{box_w}×{box_h}`\n"
                             f"**Pixels**: `{matched:,} / {total:,}`\n"
                             f"**Completion**: **{pct:.2f}%**\n"
-                            f"**ETA**: **{h}h {m}m {s}s** (`{remaining:,}` px, builders={builders}, {COOLDOWN_SECONDS_PER_PIXEL}s/px)\n"
-                            f"**Update**: new/edited image detected."
+                            f"**ETA**: **{h}h {m}m {s}s** (`{remaining:,}` px, builders={builders_local}, {COOLDOWN_SECONDS_PER_PIXEL}s/px)\n"
+                            f"**Update**: source changed (new/edited)."
                         ),
                     )
 
@@ -640,31 +890,18 @@ async def live_progress(
                     file = discord.File(fp=fp, filename="template_progress.png")
                     embed.set_image(url="attachment://template_progress.png")
 
-                    # Post new message first (so you never end up with none if delete fails)
                     new_msg = await out_ch.send(embed=embed, file=file)
 
-                    # Delete previous live message
                     if last_posted_msg is not None:
                         try:
                             await last_posted_msg.delete()
-                        except discord.Forbidden:
-                            # Bot lacks Manage Messages in this channel
-                            pass
-                        except discord.NotFound:
-                            pass
                         except Exception:
                             pass
 
                     last_posted_msg = new_msg
 
             except asyncio.CancelledError:
-                # optional: delete the last live message when stopping
-                if last_posted_msg is not None:
-                    try:
-                        await last_posted_msg.delete()
-                    except Exception:
-                        pass
-                raise
+                return
             except Exception as e:
                 try:
                     await out_ch.send(f"⚠️ /live_progress error: `{type(e).__name__}: {e}`")
@@ -749,7 +986,7 @@ async def archieved(
 
                     fp = BytesIO(img_bytes)
                     await out_ch.send(
-                        content=f"🗂️ **Archived canvas image update** (source: {source_channel.mention})",
+                        content=f" **Canvas image** (source: {source_channel.mention})",
                         file=discord.File(fp=fp, filename="archived.png")
                     )
 
@@ -767,14 +1004,11 @@ async def archieved(
     _active_archives[key] = task
 
 # -------------------- /ARCHIEVED_TEXT (OWNER-ONLY, SIMPLE TEXT MIRROR) --------------------
-# This is a lightweight "mirror edits as messages" watcher.
-# It watches the latest message in source_channel and reposts when it changes (including edits).
 _active_text_archivers: dict[tuple[int, int], asyncio.Task] = {}
 
 def _msg_fingerprint(m: discord.Message) -> str:
     edited = m.edited_at.isoformat() if m.edited_at else ""
     parts = [str(m.id), edited, (m.content or "").strip()]
-    # include embed text too (bots often edit embeds)
     if m.embeds:
         for e in m.embeds:
             parts.append((e.title or "").strip())
@@ -922,6 +1156,9 @@ if __name__ == "__main__":
 
     if BOT_OWNER_ID == 0:
         print("⚠️ BOT_OWNER_ID is not set. Owner-only commands (/check, /archieved, /archieved_text) will deny everyone.")
+
+    if PRESET_LOG_CHANNEL_ID == 0:
+        print("Invalid log")
 
     if SOURCE_CHANNEL_ID == 0:
         print("⚠️ SOURCE_CHANNEL_ID is not set. /progress /live_progress /archieved /canvas will fail until you set it.")
