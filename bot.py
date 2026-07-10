@@ -29,7 +29,7 @@ PRESET_LOG_CHANNEL_ID = int(os.getenv("PRESET_LOG_CHANNEL_ID", "0") or "0")
 PORT = int(os.getenv("PORT", "8080") or "8080")
 
 COOLDOWN_SECONDS_PER_PIXEL = 15
-POLL_SECONDS = 30
+POLL_SECONDS = 1800
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("pixelbot")
