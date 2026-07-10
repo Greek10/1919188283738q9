@@ -1,14 +1,17 @@
 import os
 import time
 import asyncio
+import logging
 from io import BytesIO
 from datetime import timedelta
 import re
 import math
 
+import aiohttp
 import discord
 from discord import app_commands
 from discord.ext import commands
+from aiohttp import web
 
 # ----------------- CONFIG --------------------
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN", "").strip()
@@ -22,8 +25,26 @@ BOT_OWNER_ID = int(os.getenv("BOT_OWNER_ID", "0") or "0")
 # Preset log channel (presets are stored as messages here)
 PRESET_LOG_CHANNEL_ID = int(os.getenv("PRESET_LOG_CHANNEL_ID", "0") or "0")
 
+# Render (or any host) gives you a port to bind to via $PORT. Default to 8080 for local runs.
+PORT = int(os.getenv("PORT", "8080") or "8080")
+
 COOLDOWN_SECONDS_PER_PIXEL = 15
 POLL_SECONDS = 30
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+log = logging.getLogger("pixelbot")
+
+# -------------------- SHARED HTTP SESSION --------------------
+# Reused everywhere instead of opening a new aiohttp.ClientSession per request/poll.
+# This avoids the overhead of a fresh TCP/TLS handshake every 30s across every
+# background loop (live_progress, archieved, archieved_text, etc).
+http_session: aiohttp.ClientSession | None = None
+
+async def get_http_session() -> aiohttp.ClientSession:
+    global http_session
+    if http_session is None or http_session.closed:
+        http_session = aiohttp.ClientSession()
+    return http_session
 
 # -------------------- DISCORD BOT --------------------
 intents = discord.Intents.default()
@@ -32,7 +53,7 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 @bot.event
 async def on_ready():
     await bot.tree.sync()
-    print(f"✅ Logged in as {bot.user}")
+    log.info(f"✅ Logged in as {bot.user}")
 
 # -------------------- OWNER HELPERS --------------------
 def _is_owner_user_id(user_id: int) -> bool:
@@ -51,7 +72,7 @@ async def _deny_if_not_owner_interaction(interaction: discord.Interaction) -> bo
         else:
             await interaction.response.send_message(msg, ephemeral=True)
     except Exception:
-        pass
+        log.exception("Failed to send owner-only denial message")
     return True
 
 # -------------------- CHANNEL RESOLUTION --------------------
@@ -128,13 +149,13 @@ async def load_preset_by_name(preset_name: str) -> dict | None:
     return None
 
 async def _download_template_url(url: str) -> bytes:
-    import aiohttp
-    async with aiohttp.ClientSession() as session:
-        return await _download_bytes(session, url, timeout_s=45)
+    session = await get_http_session()
+    return await _download_bytes(session, url, timeout_s=45)
 
 # -------------------- COMMON HELPERS --------------------
-async def _download_bytes(session, url: str, timeout_s: int = 30) -> bytes:
-    async with session.get(url, timeout=timeout_s) as resp:
+async def _download_bytes(session: aiohttp.ClientSession, url: str, timeout_s: int = 30) -> bytes:
+    timeout = aiohttp.ClientTimeout(total=timeout_s)
+    async with session.get(url, timeout=timeout) as resp:
         if resp.status != 200:
             raise RuntimeError(f"HTTP {resp.status}")
         return await resp.read()
@@ -271,7 +292,6 @@ async def run_markarea_once(
     coords: str,
 ):
     from PIL import Image
-    import aiohttp
 
     pts = parse_coords_4pairs(coords)
     (x1, y1), (x2, y2), (x3, y3), (x4, y4) = pts
@@ -280,8 +300,8 @@ async def run_markarea_once(
     if not canvas_url:
         raise RuntimeError("No recent canvas image found in the source channel.")
 
-    async with aiohttp.ClientSession() as session:
-        canvas_bytes = await _download_bytes(session, canvas_url, timeout_s=30)
+    session = await get_http_session()
+    canvas_bytes = await _download_bytes(session, canvas_url, timeout_s=30)
 
     canvas = Image.open(BytesIO(canvas_bytes)).convert("RGBA")
     tmpl = Image.open(BytesIO(template_bytes)).convert("RGBA")
@@ -370,6 +390,7 @@ async def preset_cmd(
 ):
     await interaction.response.defer(thinking=True, ephemeral=True)
 
+    template_name = (template_name or "").strip()
     if not template_name or len(template_name) > 40:
         await interaction.followup.send("❌ `template_name` must be 1–40 characters.", ephemeral=True)
         return
@@ -392,7 +413,7 @@ async def preset_cmd(
 
     ping_role_id = int(ping_role.id) if ping_role else 0
     marker = _preset_marker_line(
-        template_name.strip(),
+        template_name,
         coordinates.strip(),
         ping_role_id,
         template_image.url,
@@ -400,9 +421,9 @@ async def preset_cmd(
     )
 
     embed = discord.Embed(
-        title=f"Preset Saved: {template_name.strip()}",
+        title=f"Preset Saved: {template_name}",
         description=(
-            f"**Name:** `{template_name.strip()}`\n"
+            f"**Name:** `{template_name}`\n"
             f"**Coords:** `{coordinates.strip()}`\n"
             f"**Ping Role:** {f'<@&{ping_role_id}>' if ping_role_id else 'None'}\n"
             f"**Template:** `{template_image.filename or 'template.png'}`\n\n"
@@ -413,7 +434,7 @@ async def preset_cmd(
     await log_ch.send(embed=embed)
 
     await interaction.followup.send(
-        f"✅ Preset saved as **{template_name.strip()}** (logged in {log_ch.mention}).",
+        f"✅ Preset saved as **{template_name}** (logged in {log_ch.mention}).",
         ephemeral=True
     )
 
@@ -433,9 +454,8 @@ async def canvas(interaction: discord.Interaction):
             await interaction.followup.send(f"❌ No recent image found in {source_channel.mention}.")
             return
 
-        import aiohttp
-        async with aiohttp.ClientSession() as session:
-            img_bytes = await _download_bytes(session, url, timeout_s=45)
+        session = await get_http_session()
+        img_bytes = await _download_bytes(session, url, timeout_s=45)
 
         fp = BytesIO(img_bytes)
         await interaction.followup.send(
@@ -453,9 +473,7 @@ async def check(interaction: discord.Interaction):
 
     await interaction.response.defer(thinking=True, ephemeral=True)
 
-    lines = []
-    for g in bot.guilds:
-        lines.append(f"- {g.name} — Members: {g.member_count}")
+    lines = [f"- {g.name} — Members: {g.member_count}" for g in bot.guilds]
 
     if not lines:
         await interaction.followup.send("I'm not in any servers.", ephemeral=True)
@@ -487,7 +505,6 @@ def _fit_resize(w: int, h: int, max_side: int) -> tuple[int, int]:
 @app_commands.describe(hours="Hours back (default 12).", fps="FPS (default 4).", max_frames="Max frames (default 60).", max_side="Max side (default 600).")
 async def timelapse(interaction: discord.Interaction, hours: int = 12, fps: int = 4, max_frames: int = 60, max_side: int = 600):
     from PIL import Image
-    import aiohttp
 
     await interaction.response.defer(thinking=True)
 
@@ -535,17 +552,18 @@ async def timelapse(interaction: discord.Interaction, hours: int = 12, fps: int 
         ordered = ordered[-max_frames:]
 
     frames: list[Image.Image] = []
-    async with aiohttp.ClientSession() as session:
-        for url in ordered:
-            try:
-                b = await _download_bytes(session, url)
-                im = Image.open(BytesIO(b)).convert("RGBA")
-                nw, nh = _fit_resize(im.width, im.height, max_side)
-                if (nw, nh) != (im.width, im.height):
-                    im = im.resize((nw, nh), resample=Image.Resampling.LANCZOS)
-                frames.append(im)
-            except Exception:
-                continue
+    session = await get_http_session()
+    for url in ordered:
+        try:
+            b = await _download_bytes(session, url)
+            im = Image.open(BytesIO(b)).convert("RGBA")
+            nw, nh = _fit_resize(im.width, im.height, max_side)
+            if (nw, nh) != (im.width, im.height):
+                im = im.resize((nw, nh), resample=Image.Resampling.LANCZOS)
+            frames.append(im)
+        except Exception:
+            log.warning(f"Skipping frame that failed to download/decode: {url}")
+            continue
 
     if len(frames) < 2:
         await interaction.followup.send("Not enough valid images to make a GIF (need at least 2).")
@@ -676,7 +694,7 @@ class LiveProgressControls(discord.ui.View):
             try:
                 await interaction.response.send_message("✅ Toggled pause.", ephemeral=True)
             except Exception:
-                pass
+                log.exception("Failed to acknowledge pause toggle")
 
     @discord.ui.button(label="Stop", style=discord.ButtonStyle.danger)
     async def stop_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -696,7 +714,7 @@ class LiveProgressControls(discord.ui.View):
             try:
                 await interaction.response.send_message("🛑 Live progress stopped.", ephemeral=True)
             except Exception:
-                pass
+                log.exception("Failed to acknowledge stop")
 
 @bot.tree.command(name="live_progress", description="Live template progress.")
 @app_commands.describe(
@@ -805,15 +823,17 @@ async def live_progress(
         "preset_name": preset or "",
     }
 
+    header = " **Live progress started**"
+    preset_line = f"\n• Preset: **{preset}**" if preset else ""
+    body = (
+        f"{header}{preset_line}\n"
+        f"• Builders: **{builders}**\n"
+        f"• Ping role: {ping_role.mention if ping_role else 'None'}\n"
+        f"Use the buttons below."
+    )
+
     await interaction.response.send_message(
-        content=(
-            f" **Live progress started**\n"
-            f"• Preset: **{preset}**\n" if preset else " **Live progress started**\n"
-        ) + (
-            f"• Builders: **{builders}**\n"
-            f"• Ping role: {ping_role.mention if ping_role else 'None'}\n"
-            f"Use the buttons below."
-        ),
+        content=body,
         view=view,
         ephemeral=False
     )
@@ -903,6 +923,7 @@ async def live_progress(
             except asyncio.CancelledError:
                 return
             except Exception as e:
+                log.exception("live_progress runner error")
                 try:
                     await out_ch.send(f"⚠️ /live_progress error: `{type(e).__name__}: {e}`")
                 except Exception:
@@ -972,7 +993,6 @@ async def archieved(
     )
 
     async def runner():
-        import aiohttp
         last_sig: str | None = None
 
         while True:
@@ -981,8 +1001,8 @@ async def archieved(
                 if sig and url and sig != last_sig:
                     last_sig = sig
 
-                    async with aiohttp.ClientSession() as session:
-                        img_bytes = await _download_bytes(session, url, timeout_s=45)
+                    session = await get_http_session()
+                    img_bytes = await _download_bytes(session, url, timeout_s=45)
 
                     fp = BytesIO(img_bytes)
                     await out_ch.send(
@@ -993,6 +1013,7 @@ async def archieved(
             except asyncio.CancelledError:
                 raise
             except Exception as e:
+                log.exception("archieved runner error")
                 try:
                     await out_ch.send(f"⚠️ /archieved error: `{type(e).__name__}: {e}`")
                 except Exception:
@@ -1118,6 +1139,7 @@ async def archieved_text(
             except asyncio.CancelledError:
                 raise
             except Exception as e:
+                log.exception("archieved_text runner error")
                 try:
                     await out_ch.send(f"⚠️ /archieved_text error: `{type(e).__name__}: {e}`")
                 except Exception:
@@ -1131,9 +1153,7 @@ async def archieved_text(
 # -------------------- PREFIX COMMAND: !check2009 --------------------
 @bot.command(name="check2009")
 async def check2009(ctx: commands.Context):
-    lines = []
-    for g in bot.guilds:
-        lines.append(f"- {g.name} | ID: {g.id} | Members: {g.member_count}")
+    lines = [f"- {g.name} | ID: {g.id} | Members: {g.member_count}" for g in bot.guilds]
 
     if not lines:
         await ctx.send("I'm not in any servers.")
@@ -1149,20 +1169,72 @@ async def check2009(ctx: commands.Context):
     if msg.strip():
         await ctx.send(msg)
 
-# -------------------- START --------------------
-if __name__ == "__main__":
+# -------------------- KEEPALIVE / HEALTH-CHECK WEB SERVER --------------------
+# Render's "Web Service" type requires binding to $PORT and answering HTTP
+# requests, or it treats the deploy as failed even if the process itself is
+# healthy. This tiny server exists purely to satisfy that port-detection
+# check (and doubles as an uptime-pinger target / health check endpoint).
+async def _health(request: web.Request) -> web.Response:
+    status = "ready" if bot.is_ready() else "starting"
+    return web.json_response({
+        "status": status,
+        "logged_in_as": str(bot.user) if bot.user else None,
+        "guilds": len(bot.guilds) if bot.is_ready() else 0,
+    })
+
+async def start_web_server() -> web.AppRunner:
+    app = web.Application()
+    app.router.add_get("/", _health)
+    app.router.add_get("/health", _health)
+
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", PORT)
+    await site.start()
+    log.info(f"✅ Web server listening on port {PORT}")
+    return runner
+
+# -------------------- STARTUP / SHUTDOWN --------------------
+async def _shutdown():
+    log.info("Shutting down: cancelling background tasks...")
+    all_tasks = list(_active_checks.values()) + list(_active_archives.values()) + list(_active_text_archivers.values())
+    for t in all_tasks:
+        if not t.done():
+            t.cancel()
+    if all_tasks:
+        await asyncio.gather(*all_tasks, return_exceptions=True)
+
+    global http_session
+    if http_session is not None and not http_session.closed:
+        await http_session.close()
+
+async def main():
     if not DISCORD_TOKEN:
         raise RuntimeError("Missing DISCORD_TOKEN env var.")
 
     if BOT_OWNER_ID == 0:
-        print("⚠️ BOT_OWNER_ID is not set. Owner-only commands (/check, /archieved, /archieved_text) will deny everyone.")
+        log.warning("BOT_OWNER_ID is not set. Owner-only commands (/check, /archieved, /archieved_text) will deny everyone.")
 
     if PRESET_LOG_CHANNEL_ID == 0:
-        print("Invalid log")
+        log.warning("PRESET_LOG_CHANNEL_ID is not set. /preset and preset-based /live_progress will fail until you set it.")
 
     if SOURCE_CHANNEL_ID == 0:
-        print("⚠️ SOURCE_CHANNEL_ID is not set. /progress /live_progress /archieved /canvas will fail until you set it.")
-    if TIMELAPSE_CHANNEL_ID == 0:
-        print("⚠️ TIMELAPSE_CHANNEL_ID is not set. /timelapse will fail until you set it.")
+        log.warning("SOURCE_CHANNEL_ID is not set. /progress /live_progress /archieved /canvas will fail until you set it.")
 
-    bot.run(DISCORD_TOKEN)
+    if TIMELAPSE_CHANNEL_ID == 0:
+        log.warning("TIMELAPSE_CHANNEL_ID is not set. /timelapse will fail until you set it.")
+
+    web_runner = await start_web_server()
+
+    try:
+        async with bot:
+            await bot.start(DISCORD_TOKEN)
+    finally:
+        await _shutdown()
+        await web_runner.cleanup()
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        pass
