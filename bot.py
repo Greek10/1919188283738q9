@@ -514,7 +514,7 @@ async def timelapse(interaction: discord.Interaction, hours: int = 12, fps: int 
         await interaction.followup.send(f"❌ Timelapse source channel error: `{type(e).__name__}: {e}`")
         return
 
-    hours = max(1, min(24, int(hours)))
+    hours = max(1, min(1000, int(hours)))
     fps = max(1, min(30, int(fps)))
     max_frames = max(1, min(1000, int(max_frames)))
     max_side = max(64, min(1024, int(max_side)))
